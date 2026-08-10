@@ -19,7 +19,7 @@ the arduino build
 > arduino-cli compile --fqbn "esp32:esp32:m5stack_tab5:FlashSize=16M,PSRAM=enabled,PartitionScheme=app3M_fat9M_16MB,CDCOnBoot=cdc,USBMode=hwcdc" . && arduino-cli upload --fqbn "esp32:esp32:m5stack_tab5:FlashSize=16M,PSRAM=enabled,PartitionScheme=app3M_fat9M_16MB,CDCOnBoot=cdc,USBMode=hwcdc" --port /dev/ttyACM0 . && sleep 2 && arduino-cli monitor --port /dev/ttyACM0 --config baudrate=115200
 
 
-The arduino build is more streamlined. the ESP-IDF build is trying to support files on usb stick and hotplug.
+The arduino build is more streamlined. the ESP-IDF build is trying to support files on usb stick, exfat (not just fat32), and hotplug.
 
 
 
