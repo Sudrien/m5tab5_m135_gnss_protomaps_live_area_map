@@ -36,5 +36,5 @@ Modes:
 - Supports GNSS caching on microsd to speed up location aquisition
 - Remembers multiple wifi networks
 - 'rule of thirds' sliding display - this will keep up if you're in a car.
-- night mode
+- dat/night/auto mode (based on SunSet https://github.com/buelowp/sunset) library
 - screen toggle for battery savings
