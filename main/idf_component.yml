@@ -1,0 +1,104 @@
+## Managed dependencies.
+##
+## The component manager downloads these and adds them to this component's
+## requirements automatically - which is why `arduino` does not appear in
+## REQUIRES in CMakeLists.txt. Listing it there by hand was the bug behind
+## "Failed to resolve component 'arduino'": a manually cloned copy in
+## components/arduino registers under the name `arduino`, but a managed one
+## registers as `espressif__arduino-esp32`. Declaring it here avoids having to
+## know which.
+dependencies:
+  idf:
+    ## Upper bound is v6, not v6.2. M5Unified does not compile on v6 at all:
+    ## the new I2S driver removed i2s_port_t and SOC_I2S_NUM, and both
+    ## Speaker_Class.hpp and Mic_Class.hpp declare
+    ##     i2s_port_t i2s_port = i2s_port_t::I2S_NUM_0;
+    ## Letting the manager resolve against a v6 toolchain just moves the
+    ## failure to the middle of a 128-target build, as a wall of "no member
+    ## named i2s_port" that reads like a different problem. CMakeLists.txt also
+    ## stops on this, with an explanation.
+    version: ">=5.3,<6.0"
+
+  ## No esp_hosted or esp_wifi_remote pins here - deliberately.
+  ##
+  ## Pinning them to 1.4.0 / 0.8.5, taken from BufferRoot/M5STACK-TAB5-DEMO-CLEAN,
+  ## fails to solve:
+  ##
+  ##   espressif/arduino-esp32 (3.3.11) depends on espressif/esp_wifi_remote (^1.2.2)
+  ##   project depends on espressif/esp_wifi_remote (0.8.5)
+  ##
+  ## That demo is pure IDF with its own BSP and no Arduino core, so its
+  ## versions are a coherent set for a different dependency graph. Ours has
+  ## arduino-esp32 in it, and the core pins what it needs.
+  ##
+  ## The failure is informative: arduino-esp32 3.3.11 asks for
+  ## esp_wifi_remote ^1.2.2, which is what the manager was already resolving.
+  ## So esp_hosted and esp_wifi_remote here are the versions the Arduino core
+  ## itself wants - the same pairing the working Arduino build uses - and the
+  ## wifi difference between the two builds is not version drift after all.
+
+  espressif/arduino-esp32:
+    version: "^3.3.0"
+
+  ## USB host mass storage - the reason for building under IDF at all.
+  ##
+  ## Deliberately unpinned. A guessed pin of "^1.1.0" was what kept this
+  ## commented out before: the registry answered "no versions match", and an
+  ## unsatisfiable dependency stops the project configuring entirely, so a
+  ## feature nobody was using could break a build that had nothing to do with
+  ## it. Whatever the registry carries for the IDF version in use is fine here
+  ## - the API surface this project touches (msc_host_install,
+  ## msc_host_install_device, msc_host_vfs_register) has been stable across it.
+  ##
+  ## Disable the feature without touching this file:
+  ##   idf.py -DMAP_HAVE_USB_MSC=0 build
+  espressif/usb_host_msc:
+    version: "*"
+
+  ## Display, touch, power, RTC and IMU. Names taken from M5Unified's own
+  ## idf_component.yml, which declares its dependency as m5stack/m5gfx - so the
+  ## namespace is m5stack and the names are lowercase, not the CamelCase of the
+  ## Arduino library folders.
+  ##
+  ## Pinned to the same versions the Arduino build reports, so both builds use
+  ## identical board support rather than differing by whatever the registry
+  ## happens to resolve to.
+  ##
+  ## m5gfx is not listed: m5unified depends on it and the component manager
+  ## pulls it in transitively.
+  ## Pinned exactly, not "^0.2.19".
+  ##
+  ## A bare M5.begin() under IDF - nothing else in the program - reports
+  ## M5.getBoard()=255 and M5.Display.getBoard()=127, neither of which is a
+  ## value in m5gfx's board_t enum (board_unknown=0, board_M5Tab5=22), and
+  ## attaches no panel. The identical source under arduino-cli reports 22/22
+  ## and brings up 1280x720.
+  ##
+  ## The Arduino build links M5Unified 0.2.19 and M5GFX 0.2.26, as arduino-cli
+  ## reports at compile time. The caret range above let the component manager
+  ## resolve something newer, and version drift between managed components and
+  ## the Arduino libraries has already accounted for the usb_host_msc pin, the
+  ## esp_hosted constructor and the SDIO mempool. Matching the versions that
+  ## demonstrably work on this board was the cheapest remaining test.
+  ##
+  ## TESTED, AND IT DID NOT HELP. With these exact pins a bare M5.begin() still
+  ## reported 255/127 and attached no panel, which ruled version drift out.
+  ##
+  ## The cause was found elsewhere: these components were being compiled
+  ## without ARDUINO defined while main was compiled with it, and LovyanGFX
+  ## changes its class layout on that macro, so main read every member of the
+  ## M5 object four bytes off. CMakeLists.txt patches both components to
+  ## require arduino-esp32, which is where -DARDUINO comes from. See
+  ## DISPLAY_IDF_NOTES.md.
+  ##
+  ## The pins stay: matching the versions the Arduino build links keeps the two
+  ## builds comparable, which is what made the 22/22 versus 255/127 contrast
+  ## trustworthy in the first place.
+  ##
+  ## If these do not resolve, the registry may not carry them - check with
+  ##   idf.py add-dependency "m5stack/m5unified"
+  ## and see what it offers.
+  m5stack/m5unified:
+    version: "==0.2.19"
+  m5stack/m5gfx:
+    version: "==0.2.26"

@@ -1,0 +1,172 @@
+# sdkconfig.defaults - ESP-IDF build of the Tab5 map.
+#
+# Values below are taken from the configuration arduino-cli actually uses for
+# this board and this silicon:
+#
+#   ~/.arduino15/packages/esp32/tools/esp32p4_es-libs/3.3.11/sdkconfig
+#
+# The `_es` set is for chips before rev v3.00. boards.txt maps the Tab5's
+# ChipVariant menu to it (prev3 -> esp32p4_es, 360 MHz), and the boot log
+# confirms it: "Chip rev: v1.3", "cpu freq: 360000000 Hz".
+#
+# Earlier revisions of this file were guessed from Kconfig defaults and got
+# several things wrong. Where a setting appears here it is because the working
+# Arduino build has it, not because it seemed reasonable.
+
+CONFIG_IDF_TARGET="esp32p4"
+
+# ---- chip revision --------------------------------------------------------
+# Support for P4 rev <3.0 and >=3.0 is mutually exclusive, and this chip is
+# v1.3. Getting this wrong gives a bootloader that refuses the chip.
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_1=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_360=y
+
+# ---- flash and partitions -------------------------------------------------
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ---- optimisation ---------------------------------------------------------
+# The Arduino libraries are built -Os. IDF defaults to -Og, which the earlier
+# builds were using: bigger code and more static RAM, on a chip where the
+# internal heap was already tight enough to fail an idle-task allocation.
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+
+# ---- PSRAM ----------------------------------------------------------------
+# 200 MHz, confirmed against the _es reference - so the fast clock is correct
+# for this silicon after all, and the earlier retreat to 20 MHz was wrong.
+#
+# What was missing were the allocator settings. IDF defaults
+# SPIRAM_MALLOC_ALWAYSINTERNAL to 16384 and RESERVE_INTERNAL to 32768; Arduino
+# uses 4096 and 0. The first decides how large an allocation still comes from
+# internal RAM, so IDF's default drains internal heap far faster - and the
+# failure was FreeRTOS unable to allocate the idle task stack.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_HEX=y
+CONFIG_IDF_EXPERIMENTAL_FEATURES=y
+CONFIG_SPIRAM_SPEED_200M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=0
+CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY=y
+CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=y
+
+# PSRAM and flash run off internal LDO rails that have to be reserved at boot.
+# Absent from every earlier version of this file.
+CONFIG_ESP_LDO_RESERVE_PSRAM=y
+CONFIG_ESP_LDO_CHAN_PSRAM_DOMAIN=2
+CONFIG_ESP_LDO_VOLTAGE_PSRAM_1800_MV=y
+CONFIG_ESP_LDO_RESERVE_SPI_NOR_FLASH=y
+CONFIG_ESP_LDO_CHAN_SPI_NOR_FLASH_DOMAIN=1
+CONFIG_ESP_LDO_VOLTAGE_SPI_NOR_FLASH_3300_MV=y
+
+# ---- cache and MMU --------------------------------------------------------
+# L2 cache is carved out of the same internal RAM as the heap.
+CONFIG_CACHE_L2_CACHE_256KB=y
+CONFIG_CACHE_L2_CACHE_LINE_128B=y
+CONFIG_MMU_PAGE_SIZE_64KB=y
+
+# ---- MIPI-DSI panel -------------------------------------------------------
+# The display path, and the most likely reason M5.begin() attached no panel:
+# LCD_DSI_OBJ_FORCE_INTERNAL puts the DSI driver object in internal RAM, and
+# the Arduino build sets it while IDF does not default it on.
+CONFIG_LCD_DSI_OBJ_FORCE_INTERNAL=y
+CONFIG_LCD_DSI_ISR_HANDLER_IN_IRAM=y
+CONFIG_LCD_RGB_ISR_IRAM_SAFE=y
+
+# ---- FreeRTOS -------------------------------------------------------------
+CONFIG_FREERTOS_HZ=1000
+# 1024, as the reference has it.
+#
+# This was briefly 8192 as a probe: the idle stack was being allocated out of
+# TCM (8088 bytes free) and portVALID_STACK_MEM rejects TCM, so asking for more
+# than TCM could hold would have forced DRAM. That probe is withdrawn now that
+# esp-idf is on v5.5.5 - the version the working Arduino libraries were built
+# with - so the version change is tested on its own rather than alongside a
+# workaround that would mask whether it helped.
+#
+# If the idle-task assert comes back at 1024, the probe value is the thing to
+# try next, and it would mean the version was not the cause.
+CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=1024
+CONFIG_FREERTOS_ISR_STACKSIZE=2096
+CONFIG_FREERTOS_IN_IRAM=y
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096
+CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0=y
+
+# ---- Arduino --------------------------------------------------------------
+CONFIG_AUTOSTART_ARDUINO=y
+CONFIG_ARDUINO_RUN_CORE1=y
+CONFIG_ARDUINO_EVENT_RUN_CORE1=y
+CONFIG_ARDUINO_LOOP_STACK_SIZE=8192
+
+# Board variant: esp32p4, matching the reference.
+#
+# I set this to m5stack_tab5 on the reasoning that arduino-cli compiles the
+# sketch with build.variant=m5stack_tab5, so an IDF build - which has one
+# setting for core and sketch together - should use the sketch's. CMake then
+# failed: variants/m5stack_tab5 does not exist in the arduino-esp32 version the
+# component manager resolved. It exists upstream on master; I checked there and
+# assumed the installed copy matched.
+#
+# Going back to esp32p4 is also what the reference does, and that weakens the
+# wrong-variant theory for the dark panel anyway: the Arduino core itself is
+# built with generic P4 pins and the display still works, because M5Unified
+# carries its own per-board pin tables and does not read pins_arduino.h. The
+# variant mainly sets defaults for Wire and SPI.
+#
+# To use the Tab5 variant, check whether your resolved version has it:
+#   ls managed_components/espressif__arduino-esp32/variants/ | grep m5stack
+# and if not, raise the version pin in main/idf_component.yml.
+CONFIG_ARDUINO_VARIANT="esp32p4"
+
+# ---- console --------------------------------------------------------------
+# Primary UART with USB-Serial/JTAG secondary, matching the reference. Earlier
+# versions of this file made USB-Serial/JTAG primary, which is not what the
+# working build does.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y
+
+# ---- wifi, via the ESP32-C6 over SDIO --------------------------------------
+# The pin numbers the sketch already passes to setPins(), now also configured
+# for the hosted transport itself.
+CONFIG_ESP_HOSTED_ENABLED=y
+CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE=y
+CONFIG_ESP_HOSTED_SDIO_SLOT_1=y
+CONFIG_ESP_HOSTED_SDIO_4_BIT_BUS=y
+CONFIG_ESP_HOSTED_SDIO_PIN_CMD=19
+CONFIG_ESP_HOSTED_SDIO_PIN_CLK=18
+CONFIG_ESP_HOSTED_SDIO_PIN_D0=14
+CONFIG_ESP_HOSTED_SDIO_PIN_D1=15
+CONFIG_ESP_HOSTED_SDIO_PIN_D2=16
+CONFIG_ESP_HOSTED_SDIO_PIN_D3=17
+CONFIG_ESP_HOSTED_SDIO_GPIO_RESET_SLAVE=54
+
+# ---- mbedTLS --------------------------------------------------------------
+# PSK is not optional: the whole body of arduino-esp32's ssl_client.cpp sits
+# behind a check for it, so without it the file compiles to nothing and the
+# link fails on start_ssl_client and friends.
+CONFIG_MBEDTLS_PSK_MODES=y
+CONFIG_MBEDTLS_KEY_EXCHANGE_PSK=y
+CONFIG_MBEDTLS_KEY_EXCHANGE_ECDHE_PSK=y
+CONFIG_MBEDTLS_KEY_EXCHANGE_RSA_PSK=y
+CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC=y
+CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN=16384
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+CONFIG_MBEDTLS_HARDWARE_AES=y
+CONFIG_MBEDTLS_HARDWARE_SHA=y
+CONFIG_MBEDTLS_HARDWARE_MPI=y
+
+# ---- FAT ------------------------------------------------------------------
+# LFN on the stack, not the heap, and 4096-byte sectors - both as the working
+# build has them. An earlier version of this file used LFN_HEAP.
+CONFIG_FATFS_LFN_STACK=y
+CONFIG_FATFS_SECTOR_4096=y
+CONFIG_FATFS_ALLOC_PREFER_EXTRAM=y
+CONFIG_FATFS_API_ENCODING_UTF_8=y
+
+# ---- heap -----------------------------------------------------------------
+CONFIG_HEAP_POISONING_LIGHT=y
