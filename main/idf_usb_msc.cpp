@@ -28,6 +28,7 @@
 // drive up once s_mounted flips.
 
 #include "../features.h"
+#include "../storage.h"
 
 #if MAP_HAVE_USB_MSC
 
@@ -147,7 +148,7 @@ static void usb_msc_task(void *arg) {
             // wrong default.
             esp_vfs_fat_mount_config_t mcfg = {};
             mcfg.format_if_mount_failed = false;
-            mcfg.max_files              = 5;
+            mcfg.max_files              = STORAGE_MAX_OPEN_FILES;
             mcfg.allocation_unit_size   = 0;
 
             esp_err_t err = msc_host_vfs_register(s_dev, USB_MOUNT, &mcfg, &s_vfs);

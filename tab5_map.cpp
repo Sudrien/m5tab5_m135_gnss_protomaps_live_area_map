@@ -763,8 +763,10 @@ static void sdQuiet(bool quiet) {
 // "SDMMC host already initialized, skipping init flow" and reuses a host that
 // was left in whatever state the failure put it in.
 static bool mountSDQuick(const char **bus) {
-    if (SD_MMC.begin("/sdcard", false)) { *bus = "SDMMC 4-bit"; return true; }
-    if (SD_MMC.begin("/sdcard", true))  { *bus = "SDMMC 1-bit"; return true; }
+    if (SD_MMC.begin("/sdcard", false, false, BOARD_MAX_SDMMC_FREQ,
+                     STORAGE_MAX_OPEN_FILES)) { *bus = "SDMMC 4-bit"; return true; }
+    if (SD_MMC.begin("/sdcard", true, false, BOARD_MAX_SDMMC_FREQ,
+                     STORAGE_MAX_OPEN_FILES))  { *bus = "SDMMC 1-bit"; return true; }
     SD_MMC.end();
     sdmmc_host_deinit();
     return false;
@@ -864,9 +866,15 @@ static bool waitForStorage(const char **bus) {
     }
 }
 
+// The trailing arguments to SD_MMC.begin() are the library's own defaults for
+// frequency, and STORAGE_MAX_OPEN_FILES for the descriptor count - which is
+// not a default. Arduino's is 5, and five is not enough to hold a set of band
+// archives open alongside the tile cache.
 static bool mountSD(const char **bus, bool allow_format) {
-    if (SD_MMC.begin("/sdcard", false)) { *bus = "SDMMC 4-bit"; return true; }
-    if (SD_MMC.begin("/sdcard", true))  { *bus = "SDMMC 1-bit"; return true; }
+    if (SD_MMC.begin("/sdcard", false, false, BOARD_MAX_SDMMC_FREQ,
+                     STORAGE_MAX_OPEN_FILES)) { *bus = "SDMMC 4-bit"; return true; }
+    if (SD_MMC.begin("/sdcard", true, false, BOARD_MAX_SDMMC_FREQ,
+                     STORAGE_MAX_OPEN_FILES))  { *bus = "SDMMC 1-bit"; return true; }
     if (SD.begin())                     { *bus = "SPI";         return true; }
 
     if (!allow_format) return false;
@@ -874,8 +882,10 @@ static bool mountSD(const char **bus, bool allow_format) {
     // Every read-only attempt has failed by now, so there is nothing here that
     // this build could have opened.
     Serial.println("sd: formatting card (FAT, all existing data lost)");
-    if (SD_MMC.begin("/sdcard", false, true)) { *bus = "SDMMC 4-bit, formatted"; return true; }
-    if (SD_MMC.begin("/sdcard", true,  true)) { *bus = "SDMMC 1-bit, formatted"; return true; }
+    if (SD_MMC.begin("/sdcard", false, true, BOARD_MAX_SDMMC_FREQ,
+                     STORAGE_MAX_OPEN_FILES)) { *bus = "SDMMC 4-bit, formatted"; return true; }
+    if (SD_MMC.begin("/sdcard", true,  true, BOARD_MAX_SDMMC_FREQ,
+                     STORAGE_MAX_OPEN_FILES)) { *bus = "SDMMC 1-bit, formatted"; return true; }
     return false;
 }
 
@@ -1291,6 +1301,137 @@ static bool antennaSuspect(const GnssFix &fix) {
     return suspect;
 }
 
+// ---- battery ---------------------------------------------------------------
+//
+// Read the pack voltage and work out the percentage here rather than taking
+// M5Unified's answer, because its answer depends on a pack assumption we
+// cannot verify from inside the program.
+//
+// Power_Class::getBatteryLevel() for the Tab5 is:
+//
+//     mv = Ina226.getBusVoltage() * 500;              // "2S Li-Po (*1000/2)"
+//     level = (mv - 3300) * 100 / (float)(4150 - 3350);
+//
+// The 500 is 1000/2: it converts the bus voltage to volts-per-cell on the
+// assumption of two cells in series. If the pack is 1S, the halving makes a
+// healthy 3.9 V read as 1950 mV per cell, which is below the 3300 floor, and
+// the level clamps to 0 - permanently, at any state of charge. That is exactly
+// what a stuck 0% looks like.
+//
+// getBatteryVoltage() on the same board returns the bus voltage unhalved, so
+// it is the honest number and the one to reason from.
+//
+// MAP_BATTERY_CELLS says how many cells are in series. If 0%-when-full turns
+// out to be the halving, set it to 1 and the reading is correct without
+// touching M5Unified.
+#ifndef MAP_BATTERY_CELLS
+#define MAP_BATTERY_CELLS 2
+#endif
+
+// Per-cell millivolts for empty and full. Same endpoints M5Unified uses, and
+// unremarkable for Li-Po - 3.3 V is about as low as a cell should be taken and
+// 4.15 V is a full one at rest.
+static const int CELL_MV_EMPTY = 3300;
+static const int CELL_MV_FULL  = 4150;
+
+// Percentage, or -1 when the pack voltage is not believable.
+//
+// "Not believable" is the important case. A missing or unresponsive INA226
+// reads zero, and zero volts is not an empty battery - it is no measurement.
+// Showing that as a red 0% is worse than showing nothing, because it is
+// indistinguishable from a real flat pack.
+static int batteryPercent(int *out_mv) {
+    int mv = (int)M5.Power.getBatteryVoltage();      // whole pack, millivolts
+    if (out_mv) *out_mv = mv;
+
+    // Below one flat cell there is nothing plausible to report, whatever the
+    // cell count.
+    if (mv < 2500) return -1;
+
+    int cell = mv / MAP_BATTERY_CELLS;
+    int pct  = (cell - CELL_MV_EMPTY) * 100 / (CELL_MV_FULL - CELL_MV_EMPTY);
+    return pct < 0 ? 0 : pct > 100 ? 100 : pct;
+}
+
+// Said once at boot, because a wrong battery reading is easy to notice and
+// hard to diagnose without the raw numbers behind it.
+static void powerReport() {
+    int mv = 0;
+    int pct = batteryPercent(&mv);
+    int m5  = (int)M5.Power.getBatteryLevel();
+    bool chg = M5.Power.isCharging();
+
+    Serial.printf("power: pack %d mV, %d cell(s) -> %d%%, M5Unified says %d%%, "
+                  "charging %s\n",
+                  mv, MAP_BATTERY_CELLS, pct, m5, chg ? "yes" : "no");
+
+    if (mv < 2500)
+        Serial.println("power: pack voltage reads zero - the INA226 on the "
+                       "power bus is not answering, so no percentage is real");
+    else if (m5 == 0 && pct > 5)
+        Serial.println("power: M5Unified reads 0% where the voltage says "
+                       "otherwise - its Tab5 path assumes a 2S pack; "
+                       "build with -DMAP_BATTERY_CELLS=1 if this one is 1S");
+
+    // CHG_STAT is expander 0x44 pin P6, and M5Unified treats a high level as
+    // charging. Charger status pins are commonly active low, so print the raw
+    // bit alongside its interpretation - if the sign is inverted, this is
+    // where it shows.
+    Serial.printf("power: CHG_STAT (expander 0x44 P6) reads %d\n",
+                  M5.getIOExpander(1).digitalRead(6) ? 1 : 0);
+
+    // Ask the fuel gauge itself, on the bus, without going through M5Unified.
+    //
+    // Everything above depends on Power_Class having reached its INA226, and
+    // a zero from getBusVoltage() cannot tell "the chip said zero" from "the
+    // read failed and the buffer was still zero" - INA226_Class::readRegister16
+    // returns buf[0]<<8|buf[1] with buf pre-zeroed and no error check.
+    //
+    // Register 0xFF is the die ID and reads 0x2260 on a working part. That
+    // number is the whole diagnosis:
+    //
+    //   0x2260  the chip is there and answering, so the fault is in how
+    //           M5Unified is driving it, and the CONFIG register below says
+    //           whether it was ever configured
+    //   0x0000  nothing at 0x41 on the internal bus - wrong address for this
+    //           unit, or the part is not populated
+    //
+    // Address and settings cross-checked against M5Stack's own Tab5 demo
+    // (platforms/tab5/main/hal/hal_esp32.cpp), which does:
+    //     ina226.begin(i2c_bus_handle, 0x41);
+    //     ina226.configure(AVERAGES_16, BUS_CONV_1100US, SHUNT_CONV_1100US,
+    //                      MODE_SHUNT_BUS_CONT);
+    //     ina226.calibrate(0.005, 8.192);
+    // M5Unified uses the same address and the same continuous mode, so if the
+    // chip answers here, the difference is elsewhere.
+    {
+        const uint8_t INA226_ADDR = 0x41;
+        uint8_t buf[2] = { 0, 0 };
+        bool ok = M5.In_I2C.readRegister(INA226_ADDR, 0xFF, buf, 2, 400000);
+        uint16_t die = (uint16_t)(buf[0] << 8 | buf[1]);
+
+        uint8_t cfgb[2] = { 0, 0 };
+        M5.In_I2C.readRegister(INA226_ADDR, 0x00, cfgb, 2, 400000);
+        uint16_t cfg = (uint16_t)(cfgb[0] << 8 | cfgb[1]);
+
+        uint8_t busb[2] = { 0, 0 };
+        M5.In_I2C.readRegister(INA226_ADDR, 0x02, busb, 2, 400000);
+        int16_t bus_raw = (int16_t)(busb[0] << 8 | busb[1]);
+
+        Serial.printf("power: INA226 @0x%02X %s die=0x%04X cfg=0x%04X "
+                      "bus_raw=%d (%.3f V)\n",
+                      INA226_ADDR, ok ? "acked" : "NO ACK", die, cfg,
+                      (int)bus_raw, bus_raw * 0.00125f);
+
+        if (die != 0x2260)
+            Serial.println("power: that is not an INA226 answering - the "
+                           "reading cannot work until this does");
+        else if ((cfg & 0x0007) == 0)
+            Serial.println("power: INA226 is in power-down mode - it was "
+                           "never configured, so every register reads stale");
+    }
+}
+
 static void drawClockBattery(const GnssFix &fix, lgfx::LovyanGFX *g) {
     if (!g_panelOk) return;   // no display attached
     const int W = M5.Display.width();
@@ -1314,27 +1455,39 @@ static void drawClockBattery(const GnssFix &fix, lgfx::LovyanGFX *g) {
         return;
     }
 
-    int pct = M5.Power.getBatteryLevel();
+    int pct = batteryPercent(nullptr);
     bool charging = M5.Power.isCharging();
+
+    // Say "no batt" rather than nothing when there is no measurement.
+    //
+    // Suppressing the percentage was right - a red 0% from an unread sensor is
+    // a lie - but silence is its own kind of wrong: a reading that vanishes
+    // looks like a bug in the status bar rather than an absent battery, and it
+    // is indistinguishable from the clock simply having taken the space.
+    const char *batt_txt = pct >= 0 ? nullptr : "no batt";
 
     if (haveTime && pct >= 0)
         snprintf(buf, sizeof buf, "%02d:%02dZ   %s%d%%",
                  lt.tm_hour, lt.tm_min, charging ? "+" : "", pct);
     else if (haveTime)
-        snprintf(buf, sizeof buf, "%02d:%02dZ", lt.tm_hour, lt.tm_min);
+        snprintf(buf, sizeof buf, "%02d:%02dZ   %s", lt.tm_hour, lt.tm_min, batt_txt);
     else if (pct >= 0)
         snprintf(buf, sizeof buf, "%s%d%%", charging ? "+" : "", pct);
     else
-        return;
+        snprintf(buf, sizeof buf, "%s", batt_txt);
 
     // Colour follows the battery, since that is the part worth noticing at a
     // glance on a device you are carrying.
     uint16_t col = TFT_WHITE;
-    if (!charging && pct >= 0) {
+    if (pct < 0) {
+        // Dim, because it is a statement about the sensor rather than a
+        // warning about the battery. Nothing is wrong with the device.
+        col = TFT_DARKGREY;
+    } else if (!charging) {
         if (pct <= 10)      col = TFT_RED;
         else if (pct <= 25) col = TFT_ORANGE;
-    } else if (charging) {
-        col = TFT_GREENYELLOW;
+    } else {
+        col = TFT_GREENYELLOW;                   // charging, and measured
     }
     g->setTextDatum(top_right);
     g->setTextColor(col);
@@ -1699,6 +1852,8 @@ void setup() {
     // early even in principle. SNTP overwrites this later when it arrives, and
     // writes the corrected value back to the RTC (see loop()).
     if (M5.Rtc.isEnabled()) M5.Rtc.setSystemTimeFromRtc();
+
+    powerReport();
 
     bool panel = panelBegin();
 

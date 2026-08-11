@@ -120,7 +120,7 @@ static void idx_save() {
     f.write((uint8_t *)&REC_MAGIC, 4);
     f.write((uint8_t *)&n, 4);
     f.write((uint8_t *)&blobLen, 8);
-    f.write((uint8_t *)g_idx, n * sizeof(Entry));
+    storage_write(f, (uint8_t *)g_idx, n * sizeof(Entry));
     f.close();
     g_st.index_flushes++;
     g_since_flush = 0;
@@ -185,7 +185,7 @@ static bool idx_load() {
     f.read((uint8_t *)&n, 4);
     f.read((uint8_t *)&blobLen, 8);
     if (n > g_cap) { f.close(); return false; }
-    if (f.read((uint8_t *)g_idx, n * sizeof(Entry)) != (int)(n * sizeof(Entry))) {
+    if (storage_read(f, (uint8_t *)g_idx, n * sizeof(Entry)) != n * sizeof(Entry)) {
         f.close(); return false;
     }
     f.close();
@@ -271,7 +271,7 @@ bool tilecache_get(uint8_t z, uint32_t x, uint32_t y, uint8_t *dst, uint32_t *le
     if (n > *len) { g_st.misses++; return false; }
 
     if (!g_blob.seek(g_idx[at].offset)) { g_st.misses++; return false; }
-    if (g_blob.read(dst, n) != (int)n) { g_st.misses++; return false; }
+    if (storage_read(g_blob, dst, n) != n) { g_st.misses++; return false; }
     // Reads move the file position, and writes go wherever it happens to be
     // in "r+" mode. tilecache_put seeks explicitly, so this is belt and
     // braces rather than load-bearing.
@@ -295,7 +295,7 @@ bool tilecache_put(uint8_t z, uint32_t x, uint32_t y, const uint8_t *src, uint32
 
     RecHdr h = { REC_MAGIC, id, len };
     if (g_blob.write((uint8_t *)&h, sizeof h) != sizeof h) return false;
-    if (len && g_blob.write(src, len) != len) return false;
+    if (len && storage_write(g_blob, src, len) != len) return false;
     g_blob_len = off + sizeof h + len;
 
     if (!idx_insert(id, off + sizeof(RecHdr), len)) {

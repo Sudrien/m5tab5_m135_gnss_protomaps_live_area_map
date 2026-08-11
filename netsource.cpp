@@ -77,6 +77,13 @@ static fs::FS *g_fs = nullptr;
 // z14 are ever requested, and a contiguous extract would spend most of its
 // size on levels nothing asks for. Three files, one per band, keeps each well
 // clear of the limit and skips the rest entirely.
+// Raise this if a plan needs more bands than it allows. plan-extracts.py will
+// happily emit up to 40 - a global z14 split at 3.2 GB a file is around ten,
+// but a smaller --target or a finer zoom gets there quickly. Past this many,
+// try_open() simply stops, so the extra archives are silently not consulted
+// and the tiles they hold come over the network instead. Each open archive
+// costs LOCAL_ROOT_CAP (64 KB) of PSRAM for its root directory, held for as
+// long as it is open, so the ceiling is memory rather than anything structural.
 #ifndef LOCAL_ARCHIVE_MAX
 #define LOCAL_ARCHIVE_MAX 16
 #endif
@@ -517,7 +524,10 @@ static int sd_read(void *ctx, uint64_t off, uint32_t len, uint8_t *dst) {
     local_src_t *src = (local_src_t *)ctx;
     if (!src || !src->file) return -1;
     if (!src->file.seek((uint32_t)off)) return -1;
-    return src->file.read(dst, len) == (int)len ? 0 : -1;
+    // Chunked: a pmtiles blob or leaf directory can be tens of KB, and a
+    // single read that large is what the USB driver cannot allocate a
+    // transfer buffer for. See STORAGE_IO_CHUNK.
+    return storage_read(src->file, dst, len) == len ? 0 : -1;
 }
 
 static int gz_inflate(void *ctx, uint8_t codec, const uint8_t *src,
@@ -584,7 +594,20 @@ static bool probe_build(const char *date) {
 static bool discover_build(char *out, size_t n) {
     if (!g_today_epochdays) netsource_set_date_from_clock();
     if (!g_today_epochdays) {
-        Serial.println("netsource: no date yet (needs SNTP or a GNSS fix)");
+        // Once, not once per tile.
+        //
+        // maybe_refresh() is called on every tile that misses the cache, so
+        // before the clock is set this pair of lines is the entire console -
+        // hundreds of repetitions that say nothing the first one did not, and
+        // bury everything that does. The state is latched rather than rate
+        // limited by time: it only changes when a clock arrives, and when it
+        // does the next line will say so.
+        static bool said = false;
+        if (!said) {
+            said = true;
+            Serial.println("netsource: no date yet (needs SNTP or a GNSS fix) "
+                           "- offline until one arrives, local archives still work");
+        }
         return false;
     }
     for (int back = 0; back < MAX_PROBE_DAYS; back++) {
@@ -798,7 +821,13 @@ bool netsource_begin(const char *local_path) {
     if (g_local_n == 0)
         Serial.println("netsource: no local archives (no *.pmtiles at the card root)");
     else
-        Serial.printf("netsource: %d local archive(s) open\n", g_local_n);
+    {
+        Serial.printf("netsource: %d local archive(s) open", g_local_n);
+        if (g_local_n >= LOCAL_ARCHIVE_MAX)
+            Serial.printf(" - at the LOCAL_ARCHIVE_MAX limit, any further "
+                          "*.pmtiles were skipped");
+        Serial.println();
+    }
 
     manifest_load();
     if (g_build[0]) {
@@ -908,7 +937,14 @@ bool netsource_refresh() {
 
     char found[16] = "";
     if (!discover_build(found, sizeof found)) {
-        Serial.println("netsource: no live build found in the last 8 days");
+        // Same reasoning as the line above, and the same call frequency. This
+        // one is latched on the day: a new day is a new set of builds to
+        // probe, so it is worth saying again then and not before.
+        static uint32_t said_for_day = 0;
+        if (said_for_day != g_today_epochdays) {
+            said_for_day = g_today_epochdays ? g_today_epochdays : 1;
+            Serial.println("netsource: no live build found in the last 8 days");
+        }
         return false;
     }
     if (strcmp(found, g_build) != 0) {
@@ -950,6 +986,38 @@ static bool maybe_refresh() {
     return netsource_refresh();
 }
 
+// Try every local archive that claims this tile.
+//
+// Split out of netsource_get_locked() so it can run before the network rather
+// than after it. See NET_PREFER_LOCAL.
+static bool local_try(uint8_t z, uint32_t x, uint32_t y,
+                      uint8_t *dst, uint32_t cap, uint32_t *len) {
+    for (int i = 0; i < g_local_n; i++) {
+        local_src_t *src = &g_locals[i];
+        if (!local_covers(src, z, x, y)) continue;
+
+        // The archives share one dir_buf, and pmtiles.c reuses whatever that
+        // buffer already holds to avoid re-reading a leaf directory. That
+        // shortcut is keyed on an offset and length, which are only meaningful
+        // within one archive - so switching archives must retire the previous
+        // owner's claim, or the next lookup could match an offset from a
+        // different file and read another archive's directory as its own.
+        if (i != g_dir_owner) {
+            if (g_dir_owner >= 0 && g_dir_owner < g_local_n)
+                g_locals[g_dir_owner].pmt.dir_len = 0;
+            g_dir_owner = i;
+        }
+
+        uint32_t n = cap;
+        if (pmt_get(&src->pmt, z, x, y, dst, &n) == PMT_OK) {
+            *len = n;
+            g_stats.local_hits++;
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool netsource_get_locked(uint8_t z, uint32_t x, uint32_t y,
                                  uint8_t *dst, uint32_t *len, bool *from_net)
 {
@@ -957,13 +1025,56 @@ static bool netsource_get_locked(uint8_t z, uint32_t x, uint32_t y,
     uint32_t cap = *len;
 
     // 1. cache
+    bool empty_marked = false;
     if (g_build[0]) {
-        if (cache_is_empty_marker(z, x, y)) { g_stats.misses++; return false; }
-        uint32_t n = cap;
-        if (cache_read(z, x, y, dst, &n)) { *len = n; g_stats.cache_hits++; return true; }
+        // The empty marker used to return a miss outright. That was right when
+        // local archives came last - anything the remote did not have, nothing
+        // else was going to either.
+        //
+        // With local first it becomes a trap. The marker records that *the
+        // remote build* had no tile there, which is a different claim from "no
+        // tile exists": drop a band extract on the drive covering ground the
+        // device once probed and cached as empty, and every one of those tiles
+        // would stay empty for as long as the cache lived, with the data
+        // sitting in a file it never opened.
+        //
+        // So note it and keep going. It still suppresses the network request,
+        // which is what it is for.
+        empty_marked = cache_is_empty_marker(z, x, y);
+        if (!empty_marked) {
+            uint32_t n = cap;
+            if (cache_read(z, x, y, dst, &n)) { *len = n; g_stats.cache_hits++; return true; }
+        }
     }
 
-    // 2. network
+    // 2. local archives, before the network.
+    //
+    // The order used to be the other way round: network first, local as the
+    // floor for whatever the network could not supply. That made sense when
+    // the only local file was a small low-zoom world archive - a fallback for
+    // being offline, not a source in its own right.
+    //
+    // It is wrong once the working zoom is on the drive. Downloading a tile
+    // that is sitting in a file two feet away costs a TLS handshake and a
+    // range request per tile, on a link that may not exist, to produce bytes
+    // already present - and it does it for every tile of every pan.
+    //
+    // The zoom test in local_covers() is what makes this safe to do
+    // unconditionally. A z14-only band extract claims nothing at z12, so the
+    // coarse overview and the world floor still reach the network exactly as
+    // before, and a tile no archive claims falls straight through.
+    //
+    // Set NET_PREFER_LOCAL to 0 for the old order.
+#ifndef NET_PREFER_LOCAL
+#define NET_PREFER_LOCAL 1
+#endif
+#if NET_PREFER_LOCAL
+    if (local_try(z, x, y, dst, cap, len)) return true;
+#endif
+
+    if (empty_marked) { g_stats.misses++; return false; }
+
+    // 3. network
     if (maybe_refresh() && g_remote_ok) {
         g_stats.online = true;
 
@@ -1049,36 +1160,17 @@ static bool netsource_get_locked(uint8_t z, uint32_t x, uint32_t y,
                 Serial.println();
             }
         }
-        // fall through to the local floor rather than failing outright
+        // Fall through to a miss rather than failing outright. There is
+        // nothing left to try: the local archives were asked first.
     } else {
         if (g_stats.online) Serial.println("netsource: gone offline");
         g_stats.online = false;
     }
 
-    // 3. local archives
-    for (int i = 0; i < g_local_n; i++) {
-        local_src_t *src = &g_locals[i];
-        if (!local_covers(src, z, x, y)) continue;
+#if !NET_PREFER_LOCAL
+    if (local_try(z, x, y, dst, cap, len)) return true;
+#endif
 
-        // The archives share one dir_buf, and pmtiles.c reuses whatever that
-        // buffer already holds to avoid re-reading a leaf directory. That
-        // shortcut is keyed on an offset and length, which are only meaningful
-        // within one archive - so switching archives must retire the previous
-        // owner's claim, or the next lookup could match an offset from a
-        // different file and read another archive's directory as its own.
-        if (i != g_dir_owner) {
-            if (g_dir_owner >= 0 && g_dir_owner < g_local_n)
-                g_locals[g_dir_owner].pmt.dir_len = 0;
-            g_dir_owner = i;
-        }
-
-        uint32_t n = cap;
-        if (pmt_get(&src->pmt, z, x, y, dst, &n) == PMT_OK) {
-            *len = n;
-            g_stats.local_hits++;
-            return true;
-        }
-    }
     g_stats.misses++;
     return false;
 }

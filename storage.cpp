@@ -187,6 +187,31 @@ void storage_rescan() {
     pick();
 }
 
+size_t storage_read(fs::File &f, uint8_t *dst, size_t len) {
+    size_t done = 0;
+    while (done < len) {
+        size_t want = len - done;
+        if (want > STORAGE_IO_CHUNK) want = STORAGE_IO_CHUNK;
+        int got = f.read(dst + done, want);
+        if (got <= 0) break;
+        done += (size_t)got;
+        if ((size_t)got < want) break;          // short read: end of file
+    }
+    return done;
+}
+
+size_t storage_write(fs::File &f, const uint8_t *src, size_t len) {
+    size_t done = 0;
+    while (done < len) {
+        size_t want = len - done;
+        if (want > STORAGE_IO_CHUNK) want = STORAGE_IO_CHUNK;
+        size_t put = f.write(src + done, want);
+        done += put;
+        if (put < want) break;                  // out of space, or a bus error
+    }
+    return done;
+}
+
 bool storage_available() {
     if (!g_fs) pick();
     return g_have;
