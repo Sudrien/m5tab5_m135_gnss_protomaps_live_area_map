@@ -11,9 +11,17 @@ sdkconfig.old
 managed_components/
 dependencies.lock
 
-# Cloned by CMakeLists.txt before project(). A committed copy would shadow the
-# clone with a stale one.
-components/sunset/sunset/
+# NOT ignored any more: components/sunset/sunset is a git submodule now, and
+# ignoring a submodule path is a way to lose track of it - git still records
+# the gitlink, so the two disagree about whether the directory is the repo's
+# business.
+#
+# The CMakeLists clone is still there and still useful, because it fills the
+# directory for anyone who clones without --recursive and never runs
+# `git submodule update --init`. It only runs when src/sunset.cpp is missing,
+# so an initialised submodule is left alone. What it cannot do is check out the
+# commit the submodule pins - it clones the tip - so if the pinned commit ever
+# matters, initialise the submodule rather than relying on the fallback.
 
 # Derived by CMakeLists.txt from $IDF_PATH at configure time, and re-derived
 # whenever the IDF version changes - see the MAP_FATFS_EXFAT block.

@@ -253,6 +253,176 @@ endif()
 tab5_install_variant(TAB5_VARIANT_INSTALLED_EARLY)
 
 # ---------------------------------------------------------------------------
+# exFAT and GPT in FatFs, on by default.
+#
+#   idf.py -DMAP_FATFS_EXFAT=0 build      turn off
+#   idf.py -DMAP_FATFS_EXFAT=1 build      turn back on
+#
+# ESP-IDF ships FatFs with exFAT compiled out and offers no menuconfig option,
+# so the only way in is a local copy of the component with src/ffconf.h edited.
+# A component in components/ shadows the one in IDF, so nothing in the IDF tree
+# is touched and other projects are unaffected.
+#
+# Two formats are at stake, not one. A drive over 32 GB ships exFAT from the
+# factory and often GPT with it, and FatFs reads GPT partition tables in
+# find_volume() inside #if FF_LBA64 - which is one of the three switches this
+# sets. So this fixes both, and neither can be had alone: ffconf.h's own note
+# is "To enable the 64-bit LBA, also exFAT needs to be enabled".
+#
+# This is on by default, so read the first of these rather than discovering it
+# later:
+#
+#   - Espressif's stated reason for shipping exFAT off is licensing, not
+#     technical. Their docs ask you to review it for your product and markets,
+#     and this project turning it on by default does not answer that question
+#     for you. Microsoft published the specification and added it to the Open
+#     Invention Network Linux System Definition in 2019, which is why exFAT is
+#     in the mainline Linux kernel; that is context, not legal advice. Build
+#     with -DMAP_FATFS_EXFAT=0 if the answer for your case is no.
+#   - Even with GPT support, FatFs only looks at partitions whose type GUID is
+#     Microsoft Basic Data. FAT32 in a partition typed as Linux filesystem is
+#     invisible - right filesystem, wrong label.
+#   - Only the first FAT volume on a drive is mounted, either way.
+#
+# Formatting the drive FAT32 on an MBR label avoids all of this and costs
+# nothing if you control the drives.
+#
+# components/fatfs/ IS gitignored, which is the opposite of what the example's
+# README advises - and the difference is the point of doing this in CMake.
+#
+# That advice is right for a script: a copy nobody re-runs the script for has
+# to be committed, or a fresh clone silently builds FAT-only. But a committed
+# copy is a fork of one of IDF's components, pinned to whichever IDF version
+# happened to be installed the day it was made. Update IDF and the tree still
+# compiles the old FatFs against the new headers and the new Kconfig, and
+# nothing says so.
+#
+# Since this derives the copy automatically, committing it buys nothing and
+# costs that. The stamp below records the IDF version and the settings the copy
+# was made with; anything else and it is thrown away and re-derived. So the
+# vendored FatFs always matches the IDF in use, and the only thing in git is
+# the three-line patch that makes it, in tools/patch_ffconf.py.
+#
+# This is the same shape as the m5gfx/m5unified patch further down: take what
+# the toolchain provides, change the one thing that needs changing, and do it
+# every time rather than once.
+#
+# src: ported from tools/enable_exfat.sh in m5tab5_esp_idf_usb_host_example.
+#      Done here rather than as a script because a script has to be remembered,
+#      and the failure mode for forgetting it is a drive that does not mount.
+set(TAB5_FATFS "${CMAKE_CURRENT_LIST_DIR}/components/fatfs")
+
+# Default on. A drive bought today is exFAT on GPT, and a build that cannot
+# read it is a build that cannot read the storage this project now prefers.
+# The trade is a vendored component in the tree and a licensing question to
+# answer - both stated above, neither silent.
+if(NOT DEFINED MAP_FATFS_EXFAT)
+    set(MAP_FATFS_EXFAT 1)
+endif()
+
+# What the current copy would have to say to be left alone. Any change here -
+# a different IDF, a different setting - invalidates it.
+set(TAB5_FATFS_STAMP "${TAB5_FATFS}/.tab5-exfat-stamp")
+set(TAB5_FATFS_WANT
+    "idf=${IDF_VERSION_MAJOR}.${IDF_VERSION_MINOR}.${IDF_VERSION_PATCH} exfat=1 lba64=1 trim=0")
+
+set(TAB5_FATFS_STALE FALSE)
+if(MAP_FATFS_EXFAT AND EXISTS "${TAB5_FATFS}")
+    set(TAB5_FATFS_HAVE "")
+    if(EXISTS "${TAB5_FATFS_STAMP}")
+        file(READ "${TAB5_FATFS_STAMP}" TAB5_FATFS_HAVE)
+        string(STRIP "${TAB5_FATFS_HAVE}" TAB5_FATFS_HAVE)
+    endif()
+    if(NOT TAB5_FATFS_HAVE STREQUAL TAB5_FATFS_WANT)
+        message(STATUS "fatfs: vendored copy is stale (${TAB5_FATFS_HAVE}) - re-deriving")
+        file(REMOVE_RECURSE "${TAB5_FATFS}")
+        set(TAB5_FATFS_STALE TRUE)
+    endif()
+endif()
+
+if(MAP_FATFS_EXFAT AND NOT EXISTS "${TAB5_FATFS}")
+    set(TAB5_FATFS_SRC "$ENV{IDF_PATH}/components/fatfs")
+    if(NOT EXISTS "${TAB5_FATFS_SRC}/src/ffconf.h")
+        message(FATAL_ERROR
+            "MAP_FATFS_EXFAT is set but there is no FatFs component at "
+            "${TAB5_FATFS_SRC}. Is IDF_PATH right, and is export.sh sourced?")
+    endif()
+
+    # NO_SOURCE_PERMISSIONS because the copy has to be writable to be patched,
+    # and an IDF installed read-only - a system package, a shared toolchain -
+    # would otherwise produce a copy nothing can edit.
+    file(COPY "${TAB5_FATFS_SRC}" DESTINATION "${CMAKE_CURRENT_LIST_DIR}/components"
+         NO_SOURCE_PERMISSIONS)
+
+    find_program(TAB5_PYTHON NAMES python3 python)
+    if(NOT TAB5_PYTHON)
+        file(REMOVE_RECURSE "${TAB5_FATFS}")
+        message(FATAL_ERROR
+            "MAP_FATFS_EXFAT needs python to patch ffconf.h and none was found "
+            "on PATH. Source ESP-IDF's export.sh, which puts its own on there.")
+    endif()
+
+    execute_process(
+        COMMAND "${TAB5_PYTHON}" "${CMAKE_CURRENT_LIST_DIR}/tools/patch_ffconf.py"
+                "${TAB5_FATFS}/src/ffconf.h"
+        RESULT_VARIABLE TAB5_FFCONF_RC
+        OUTPUT_VARIABLE TAB5_FFCONF_OUT
+        ERROR_VARIABLE  TAB5_FFCONF_ERR)
+
+    if(NOT TAB5_FFCONF_RC EQUAL 0)
+        # Leave nothing half-patched behind. A vendored fatfs that shadows
+        # IDF's but was not successfully edited is strictly worse than none:
+        # it builds, it is FAT-only, and it looks like it should not be.
+        file(REMOVE_RECURSE "${TAB5_FATFS}")
+        message(FATAL_ERROR "patching ffconf.h failed:\n${TAB5_FFCONF_ERR}")
+    endif()
+
+    string(STRIP "${TAB5_FFCONF_OUT}" TAB5_FFCONF_OUT)
+    message(STATUS "${TAB5_FFCONF_OUT}")
+
+    # Written last, so a copy interrupted halfway has no stamp and is
+    # re-derived rather than trusted.
+    file(WRITE "${TAB5_FATFS_STAMP}" "${TAB5_FATFS_WANT}\n")
+    message(STATUS "fatfs: vendored from IDF "
+                   "${IDF_VERSION_MAJOR}.${IDF_VERSION_MINOR}.${IDF_VERSION_PATCH}")
+
+    # A re-derive for a new IDF does not need the sdkconfig dance: the
+    # component already existed, so its Kconfig symbols are already in there.
+    if(NOT TAB5_FATFS_STALE)
+        set(TAB5_FATFS_CHANGED TRUE)
+    endif()
+endif()
+
+if(NOT MAP_FATFS_EXFAT AND EXISTS "${TAB5_FATFS}")
+    file(REMOVE_RECURSE "${TAB5_FATFS}")
+    message(STATUS "fatfs: vendored copy removed, back to stock FAT-only")
+    set(TAB5_FATFS_CHANGED TRUE)
+endif()
+
+if(TAB5_FATFS_CHANGED)
+    # sdkconfig has to go, and this is not housekeeping.
+    #
+    # A sdkconfig generated before components/fatfs/ existed carries none of
+    # that component's Kconfig symbols, so the build compiles the vendored
+    # ffconf.h against a stale config header. It fails as
+    # "'CONFIG_FATFS_USE_LABEL' undeclared", pointing at a line of Espressif's
+    # code, with no hint that the real problem is a config file from thirty
+    # seconds ago. The same applies in reverse when reverting.
+    #
+    # sdkconfig.defaults regenerates it, and pins CONFIG_IDF_TARGET, so the
+    # target survives this.
+    file(REMOVE "${CMAKE_CURRENT_LIST_DIR}/sdkconfig")
+    message(FATAL_ERROR
+        "FatFs changed and sdkconfig has been removed so Kconfig is "
+        "regenerated from sdkconfig.defaults.\n"
+        "Run the same command again - it will succeed.\n"
+        "If anything still refuses to build, delete build/ as well: a "
+        "config header cached from before this change compiles the new "
+        "ffconf.h against the old symbols.")
+endif()
+
+
+# ---------------------------------------------------------------------------
 # Compile M5GFX and M5Unified with ARDUINO defined, as `main` already is.
 #
 # THIS IS THE FIX FOR THE HEADLESS DISPLAY. See DISPLAY_IDF_NOTES.md.

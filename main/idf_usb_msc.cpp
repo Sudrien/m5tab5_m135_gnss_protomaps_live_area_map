@@ -150,8 +150,31 @@ static void usb_msc_task(void *arg) {
             mcfg.max_files              = 5;
             mcfg.allocation_unit_size   = 0;
 
-            if (msc_host_vfs_register(s_dev, USB_MOUNT, &mcfg, &s_vfs) != ESP_OK) {
-                Serial.println("usb: vfs_register failed - unreadable filesystem?");
+            esp_err_t err = msc_host_vfs_register(s_dev, USB_MOUNT, &mcfg, &s_vfs);
+            if (err != ESP_OK) {
+                // Print the code. The first version of this said only
+                // "unreadable filesystem?", which is a guess dressed as a
+                // diagnosis - the call can also fail on a busy mount point or
+                // an out-of-memory, and those look nothing alike.
+                Serial.printf("usb: vfs_register failed: %s (0x%x)\n",
+                              esp_err_to_name(err), (unsigned)err);
+
+                // The overwhelmingly likely cause on a drive this size, so say
+                // it rather than making someone guess:
+                //
+                // ESP-IDF's FATFS is FAT12/16/32 only - FF_FS_EXFAT is off and
+                // there is no Kconfig to turn it on - and it reads an MBR
+                // partition table, not GPT. A 118 GB drive out of the box is
+                // almost always exFAT, and often GPT with it. Neither is a
+                // fault in the drive or in this code; the drive simply cannot
+                // be read as it stands.
+                Serial.println("usb: ESP-IDF reads FAT12/16/32 on an MBR "
+                               "partition table only - not exFAT, not GPT");
+                Serial.println("usb: either reformat (mkfs.vfat -F 32 on an "
+                               "msdos label) or build with "
+                               "idf.py -DMAP_FATFS_EXFAT=1, which vendors a "
+                               "FatFs with exFAT and GPT turned on");
+
                 msc_host_uninstall_device(s_dev);
                 s_dev = nullptr;
                 continue;
