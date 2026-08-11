@@ -1,0 +1,27 @@
+# Build output.
+build/
+sdkconfig
+sdkconfig.old
+
+# Resolved by the ESP-IDF component manager during project(). Committing the
+# lock file would pin dependencies, which is sometimes wanted - but this tree
+# already pins the versions that matter in main/idf_component.yml, and the
+# manager rewrites managed_components/ whenever it re-resolves, so anything
+# committed there is overwritten without warning.
+managed_components/
+dependencies.lock
+
+# Cloned by CMakeLists.txt before project(). A committed copy would shadow the
+# clone with a stale one.
+components/sunset/sunset/
+
+# Derived by CMakeLists.txt from $IDF_PATH at configure time, and re-derived
+# whenever the IDF version changes - see the MAP_FATFS_EXFAT block.
+#
+# Deliberately ignored, unlike the advice in the example this was ported from.
+# That advice assumes a script somebody has to remember to run, where an
+# uncommitted copy means a fresh clone silently builds FAT-only. Here the copy
+# is made automatically, so committing it would only pin a fork of one of IDF's
+# components to whichever IDF was installed the day it was made. The patch that
+# produces it lives in tools/patch_ffconf.py, which is committed.
+components/fatfs/

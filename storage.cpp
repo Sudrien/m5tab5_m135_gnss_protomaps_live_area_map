@@ -34,15 +34,45 @@ static bool        g_have  = false;
 // over it, putting P3 back to an input. So this has to run *after* M5.begin(),
 // not before, and it cannot be done once at startup and forgotten if anything
 // later re-runs the power init.
+// src: M5Unified utility/Power_Class.cpp, Tab5 case - the second expander is
+//      addressed at 0x44 there (pi4io2_i2c_addr in M5GFX's autodetect agrees).
 static const uint8_t PI4IOE2_ADDR    = 0x44;
+
+// src: PI4IOE5V6416 datasheet, register map. 0x03 configuration (0 = output,
+//      1 = input on this part - note M5's tables use 1 = output, see below),
+//      0x05 output port, 0x07 output high-impedance enable.
+// src: m5tab5_esp_idf_usb_host_example writes these three in this order, and
+//      the order matters: direction, then out of high-Z, then drive.
 static const uint8_t PI4IOE_IO_DIR   = 0x03;
 static const uint8_t PI4IOE_OUT_SET  = 0x05;
 static const uint8_t PI4IOE_OUT_H_IM = 0x07;
+
+// src: M5Unified utility/Power_Class.cpp, the commented bit table for 0x44 -
+//      bit 0 WLAN_PWR_EN, bit 3 USB5V_EN, bit 4 PWROFF_PLUSE, bit 5
+//      nCHG_QC_EN, bit 6 CHG_STAT, bit 7 CHG_EN.
+// src: m5tab5_esp_idf_usb_host_example, PI4IOE2_IO_DIR = 0xB9, whose bit 3 is
+//      what distinguishes it from M5Unified's 0xB1.
 static const uint8_t USB5V_EN_BIT    = 1 << 3;
-static const uint32_t EXP_FREQ       = 400000;
+
+// src: M5GFX M5GFX.cpp, Tab5 autodetect - every expander write there is
+//      i2c_write_register8_array(..., 100000). Matched rather than chosen: the
+//      two drivers talk to the same device on the same bus, and there is no
+//      reason for this one to be the odd one out. The part is rated for more.
+static const uint32_t EXP_FREQ       = 100000;
 
 void storage_usb_power(bool on) {
 #if MAP_HAVE_USB_MSC
+    // Idempotent, and quiet about it.
+    //
+    // pick() runs on every storage_rescan(), which during a wait is once a
+    // second, and the first version of this re-wrote all three expander
+    // registers, slept 100 ms for inrush and printed a line every time. The
+    // registers do not need rewriting and the port does not need re-powering;
+    // only a change does.
+    static int applied = -1;                       // -1 = never written
+    if (applied == (int)on) return;
+    applied = (int)on;
+
     M5.In_I2C.bitOn (PI4IOE2_ADDR, PI4IOE_IO_DIR,   USB5V_EN_BIT, EXP_FREQ);
     M5.In_I2C.bitOff(PI4IOE2_ADDR, PI4IOE_OUT_H_IM, USB5V_EN_BIT, EXP_FREQ);
     if (on) M5.In_I2C.bitOn (PI4IOE2_ADDR, PI4IOE_OUT_SET, USB5V_EN_BIT, EXP_FREQ);
@@ -90,19 +120,48 @@ bool storage_card_present() { return SD_MMC.cardType() != CARD_NONE; }
 // Order matters here. SD is checked first so that a card, when present, keeps
 // winning - a user who has both plugged in should not have their cache move
 // depending on enumeration timing.
+// Which medium wins when both are present.
+//
+// USB first by default, because a flash drive is the intended main store: it
+// is larger, faster to load a 40 MB tile cache onto from a desktop, and does
+// not require taking the back off anything. The card slot stays as the
+// fallback and as the only option on an Arduino build.
+//
+// Set to 0 to restore SD-first.
+#ifndef MAP_STORAGE_PREFER_USB
+#  define MAP_STORAGE_PREFER_USB MAP_HAVE_USB_MSC
+#endif
+
+// Power the port and install the host stack without waiting for an answer.
+//
+// Worth calling early and separately from pick(): enumeration happens on the
+// USB driver's own task and takes a moment, so starting it before the SD
+// attempt means the drive is often already there by the time anything asks.
+void storage_usb_begin() {
+#if MAP_HAVE_USB_MSC
+    storage_usb_power(true);
+    usb_msc_begin();
+#endif
+}
+
 static void pick() {
     g_have = true;
+
+#if MAP_HAVE_USB_MSC && MAP_STORAGE_PREFER_USB
+    storage_usb_begin();
+    if (usb_msc_mounted()) { g_fs = usb_msc_fs(); g_name = "USB"; return; }
+#endif
+
     if (SD_MMC.cardType() != CARD_NONE) { g_fs = &SD_MMC; g_name = "SD (SDMMC)"; return; }
 
-#if MAP_HAVE_USB_MSC
+#if MAP_HAVE_USB_MSC && !MAP_STORAGE_PREFER_USB
     // Bringing the stack up is idempotent and cheap; a drive only appears
     // later, on the driver's own task, so the first pick() almost never sees
     // one. storage_rescan() is what eventually finds it.
     //
     // VBUS first, every time. It is one I2C write per register and the port is
     // dead without it - see storage_usb_power().
-    storage_usb_power(true);
-    usb_msc_begin();
+    storage_usb_begin();
     if (usb_msc_mounted()) { g_fs = usb_msc_fs(); g_name = "USB"; return; }
 #endif
 

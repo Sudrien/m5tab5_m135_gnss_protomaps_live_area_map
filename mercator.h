@@ -22,6 +22,9 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+// src: the Web Mercator convention - atan(sinh(pi)) in degrees, the latitude
+//      at which the projection becomes square. Used by every slippy-map
+//      implementation and by the EPSG:3857 bounds; not a chosen cutoff.
 #define MERC_LAT_LIMIT 85.05112877980659
 
 typedef struct {
@@ -64,6 +67,9 @@ static inline void merc_to_ll(merc_pt_t p, double *lat, double *lon) {
 // `tile_px` pixels square. Useful for scale bars and for deciding whether a
 // zoom level has enough detail for the display density.
 static inline double merc_ground_res(double lat, uint8_t z, int tile_px) {
+    // src: 2 * pi * 6378137, the WGS84 semi-major axis. EPSG:3857 treats the
+    //      earth as a sphere of that radius, so this is the full width of the
+    //      projected world in metres.
     const double EQUATOR_M = 40075016.685578488;
     lat = merc_clamp_lat(lat);
     return EQUATOR_M * cos(lat * M_PI / 180.0) / ((double)tile_px * (double)(1u << z));

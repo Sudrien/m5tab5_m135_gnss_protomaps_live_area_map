@@ -28,6 +28,7 @@
 #include <esp_heap_caps.h>
 #include <esp_system.h>
 #include <esp_log.h>
+#include <driver/sdmmc_host.h>
 
 #include <WiFi.h>
 
@@ -71,6 +72,15 @@ static const char *PMT_PATH = "/world.pmtiles";
 // as well means the sketch works when built against the generic esp32p4
 // board, where those defines are absent and ESP-Hosted has no idea where to
 // find the C6.
+// SDIO to the ESP32-C6 co-processor.
+//
+// src: local logging. esp_hosted echoes the pins it ends up using, and this
+//      set is what comes back on a working association:
+//        sdio_wrapper: GPIOs: CLK[12] CMD[13] D0[11] D1[10] D2[9] D3[8]
+//                             Slave_Reset[15]
+//      That line is the only confirmation available - the values go in through
+//      WiFi.setPins() and there is no read-back API - so it is worth keeping in
+//      the boot log rather than trimming.
 constexpr int PIN_C6_CLK = 12;
 constexpr int PIN_C6_CMD = 13;
 constexpr int PIN_C6_D0  = 11;
@@ -246,6 +256,9 @@ static int    g_sunDay = -1;
 
 // Backlight levels. Night is dim enough not to ruin dark adaptation but
 // still readable; day is full, since sunlight is the harder problem.
+// src: M5GFX LGFX_Device::setBrightness takes a uint8_t, so 255 is the top of
+//      the range and not a chosen number.
+// src: BRIGHT_NIGHT is a judgement, unattributed - see PROVENANCE.md.
 static const uint8_t BRIGHT_DAY = 255, BRIGHT_NIGHT = 60;
 static uint8_t g_brightness = BRIGHT_DAY;
 
@@ -700,6 +713,63 @@ static void bootEnd() {
 static bool mountSD(const char **bus, bool allow_format = false);
 static bool confirmFormat();
 
+// Quieten the storage stack while polling an empty slot.
+//
+// A failed mount is the *expected* result here, once a second, and the drivers
+// below have no idea of that - between them they produce five lines and two
+// "HINT: Please reboot the board" suggestions per attempt, which is the entire
+// console for as long as the slot stays empty.
+//
+// Only the ESP-IDF tags can be reached this way. The two Arduino-core lines
+// (SD_MMC.cpp and sd_diskio.cpp) go through ARDUHAL's log_printf, which ends
+// in ets_printf - not esp_log_write - so no runtime call can silence them and
+// esp_log_set_vprintf does not see them either. They are compiled in at
+// CORE_DEBUG_LEVEL. The lever for those is CONFIG_ARDUHAL_LOG_DEFAULT_LEVEL in
+// sdkconfig.defaults, which is deliberately not touched: it would take every
+// Arduino-core error with it, and core errors are how the wifi and SD paths
+// report themselves. Instead the poll simply causes fewer of them - see
+// mountSDQuick().
+//
+// SD_HOST is in the list for sdmmc_host_deinit(), which logs
+// "invalid argument: null pointer" at ERROR every time it is called on a host
+// that is already down - the ordinary case in a probe loop.
+static void sdQuiet(bool quiet) {
+    static const char *tags[] = {
+        "sdmmc_common", "sdmmc_init", "sdmmc_sd", "sdmmc_io", "sdmmc_mmc",
+        "sdmmc_periph", "vfs_fat_sdmmc", "SD_HOST",
+        // Arduino's SD_MMC builds an on-chip LDO power control for the slot on
+        // every begin() (SD_MMC.cpp:267, which sets .ldo_chan_id and leaves
+        // voltage_mv at zero), so the regulator complains once per attempt.
+        // Whether it should be doing that at all is a separate question - see
+        // the board variant note in CMakeLists.txt - but it is not something a
+        // probe loop needs to say a hundred times.
+        "ldo",
+    };
+    for (auto t : tags) esp_log_level_set(t, quiet ? ESP_LOG_NONE : ESP_LOG_INFO);
+}
+
+// The probe used once a second, as opposed to the full ladder used once at
+// boot.
+//
+// SDMMC only. The SPI fallback in mountSD() costs about a second per attempt
+// and two more error lines, and this board's slot is wired for SDMMC - SPI is
+// there for the boot attempt's sake, not because it is ever expected to be the
+// answer here.
+//
+// sdmmc_host_deinit() after every failure is not optional. A failed mount
+// leaves the host initialised with its slot GPIOs still checked out;
+// SD_MMC.end() does not take it down, because Arduino's end() only unmounts
+// what it believes it mounted. Without this every later attempt logs
+// "SDMMC host already initialized, skipping init flow" and reuses a host that
+// was left in whatever state the failure put it in.
+static bool mountSDQuick(const char **bus) {
+    if (SD_MMC.begin("/sdcard", false)) { *bus = "SDMMC 4-bit"; return true; }
+    if (SD_MMC.begin("/sdcard", true))  { *bus = "SDMMC 1-bit"; return true; }
+    SD_MMC.end();
+    sdmmc_host_deinit();
+    return false;
+}
+
 // Wait for something to appear in the microSD slot or the USB-A port.
 //
 // This replaces "insert a card and restart". Everything the program draws
@@ -724,19 +794,28 @@ static bool waitForStorage(const char **bus) {
     uint32_t lastSay = 0;
     bool announced = false;
 
-    for (;;) {
-        if (mountSD(bus)) return true;
-        SD_MMC.end();                       // leave the slot clean for the retry
+    sdQuiet(true);
 
+    for (;;) {
+        // USB first, matching pick()'s preference - and cheap, since a drive
+        // that is not there costs a function call, while an absent card costs
+        // two mount attempts and their timeouts.
+        //
         // A drive enumerates on the USB driver's own task, so this only ever
         // sees one a poll or two after it is plugged in.
         storage_rescan();
-        if (storage_available()) { *bus = storage_name(); return true; }
+        if (storage_available()) { sdQuiet(false); *bus = storage_name(); return true; }
+
+        if (mountSDQuick(bus)) { sdQuiet(false); return true; }
 
         // A card that is present but unreadable is a different problem, and the
-        // one case where formatting is worth offering. Ask once.
-        if (storage_card_present()) {
-            SD_MMC.end();
+        // one case where formatting is worth offering. Ask once - confirmFormat()
+        // blocks on the screen, and asking again every second would be a trap
+        // rather than a prompt.
+        static bool askedFormat = false;
+        if (!askedFormat && storage_card_present()) {
+            askedFormat = true;
+            sdQuiet(false);
             Serial.println("sd: card present but no readable filesystem");
             if (confirmFormat()) {
                 bootBegin();
@@ -744,7 +823,9 @@ static bool waitForStorage(const char **bus) {
                 if (mountSD(bus, true)) { bootStep("card formatted"); return true; }
                 bootStepFail("format failed");
                 SD_MMC.end();
+                sdmmc_host_deinit();
             }
+            sdQuiet(true);
         }
 
         if (!announced) {
@@ -770,9 +851,16 @@ static bool waitForStorage(const char **bus) {
                           (unsigned long)((millis() - started) / 1000));
         }
 
-        // M5.update() keeps touch alive for confirmFormat(), and the delay is
-        // what makes this a 1 Hz poll rather than a spin.
-        for (int i = 0; i < 20; i++) { M5.update(); delay(50); }
+        // Back off. Someone standing at the device with a card in their hand is
+        // served by the first few seconds being responsive; a device left
+        // waiting is served by not filling the console for the next hour. The
+        // two Arduino-core error lines per attempt cannot be silenced, so the
+        // only control over them is how often they happen.
+        uint32_t waited = millis() - started;
+        uint32_t gap = waited < 15000 ? 1000 : waited < 60000 ? 3000 : 10000;
+
+        // M5.update() keeps touch alive for confirmFormat().
+        for (uint32_t i = 0; i < gap / 50; i++) { M5.update(); delay(50); }
     }
 }
 
@@ -902,8 +990,14 @@ static void pickZoom(const GnssFix &fix) {
 // actually observed the ephemeris the predictions are built from. Polling a
 // receiver that has never seen a satellite returns nothing worth keeping.
 static const char *AOP_PATH      = "/aopdb.bin";
+// src: chosen. ASCII "AOP1"; this project's own container, not u-blox's.
 static const uint32_t AOP_MAGIC  = 0x414F5031;   // "AOP1"
-static const uint32_t AOP_MAX_AGE_H = 72;        // ~3 days, the prediction span
+// src: u-blox AssistNow Autonomous - the receiver computes orbit
+//      predictions valid for up to three days ahead, so a database older
+//      than that has nothing useful left in it. Stated in the M8 receiver
+//      description under AssistNow Autonomous; confirm against the
+//      document for your own module, the span is generation-dependent.
+static const uint32_t AOP_MAX_AGE_H = 72;
 static const size_t   AOP_CAP    = 16 * 1024;
 
 struct AopHeader {
@@ -979,6 +1073,7 @@ struct LastFix {
     float    lat, lon;
     int64_t  written_utc;
 };
+// src: chosen. ASCII "LFX1", same reasoning as AOP_MAGIC.
 static const uint32_t LASTFIX_MAGIC = 0x4C465831u;   // "LFX1"
 
 static bool lastFixLoad(double *lat, double *lon) {
@@ -1027,6 +1122,10 @@ static void themeBoot() {
         return;
     }
 
+    // src: chosen. 1767225600 is 2026-01-01T00:00:00Z, comfortably after this
+    //      firmware was written and comfortably before any real use, so it
+    //      separates "the RTC has a time" from "the RTC came up at zero or at
+    //      its own power-on default" without rejecting a valid clock.
     time_t now = time(nullptr);
     if (now < 1767225600) {
         Serial.println("theme: no clock yet, starting in day palette");
@@ -1437,6 +1536,9 @@ static bool panelBegin() {
     // - is known to work: the same binary fails to find the panel on the boot
     // after a flash write and finds it on the next one.
 
+    // src: chosen, arbitrary. RTC_NOINIT memory is undefined after a power-on
+    //      reset, so the counter beside it is only trustworthy when a value
+    //      this unlikely is sitting next to it.
     if (s_panelMagic != 0x5AB5D157u) {          // first boot, counter is junk
         s_panelMagic = 0x5AB5D157u;
         s_panelRetries = 0;
@@ -1573,6 +1675,9 @@ void setup() {
     //     if (_board != m5gfx::board_t::board_unknown) { return; }
     //
     // so nothing initialises and there is no error anywhere to find.
+    // src: M5GFX lgfx/boards.hpp, enum board_t - the values run 0..201
+    //      contiguously, plus board_M5AtomS3R at 512. Anything outside that is
+    //      not a board id at all.
     auto plausible = [](int b) { return b == 0 || (b >= 1 && b <= 201) || b == 512; };
     if (!plausible(boardM5) || !plausible(boardGfx)) {
         Serial.println("display: board id is not a value board_t can hold - the "
@@ -1667,6 +1772,13 @@ void setup() {
 
     const char *bus = "none";
     bootStepBusy("mounting storage");
+
+    // Bring the USB port up first. It costs three I2C writes and returns
+    // immediately - the drive enumerates on the driver's own task - so doing
+    // it here means the SD attempt below runs while a flash drive is coming
+    // up, rather than after it.
+    storage_usb_begin();
+
     if (!mountSD(&bus)) {
         // Not a dead end any more.
         //
@@ -1680,9 +1792,11 @@ void setup() {
         // The distinction the old code drew is kept, because it still matters:
         // an empty slot is the ordinary case and formatting is only worth
         // offering for a card that is present and unreadable.
+        bool unreadable = storage_card_present();
         SD_MMC.end();
-        bootStepFail(storage_card_present() ? "storage - card unreadable"
-                                            : "storage - nothing inserted");
+        sdmmc_host_deinit();               // leave the slot clean for the poll
+        bootStepFail(unreadable ? "storage - card unreadable"
+                                : "storage - nothing inserted");
         if (!waitForStorage(&bus)) {
             g_bootActive = false;
             return;

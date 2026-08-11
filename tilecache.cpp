@@ -41,6 +41,8 @@ struct __attribute__((packed)) RecHdr {
     uint64_t tile_id;
     uint32_t len;
 };
+// src: chosen. ASCII "CTMP" big-endian, so a hex dump of the cache file is
+//      readable. No external meaning.
 static const uint32_t REC_MAGIC = 0x43544D50;
 
 struct Entry {

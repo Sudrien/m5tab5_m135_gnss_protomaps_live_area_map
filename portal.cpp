@@ -20,6 +20,9 @@
 #define PORTAL_LOG_SECRETS 0
 
 static const char *AP_SSID = "Tab5-Map-Setup";
+// src: arduino-esp32 WiFiAP - 192.168.4.1 is the softAP default gateway, so
+//      matching it means the DHCP lease handed to a client already points
+//      here and the captive-portal DNS redirect has somewhere to send them.
 static const IPAddress AP_IP(192, 168, 4, 1);
 
 static WebServer  *g_web = nullptr;

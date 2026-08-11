@@ -196,38 +196,61 @@ endif()
 set(ARDUINO_COMPONENT "${CMAKE_CURRENT_LIST_DIR}/managed_components/espressif__arduino-esp32")
 set(TAB5_VARIANT "${ARDUINO_COMPONENT}/variants/m5stack_tab5")
 
+# Called twice, before and after project(), for the same reason the M5 patch is.
+#
+# The component manager rewrites managed_components/ during project() whenever
+# a dependency resolves, and it re-resolves on every configure that changes
+# anything - a new -D on the idf.py command line is enough. That wipes the
+# variant this copied in, and the copy above ran before project(), so it cannot
+# know.
+#
+# The failure is silent, which is what makes it worth guarding. arduino-esp32
+# falls back to the generic esp32p4 variant, which defines
+#     BOARD_SDMMC_POWER_CHANNEL 4
+#     BOARD_SDMMC_POWER_PIN     45
+# and SD_MMC then builds an sd_pwr_ctrl_ldo_config_t from it (SD_MMC.cpp:267,
+# which sets .ldo_chan_id and leaves voltage_mv at zero). The only sign is one
+# warning during mount:
+#
+#     W ldo: The voltage value 0 is out of the recommended range [500, 2700]
+#
+# The build succeeds, the app runs, and the card may or may not mount depending
+# on whether the expander happened to have the rail up already. A one-line
+# warning is not enough for something that decides whether storage works.
+function(tab5_install_variant OUT_INSTALLED)
+    set(_did FALSE)
+    if(EXISTS "${ARDUINO_COMPONENT}" AND NOT EXISTS "${TAB5_VARIANT}")
+        file(GLOB VARIANT_CANDIDATES
+             "$ENV{HOME}/.arduino15/packages/esp32/hardware/esp32/*/variants/m5stack_tab5")
+        if(VARIANT_CANDIDATES)
+            list(SORT VARIANT_CANDIDATES)
+            list(REVERSE VARIANT_CANDIDATES)          # highest core version first
+            list(GET VARIANT_CANDIDATES 0 VARIANT_SRC)
+            file(COPY "${VARIANT_SRC}" DESTINATION "${ARDUINO_COMPONENT}/variants")
+            message(STATUS "arduino variant: installed m5stack_tab5 from ${VARIANT_SRC}")
+            set(_did TRUE)
+        else()
+            message(WARNING
+                "CONFIG_ARDUINO_VARIANT is m5stack_tab5 but no such variant was found "
+                "under ~/.arduino15/packages/esp32/hardware/esp32/*/variants/. "
+                "Install the esp32 core through the Arduino IDE or arduino-cli, or "
+                "set CONFIG_ARDUINO_VARIANT=\"esp32p4\" - the SD card slot will be "
+                "powered through an LDO channel this board does not use.")
+        endif()
+    endif()
+    set(${OUT_INSTALLED} ${_did} PARENT_SCOPE)
+endfunction()
+
 if(NOT EXISTS "${ARDUINO_COMPONENT}")
     # First configure on a fresh tree: the component manager has not run yet,
     # so there is nothing to copy into. It downloads during project() below,
-    # after this point, and arduino-esp32 will then fail on the missing variant.
-    # Running idf.py build a second time installs it and succeeds.
-    #
-    # This is a genuine two-pass first build, not a mistake to debug.
+    # and the second pass installs the variant then.
     message(STATUS
         "arduino variant: managed_components not present yet - components will "
-        "be fetched during this configure. If the build stops with "
-        "'variants/m5stack_tab5 is not a directory', just run idf.py build "
-        "again: the variant is installed on the next configure.")
+        "be fetched during this configure, and the variant installed afterwards.")
 endif()
 
-if(EXISTS "${ARDUINO_COMPONENT}" AND NOT EXISTS "${TAB5_VARIANT}")
-    file(GLOB VARIANT_CANDIDATES
-         "$ENV{HOME}/.arduino15/packages/esp32/hardware/esp32/*/variants/m5stack_tab5")
-    if(VARIANT_CANDIDATES)
-        list(SORT VARIANT_CANDIDATES)
-        list(REVERSE VARIANT_CANDIDATES)          # highest core version first
-        list(GET VARIANT_CANDIDATES 0 VARIANT_SRC)
-        file(COPY "${VARIANT_SRC}" DESTINATION "${ARDUINO_COMPONENT}/variants")
-        message(STATUS "arduino variant: installed m5stack_tab5 from ${VARIANT_SRC}")
-    else()
-        message(WARNING
-            "CONFIG_ARDUINO_VARIANT is m5stack_tab5 but no such variant was found "
-            "under ~/.arduino15/packages/esp32/hardware/esp32/*/variants/. "
-            "Install the esp32 core through the Arduino IDE or arduino-cli, or "
-            "set CONFIG_ARDUINO_VARIANT=\"esp32p4\" - the SD card will not "
-            "mount with the generic variant.")
-    endif()
-endif()
+tab5_install_variant(TAB5_VARIANT_INSTALLED_EARLY)
 
 # ---------------------------------------------------------------------------
 # Compile M5GFX and M5Unified with ARDUINO defined, as `main` already is.
@@ -587,12 +610,22 @@ project(tab5_map)
 #
 # Patching now fixes the file but not this build: the components were already
 # registered. Stopping is the honest outcome, and the next run is clean.
+tab5_install_variant(TAB5_VARIANT_INSTALLED_LATE)
 tab5_patch_m5_components(M5_PATCHED_LATE)
-if(M5_PATCHED_LATE)
+if(TAB5_VARIANT_INSTALLED_LATE OR M5_PATCHED_LATE)
+    if(TAB5_VARIANT_INSTALLED_LATE)
+        message(STATUS "arduino variant: was missing after component resolution")
+    endif()
+    if(M5_PATCHED_LATE)
+        message(STATUS "m5gfx/m5unified: were unpatched after component resolution")
+    endif()
     message(FATAL_ERROR
-        "m5gfx/m5unified were fetched or refreshed during this configure and "
-        "have now been patched to compile with ARDUINO defined. That patch "
-        "cannot take effect in a build that has already configured them.\n"
+        "managed_components/ was fetched or refreshed during this configure, "
+        "which discards everything installed into it beforehand. The board "
+        "variant and the ARDUINO patch have been restored, but neither can "
+        "take effect in a build that has already configured those components.\n"
         "Run the same command again - it will succeed.\n"
-        "Without it the display never initialises; see DISPLAY_IDF_NOTES.md.")
+        "Building on would give a display that never initialises and an SD "
+        "slot powered through an LDO channel this board does not use. Both "
+        "fail quietly. See DISPLAY_IDF_NOTES.md.")
 endif()

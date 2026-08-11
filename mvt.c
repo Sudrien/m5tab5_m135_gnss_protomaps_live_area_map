@@ -14,6 +14,9 @@
 //   Value:   1 = string  2 = float  3 = double
 //            4 = int64   5 = uint64 6 = sint64  7 = bool
 
+// src: Protocol Buffers encoding specification, "Message Structure" - the
+//      three-bit wire type in each field tag. 3 and 4 (start/end group) are
+//      deprecated and never appear in MVT, so they are not defined here.
 #define WT_VARINT 0
 #define WT_64BIT  1
 #define WT_LEN    2

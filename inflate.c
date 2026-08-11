@@ -9,6 +9,9 @@
 // entries (1 KiB), which fits in cache on the P4.
 #define FAST_BITS  9
 #define FAST_SIZE  (1 << FAST_BITS)
+// src: RFC 1951 (DEFLATE) section 3.2.7 - Huffman code lengths in the
+//      dynamic block header are encoded in 3 bits with a maximum of 15, and
+//      no code in a DEFLATE stream may be longer than that.
 #define MAX_BITS   15
 
 typedef struct {
@@ -138,6 +141,10 @@ static int huff_decode(inf_t *s, const huff_t *h) {
 }
 
 // ---- length / distance tables ---------------------------------------------
+//
+// src: RFC 1951 section 3.2.5, the two tables headed "Extra Bits / Length"
+//      and "Extra Bits / Dist". Transcribed, not derived - the values are
+//      the format, so a mismatch here decodes garbage rather than failing.
 static const uint16_t LEN_BASE[29] = {
     3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258
 };
@@ -199,6 +206,9 @@ static void build_fixed(huff_t *lit, huff_t *dist) {
     huff_build(dist, d, 30);
 }
 
+// src: RFC 1951 section 3.2.7 - the fixed permutation the code-length
+//      alphabet is transmitted in, given there verbatim as
+//      16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15.
 static const uint8_t CLEN_ORDER[19] = {
     16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15
 };
@@ -311,6 +321,9 @@ inf_err_t inflate_raw(const uint8_t *in, uint32_t in_len,
 // rodata and runs roughly 6x faster than the bitwise loop - the full 256-entry
 // table is only marginally quicker again and costs 1 KiB, which is not worth
 // it when this runs once per tile.
+// src: the standard CRC-32 of RFC 1952 (gzip), polynomial 0xEDB88320
+//      reflected. These sixteen entries are the nibble-at-a-time form: the
+//      256-entry table with the low four index bits held at zero.
 static const uint32_t CRC_TAB[16] = {
     0x00000000u, 0x1DB71064u, 0x3B6E20C8u, 0x26D930ACu,
     0x76DC4190u, 0x6B6B51F4u, 0x4DB26158u, 0x5005713Cu,

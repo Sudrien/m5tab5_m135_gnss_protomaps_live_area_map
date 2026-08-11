@@ -46,3 +46,24 @@ idf_component_register(
 # Tells features.h which build this is. Deliberately explicit rather than
 # inferred from ARDUINO, which is defined in both configurations.
 target_compile_definitions(${COMPONENT_LIB} PUBLIC MAP_BUILD_IDF=1)
+
+# Hand the build-time switches from the command line to the compiler.
+#
+# `idf.py -DMAP_HAVE_USB_MSC=0` sets a CMake *cache variable*. Nothing reads it
+# unless it is turned into a compile definition here, and features.h guards
+# every switch with #ifndef, so the default silently wins and the build behaves
+# as though the flag had never been passed. The only sign is a line most people
+# scroll past:
+#
+#     Manually-specified variables were not used by the project:
+#       MAP_HAVE_USB_MSC
+#
+# That is a warning, not an error, so the build succeeds, flashes and runs -
+# just not the build that was asked for. Both switches documented in features.h
+# are listed here; anything added there needs adding here too.
+foreach(MAP_OPT MAP_HAVE_USB_MSC MAP_STORAGE_PREFER_USB MAP_M5_SMOKE_TEST)
+    if(DEFINED ${MAP_OPT})
+        target_compile_definitions(${COMPONENT_LIB} PUBLIC ${MAP_OPT}=${${MAP_OPT}})
+        message(STATUS "features: ${MAP_OPT}=${${MAP_OPT}} (from the command line)")
+    endif()
+endforeach()

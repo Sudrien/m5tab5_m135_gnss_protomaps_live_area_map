@@ -39,6 +39,14 @@ bool storage_available();
 // Safe to call more than once, and a no-op on builds without USB support.
 void storage_usb_power(bool on);
 
+// Power the port and install the host stack, without waiting for a drive.
+//
+// Separate from storage_rescan() so it can be started early: enumeration runs
+// on the USB driver's own task, so anything that gives it a head start before
+// the first question is asked is time not spent waiting later. Idempotent, and
+// a no-op without USB support.
+void storage_usb_begin();
+
 // True while a card is physically in the slot.
 //
 // Polled, because it has to be: the microSD connector's detect switch is not

@@ -38,6 +38,12 @@
 //
 // To turn it off again:
 //   idf.py -DMAP_HAVE_USB_MSC=0 build
+//
+// That works only because main/CMakeLists.txt forwards it. idf.py -D sets a
+// CMake cache variable, which reaches no compiler on its own, and the #ifndef
+// below would then quietly keep the default. Any switch added here has to be
+// added to the forwarding list there as well - CMake warns that the variable
+// was unused, but it is a warning, and the build still succeeds and flashes.
 #ifndef MAP_HAVE_USB_MSC
 #  define MAP_HAVE_USB_MSC MAP_BUILD_IDF
 #endif

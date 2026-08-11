@@ -3,6 +3,9 @@
 #include "pmtiles.h"
 #include <string.h>
 
+// src: PMTiles v3 specification - the header is a fixed 127 bytes, followed
+//      by the root directory. Fixed by the format, so reading fewer bytes
+//      than this is never valid.
 #define PMT_HEADER_LEN 127
 
 // ---- little-endian scalar reads --------------------------------------------

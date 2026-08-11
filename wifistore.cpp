@@ -14,6 +14,9 @@
 #include <string.h>
 
 static const char *CRED_PATH = "/wifi.bin";
+// src: chosen. Both are this project's own file format - the magic exists to
+//      reject a file that is not ours before decryption is attempted, and
+//      the version to allow a layout change later without a silent misread.
 static const uint8_t MAGIC[8] = { 'T','A','B','5','W','I','F','I' };
 static const uint8_t VERSION  = 1;
 

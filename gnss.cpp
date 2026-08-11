@@ -231,12 +231,16 @@ static void gnss_task(void *arg) {
 // the current one and edits it rather than constructing a message, which is
 // also how the u-blox reference drivers do it.
 
-#define UBX_CLS_CFG   0x06
-#define UBX_ID_NAVX5  0x23
-#define UBX_CLS_MGA   0x13
-#define UBX_ID_DBD    0x80
-#define UBX_ID_MGA_ACK 0x60
-#define UBX_CLS_ACK   0x05
+// All six are u-blox message class/ID assignments.
+// src: u-blox M8 receiver description & protocol specification (UBX-13003221),
+//      "UBX Class IDs" and the per-message sections. Same values in the M9/M10
+//      documents; they have been stable across generations.
+#define UBX_CLS_CFG   0x06   // UBX-CFG
+#define UBX_ID_NAVX5  0x23   // UBX-CFG-NAVX5, carries the AOP enable bit
+#define UBX_CLS_MGA   0x13   // UBX-MGA (multiple GNSS assistance)
+#define UBX_ID_DBD    0x80   // UBX-MGA-DBD, the navigation database dump
+#define UBX_ID_MGA_ACK 0x60  // UBX-MGA-ACK, what terminates a DBD poll
+#define UBX_CLS_ACK   0x05   // UBX-ACK
 
 // Run one UBX exchange: send, then collect matching frames until the
 // terminating frame arrives or things go quiet.
