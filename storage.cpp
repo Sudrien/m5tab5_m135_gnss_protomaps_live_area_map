@@ -3,6 +3,8 @@
 #include <SD.h>
 #include <SD_MMC.h>
 #include <M5Unified.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 #if MAP_HAVE_USB_MSC
 // Defined in main/idf_usb_msc.cpp, which only exists in the IDF build.
@@ -14,6 +16,33 @@ fs::FS  *usb_msc_fs();
 static fs::FS     *g_fs   = nullptr;
 static const char *g_name = "none";
 static bool        g_have  = false;
+
+// Serialises the selection, and with it every I2C write the selection used to
+// make from whatever task happened to ask first.
+//
+// storage_fs() is called from tasks that are not the one running loop():
+// tilecache_open() and wifistore's fsptr() both reach it, and both run under
+// the prefetch and worldfloor tasks on core 1. storage_rescan() sets g_fs back
+// to nullptr, so any of them can re-enter pick() at any moment.
+//
+// That mattered because pick() used to bring the USB port up, and bringing the
+// port up is three M5.In_I2C writes to the expander at 0x44 - on the *internal*
+// bus, the one the INA226 fuel gauge at 0x41 sits on, which loop() reads about
+// fifteen times a second for the status bar. M5Unified's I2C_Class holds no
+// lock of its own, so those two transactions could interleave. The good case is
+// a garbage reading; the bad case is a slave left mid-byte holding SDA low,
+// which does not recover on its own - and INA226_Class::readRegister16 does not
+// check for failure, it returns its pre-zeroed buffer. Zero millivolts reads as
+// "no battery", permanently.
+//
+// Statically allocated so there is no window where two tasks each create one.
+static StaticSemaphore_t g_lock_buf;
+static SemaphoreHandle_t g_lock = xSemaphoreCreateRecursiveMutexStatic(&g_lock_buf);
+
+struct StorageLock {
+    StorageLock()  { xSemaphoreTakeRecursive(g_lock, portMAX_DELAY); }
+    ~StorageLock() { xSemaphoreGiveRecursive(g_lock); }
+};
 
 // ---- USB-A bus power -------------------------------------------------------
 //
@@ -60,8 +89,19 @@ static const uint8_t USB5V_EN_BIT    = 1 << 3;
 //      reason for this one to be the odd one out. The part is rated for more.
 static const uint32_t EXP_FREQ       = 100000;
 
+// Only ever called from the task that runs setup()/loop() - see the note on
+// g_lock. Enforced rather than documented, because the whole point is that a
+// worker task must not touch the internal I2C bus behind loop()'s back.
 void storage_usb_power(bool on) {
 #if MAP_HAVE_USB_MSC
+    static TaskHandle_t owner = nullptr;
+    if (!owner) owner = xTaskGetCurrentTaskHandle();
+    if (owner != xTaskGetCurrentTaskHandle()) {
+        Serial.println("usb: refusing an off-task VBUS write - the internal "
+                       "I2C bus belongs to loop()");
+        return;
+    }
+
     // Idempotent, and quiet about it.
     //
     // pick() runs on every storage_rescan(), which during a wait is once a
@@ -144,11 +184,15 @@ void storage_usb_begin() {
 #endif
 }
 
+// Reports what is mounted. Does not mount, power, or configure anything.
+//
+// It used to call storage_usb_begin() - which is I2C plus a 100 ms delay - from
+// whichever task asked first. That is now the caller's job, on the main task,
+// and it is why storage_usb_begin() exists as a separate entry point.
 static void pick() {
     g_have = true;
 
 #if MAP_HAVE_USB_MSC && MAP_STORAGE_PREFER_USB
-    storage_usb_begin();
     if (usb_msc_mounted()) { g_fs = usb_msc_fs(); g_name = "USB"; return; }
 #endif
 
@@ -159,9 +203,8 @@ static void pick() {
     // later, on the driver's own task, so the first pick() almost never sees
     // one. storage_rescan() is what eventually finds it.
     //
-    // VBUS first, every time. It is one I2C write per register and the port is
-    // dead without it - see storage_usb_power().
-    storage_usb_begin();
+    // VBUS is not brought up here any more; storage_usb_begin() does it from
+    // the main task before anything asks - see storage_usb_power().
     if (usb_msc_mounted()) { g_fs = usb_msc_fs(); g_name = "USB"; return; }
 #endif
 
@@ -173,16 +216,19 @@ static void pick() {
 }
 
 fs::FS *storage_fs() {
+    StorageLock l;
     if (!g_fs) pick();
     return g_fs;
 }
 
 const char *storage_name() {
+    StorageLock l;
     if (!g_fs) pick();
     return g_name;
 }
 
 void storage_rescan() {
+    StorageLock l;
     g_fs = nullptr;
     pick();
 }
@@ -213,6 +259,7 @@ size_t storage_write(fs::File &f, const uint8_t *src, size_t len) {
 }
 
 bool storage_available() {
+    StorageLock l;
     if (!g_fs) pick();
     return g_have;
 }

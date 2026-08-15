@@ -805,6 +805,10 @@ static bool waitForStorage(const char **bus) {
         //
         // A drive enumerates on the USB driver's own task, so this only ever
         // sees one a poll or two after it is plugged in.
+        // On the main task, deliberately: storage_usb_power() writes the
+        // expander on the internal I2C bus and pick() no longer does it for
+        // us. Idempotent after the first call.
+        storage_usb_begin();
         storage_rescan();
         if (storage_available()) { sdQuiet(false); *bus = storage_name(); return true; }
 
@@ -1340,9 +1344,350 @@ static const int CELL_MV_FULL  = 4150;
 // reads zero, and zero volts is not an empty battery - it is no measurement.
 // Showing that as a red 0% is worse than showing nothing, because it is
 // indistinguishable from a real flat pack.
+//
+// Read directly rather than through M5Unified, and cache the result.
+//
+// Two separate problems, one answer.
+//
+// The read itself: INA226_Class::readRegister16 pre-zeroes its buffer, calls
+// the bus and returns buf[0]<<8|buf[1] without checking whether the transfer
+// happened. A NACK and a genuine zero are the same value by the time
+// getBatteryVoltage() sees it, so a single failed transaction is
+// indistinguishable from a flat pack - and the code above quite correctly
+// treats zero as "no measurement" and prints "no batt". One failure is enough
+// to produce it. Reading the bus voltage register here means the ack is
+// visible, so a failure can be retried instead of displayed.
+//
+// The rate: drawClockBattery() runs at the 15 fps the map is drawn at, so this
+// was fifteen INA226 transactions and fifteen expander reads (isCharging) per
+// second on the internal bus. That is the contention window that made a race
+// with anything else on the bus a matter of when rather than whether. Once a
+// second is more than enough for a battery, and the status bar reads the
+// cached value.
+//
+// src: INA226 datasheet - register 0x02 is the bus voltage, 1.25 mV/LSB,
+//      unsigned. M5Unified's Tab5 path reads the same register.
+static const uint8_t INA226_ADDR   = 0x41;
+static const uint8_t INA226_REG_V  = 0x02;
+static const uint32_t INA226_FREQ  = 400000;
+
+// How many consecutive failed polls before the reading is given up on.
+//
+// Not zero, and not one. A single dropped transaction is noise - a retry a
+// second later costs nothing and the pack has not moved. Five seconds of
+// silence is a sensor that is genuinely not answering, which is worth saying.
+static const int BATT_MISS_MAX = 5;
+
+// How long a reading may go unrefreshed before it stops being shown.
+//
+// Ninety seconds is chosen against the discharge rate, not against the poll
+// rate: a pack that lasts hours cannot move a visible percentage point in that
+// time, so a stale value is still a true one, while a "no batt" caused by a
+// busy renderer is simply false.
+static const uint32_t BATT_STALE_MS = 90000;
+
+static uint32_t s_battGoodMs = 0;
+
+static int  s_battMv    = 0;
+static bool s_battOk    = false;
+static bool s_battChg   = false;
+static int  s_battMiss  = 0;
+
+// One transaction. True only if the part actually acked.
+// Why the last read failed. Kept separately because "the transfer did not
+// happen" and "the transfer happened and the answer was zero" have different
+// causes and different fixes, and collapsing them into one bool is the same
+// mistake M5Unified makes one layer down.
+enum InaFail { INA_OK, INA_NAK, INA_ZERO };
+static InaFail s_inaLast = INA_OK;
+
+static bool inaBusMillivolts(int *mv) {
+    uint8_t b[2] = { 0, 0 };
+    if (!M5.In_I2C.readRegister(INA226_ADDR, INA226_REG_V, b, 2, INA226_FREQ)) {
+        s_inaLast = INA_NAK;
+        return false;
+    }
+    uint16_t raw = (uint16_t)(b[0] << 8 | b[1]);
+    if (raw == 0) {                             // acked, but not a measurement
+        s_inaLast = INA_ZERO;
+        return false;
+    }
+    s_inaLast = INA_OK;
+    *mv = (int)raw * 5 / 4;                     // 1.25 mV/LSB
+    return true;
+}
+
+// Read a 16-bit register, reporting whether the transfer happened at all.
+static bool inaReg(uint8_t reg, uint16_t *out) {
+    uint8_t b[2] = { 0, 0 };
+    if (!M5.In_I2C.readRegister(INA226_ADDR, reg, b, 2, INA226_FREQ)) return false;
+    *out = (uint16_t)(b[0] << 8 | b[1]);
+    return true;
+}
+
+// Re-initialise the internal I2C controller.
+//
+// This is the actual repair, and it was found by accident: the diagnostic used
+// to read the SDA/SCL levels through the GPIO driver and then re-begin() the
+// bus to hand the pins back, and the register reads it performed immediately
+// afterwards succeeded - having failed 64 polls in a row up to that moment.
+// Nothing else in that path touches the device.
+//
+// What wedges it is a transaction that gets preempted and times out. During
+// the first thirty seconds of a run the tile renderer takes the core almost
+// completely - loop() managed two iterations in one measured window - and a
+// register read is start, write, repeated start, read, stop, which is long
+// enough to be interrupted in the middle. The controller is then left in a
+// state where a bare address probe still completes (which is why every device
+// on the bus appeared healthy) but a repeated start never does.
+//
+// It does not recover on its own. The starvation had been over for half a
+// minute, with loop() back to thousands of iterations per window, and the
+// reads were still failing.
+static bool i2cReinit(void) {
+    int sda = M5.In_I2C.getSDA();
+    int scl = M5.In_I2C.getSCL();
+    return M5.In_I2C.begin(M5.In_I2C.getPort(), sda, scl);
+}
+
+// Put the part back into continuous shunt-and-bus conversion.
+//
+// src: INA226 datasheet, CONFIG (0x00). Bits 2:0 are the operating mode, and
+//      000 is power-down - in which every data register reads zero while the
+//      device still acknowledges its own address, which is precisely the state
+//      the probe could not see. 0x4527 is what this board boots with:
+//      16 averages, 1.1 ms conversion times, mode 111.
+static const uint16_t INA226_CFG_WANTED = 0x4527;
+
+static bool inaConfigure(void) {
+    uint8_t b[2] = { (uint8_t)(INA226_CFG_WANTED >> 8),
+                     (uint8_t)(INA226_CFG_WANTED & 0xFF) };
+    return M5.In_I2C.writeRegister(INA226_ADDR, 0x00, b, 2, INA226_FREQ);
+}
+
+// Why the reads stopped. Printed once per failure episode, because the answer
+// decides what the fix is and guessing between the two costs a day.
+//
+// Three questions, in the order that narrows fastest:
+//
+//   1. Is anything else on the internal bus still answering? The GT911 touch
+//      controller and the two I/O expanders live there. If 0x41 has gone quiet
+//      and they have not, the bus is fine and the INA226 is the problem. If
+//      they have all gone quiet together, the bus is wedged - a transaction
+//      aborted mid-byte leaves a slave holding SDA low and nothing recovers on
+//      its own.
+//
+//   2. What are the lines actually doing? SDA low with SCL high, with no
+//      transaction in flight, *is* the wedge - there is no other way for that
+//      state to exist at rest.
+//
+//   3. Was there memory to do the transfer with? M5Unified's I2C path
+//      allocates on the internal heap, and a failed allocation returns false
+//      without ever driving a pin. That looks identical from the call site and
+//      is not a bus fault at all - see the USB MSC transfer buffer note in
+//      storage.h, which is the other large consumer of internal DMA memory.
+static void battDiagnose() {
+    // src: M5Unified I2C_Class exposes the pins it was configured with, so
+    //      this does not have to hardcode a board's wiring.
+    int sda = M5.In_I2C.getSDA();
+    int scl = M5.In_I2C.getSCL();
+
+    Serial.printf("power: last good reading %lu ms ago\n",
+                  (unsigned long)(millis() - s_battGoodMs));
+    Serial.printf("power: INA226 silent for %d polls - internal heap %u B, "
+                  "largest block %u B, largest DMA block %u B\n",
+                  s_battMiss,
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+
+    // Who is still there. A bare address probe, no register read, so a device
+    // that is present but confused still shows up.
+    static const struct { uint8_t addr; const char *what; } roll[] = {
+        { 0x41, "INA226 (fuel gauge)" },
+        { 0x43, "PI4IOE #1" },
+        { 0x44, "PI4IOE #2" },
+        { 0x14, "GT911 touch" },
+        { 0x51, "RTC" },
+    };
+    int alive = 0;
+    for (auto &d : roll) {
+        bool ack = M5.In_I2C.start(d.addr, false, INA226_FREQ);
+        M5.In_I2C.stop();
+        if (ack) alive++;
+        Serial.printf("power:   0x%02X %-20s %s\n",
+                      d.addr, d.what, ack ? "ack" : "-");
+    }
+
+    // At rest both lines idle high. Anything else is the fault itself.
+    // Reading the levels means taking the pins away from the I2C peripheral,
+    // so they have to be handed back. The first version of this did not, and
+    // every diagnosis permanently detached GPIO31/32 from the controller -
+    // which turned a transient fault into the permanent one it was trying to
+    // explain. Diagnostics must not be able to cause the thing they measure.
+    int sda_lvl = digitalRead(sda);
+    int scl_lvl = digitalRead(scl);
+    i2cReinit();                        // hand the pins back to the controller
+    Serial.printf("power:   SDA(GPIO%d)=%d SCL(GPIO%d)=%d\n",
+                  sda, sda_lvl, scl, scl_lvl);
+
+    // SDA low at rest is the wedge, whoever else is still answering.
+    //
+    // This used to require that nothing at all acked, which is too strict: a
+    // GT911 will acknowledge its address while being useless for data, so one
+    // stubborn ack was enough to route a genuinely stuck bus into the "this is
+    // the part, not the bus" branch and skip the recovery. There is no benign
+    // reading of a low SDA with no transaction in flight.
+    if (sda_lvl == 0) {
+        Serial.println("power: bus wedged - a slave is holding SDA low. "
+                       "Clocking it out.");
+        // Nine clocks with SDA released walks the stuck slave through the rest
+        // of the byte it thinks it is sending, after which it sees a stop.
+        // M5Unified's release() is exactly this; calling it rather than
+        // bit-banging keeps the driver's idea of the bus state in step.
+        M5.In_I2C.release();
+        // begin() wants an i2c_port_t, and the class already knows which one
+        // it was configured with - passing a literal here would hardcode a
+        // board's wiring for no gain. I2C_NUM_0 is the Tab5 internal bus if
+        // getPort() is missing from an older M5Unified; the external bus is
+        // I2C_NUM_1.
+        M5.In_I2C.begin(M5.In_I2C.getPort(), sda, scl);
+        s_battMiss = 0;                 // give the recovered bus a fresh count
+    } else if (alive == 0) {
+        Serial.println("power: nothing on the internal bus answers, but SDA is "
+                       "high - the controller is not transmitting. Suspect a "
+                       "failed allocation rather than the wiring.");
+    } else {
+        // The bus is healthy and 0x41 acks, so the question is what the
+        // registers say. An address probe cannot tell a working part from one
+        // sitting in power-down: both acknowledge, and only the data registers
+        // differ.
+        uint16_t die = 0, cfg = 0, bus = 0;
+        bool die_ok = inaReg(0xFF, &die);
+        bool cfg_ok = inaReg(0x00, &cfg);
+        bool bus_ok = inaReg(0x02, &bus);
+
+        Serial.printf("power:   last read %s, die=0x%04X%s cfg=0x%04X%s "
+                      "bus=0x%04X%s\n",
+                      s_inaLast == INA_NAK  ? "did not complete"
+                    : s_inaLast == INA_ZERO ? "completed and returned zero"
+                                            : "succeeded",
+                      die, die_ok ? "" : "(no read)",
+                      cfg, cfg_ok ? "" : "(no read)",
+                      bus, bus_ok ? "" : "(no read)");
+
+        if (cfg_ok && (cfg & 0x0007) == 0) {
+            // Mode 000. Every data register reads zero and the part still
+            // acks, which is the whole reason the earlier probe said the
+            // hardware was fine.
+            Serial.printf("power: INA226 is in power-down (cfg=0x%04X) - "
+                          "something cleared the mode bits after boot, where "
+                          "they read 0x%04X. Reconfiguring.\n",
+                          cfg, INA226_CFG_WANTED);
+            if (inaConfigure()) {
+                s_battMiss = 0;
+                delay(5);               // one conversion at 1.1 ms averaged x16
+            } else {
+                Serial.println("power: the reconfigure write did not complete");
+            }
+        } else if (cfg_ok && cfg != INA226_CFG_WANTED) {
+            Serial.printf("power: INA226 config has changed since boot "
+                          "(0x%04X, was 0x%04X) but conversion is still "
+                          "enabled - not the mode bits\n",
+                          cfg, INA226_CFG_WANTED);
+        } else if (s_inaLast == INA_NAK) {
+            Serial.println("power: 0x41 acks its address but a register read "
+                           "does not complete - the repeated start is what is "
+                           "failing, not the device");
+        } else {
+            Serial.println("power: INA226 configured and answering, and still "
+                           "reading zero volts - this is the part");
+        }
+    }
+}
+
+// Called from loop(). Rate-limited internally, so calling it more often than
+// it polls is free.
+static void batteryPoll(bool force) {
+    static uint32_t last = 0;
+    if (!force && millis() - last < 1000) return;
+    last = millis();
+
+    // Three attempts, spaced.
+    //
+    // A register read is start-write-restart-read-stop, and this task gets
+    // preempted mid-sequence by the tile renderer - at which point the
+    // transaction times out and returns false with nothing wrong anywhere.
+    // A single retry two milliseconds later lands inside the same render, so
+    // it fails for the same reason; spacing them gives at least one a chance
+    // to fall in a gap. This is a workaround for the starvation below, not a
+    // fix for it.
+    int mv = 0;
+    bool ok = false;
+    for (int i = 0; i < 3 && !ok; i++) {
+        if (i) delay(20);
+        ok = inaBusMillivolts(&mv);
+    }
+
+    if (ok) {
+        if (!s_battOk) Serial.println("power: INA226 answering again");
+        s_battMv    = mv;
+        s_battOk    = true;
+        s_battMiss  = 0;
+        s_battGoodMs = millis();
+        // isCharging() is an expander read on the same bus, and just as
+        // interruptible. Only worth attempting when the bus has just proved
+        // it will carry a transaction.
+        s_battChg = M5.Power.isCharging();
+        return;
+    }
+
+    // Give up on wall-clock time, not on a poll count.
+    //
+    // The count was wrong because it assumed loop() runs at a steady rate, and
+    // the whole problem is that it does not: at four iterations in thirty
+    // seconds, five "consecutive" misses is a minute of real time, and the
+    // status bar had already been lying for most of it. A pack voltage does
+    // not move meaningfully in a minute, so the honest thing is to keep
+    // showing the last real measurement and only admit defeat when it is old
+    // enough to be worth doubting.
+    s_battMiss++;
+
+    // Three failures is enough to act on.
+    //
+    // Not because three is meaningful in itself, but because the failure this
+    // recovers from is permanent: once the controller is wedged, waiting adds
+    // nothing but a stale display. Rate-limited to one attempt every five
+    // seconds so that a fault it cannot fix does not turn into a re-init loop.
+    if (s_battMiss >= 3) {
+        static uint32_t lastTry = 0;
+        if (lastTry == 0 || millis() - lastTry > 5000) {
+            lastTry = millis();
+            bool ok = i2cReinit();
+            // Said once per episode rather than once per attempt. If this line
+            // appears regularly, the starvation that causes the wedge is the
+            // thing to fix - this only clears up after it.
+            static bool said = false;
+            if (!said) {
+                said = true;
+                Serial.printf("power: internal I2C wedged after %d failed "
+                              "reads - re-initialising the controller (%s)\n",
+                              s_battMiss, ok ? "ok" : "failed");
+            }
+        }
+    }
+
+    if (s_battOk && millis() - s_battGoodMs > BATT_STALE_MS) {
+        battDiagnose();
+        s_battOk = false;
+    }
+}
+
 static int batteryPercent(int *out_mv) {
-    int mv = (int)M5.Power.getBatteryVoltage();      // whole pack, millivolts
-    if (out_mv) *out_mv = mv;
+    if (out_mv) *out_mv = s_battMv;
+    if (!s_battOk) return -1;
+
+    int mv = s_battMv;
 
     // Below one flat cell there is nothing plausible to report, whatever the
     // cell count.
@@ -1356,6 +1701,7 @@ static int batteryPercent(int *out_mv) {
 // Said once at boot, because a wrong battery reading is easy to notice and
 // hard to diagnose without the raw numbers behind it.
 static void powerReport() {
+    batteryPoll(true);                  // nothing has polled yet at boot
     int mv = 0;
     int pct = batteryPercent(&mv);
     int m5  = (int)M5.Power.getBatteryLevel();
@@ -1405,7 +1751,6 @@ static void powerReport() {
     // M5Unified uses the same address and the same continuous mode, so if the
     // chip answers here, the difference is elsewhere.
     {
-        const uint8_t INA226_ADDR = 0x41;
         uint8_t buf[2] = { 0, 0 };
         bool ok = M5.In_I2C.readRegister(INA226_ADDR, 0xFF, buf, 2, 400000);
         uint16_t die = (uint16_t)(buf[0] << 8 | buf[1]);
@@ -1456,7 +1801,7 @@ static void drawClockBattery(const GnssFix &fix, lgfx::LovyanGFX *g) {
     }
 
     int pct = batteryPercent(nullptr);
-    bool charging = M5.Power.isCharging();
+    bool charging = s_battChg;          // cached; see batteryPoll()
 
     // Say "no batt" rather than nothing when there is no measurement.
     //
@@ -2138,6 +2483,7 @@ void loop() {
     GnssFix fix;
     gnss_get(&fix);
 
+    batteryPoll(false);                // 1 Hz internally
     handleTouch();
     handlePowerButton();
     flushIfIdle();
