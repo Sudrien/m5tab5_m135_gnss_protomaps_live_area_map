@@ -13,6 +13,7 @@ idf_component_register(
         "../wifistore.cpp"
         "../portal.cpp"
         "../gnss.cpp"
+        "../waypoints.cpp"
         "../storage.cpp"
         "../raster.c"
         "../mvt.c"

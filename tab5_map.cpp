@@ -44,6 +44,7 @@
 #include "features.h"
 #include "mapconfig.h"
 #include "style.h"
+#include "waypoints.h"
 
 constexpr int      PIN_GNSS_TX = 7;    // module transmits here -> ESP32 RX
 constexpr int      PIN_GNSS_RX = 6;    // module listens here   -> ESP32 TX
@@ -391,10 +392,10 @@ static bool     g_btnCvOk    = false;
 // the map and downward to the screen edge.
 static const int BTN_PAD_TOP = 26, BTN_PAD_SIDE = 6;
 
-// Four across the bottom now. At 1280 px that is 305 px each, still a wide
+// Five across the bottom now. At 1280 px that is 244 px each, still a wide
 // target on a moving vehicle - and the touch zone extends past the drawn
 // outline in every direction (BTN_PAD_*), so the usable area is larger again.
-enum { BTN_CACHE = 0, BTN_THEME, BTN_POI, BTN_SLEEP, BTN_COUNT };
+enum { BTN_CACHE = 0, BTN_THEME, BTN_POI, BTN_PINS, BTN_SLEEP, BTN_COUNT };
 
 static uint32_t g_confirmUntil = 0;      // armed state for the cache button
 static uint32_t g_lastTouchMs = 0;
@@ -530,6 +531,25 @@ static void drawFooter() {
                lab ? M5.Display.color565(60, 80, 110)
                    : M5.Display.color565(70, 70, 70));
 
+    // The pin button doubles as the guidance readout: while a target is set
+    // the button names it, so the one control that turns guidance off also
+    // says that guidance is on. A separate indicator would be a fifth thing
+    // competing for the same strip.
+    {
+        char pl[40];
+        int t = wp_target();
+        if (t >= 0) {
+            Waypoint w;
+            if (wp_get(t, &w)) snprintf(pl, sizeof pl, "to %s", w.name);
+            else               snprintf(pl, sizeof pl, "pins");
+        } else {
+            snprintf(pl, sizeof pl, "pins (%d)", wp_count());
+        }
+        drawButton(BTN_PINS, pl,
+                   t >= 0 ? M5.Display.color565(150, 60, 30)
+                          : M5.Display.color565(70, 70, 70));
+    }
+
     drawButton(BTN_SLEEP, "screen off", M5.Display.color565(70, 70, 70));
 }
 
@@ -568,7 +588,281 @@ static void screenOn() {
     Serial.println("screen: on");
 }
 
-static void handleTouch() {
+// ---- saved-point panel -----------------------------------------------------
+// A list over the map: save the current position, pick one to be guided back
+// to, or delete one.
+//
+// Not a modal spin loop like confirmFormat(). That one runs during setup(),
+// before esp_task_wdt_add(); anything blocking after it has to feed the
+// watchdog itself, and a panel the user may leave open for a minute is the
+// wrong place to be doing that. This draws and returns, and loop() keeps
+// turning underneath it.
+// Composed into an off-screen canvas and pushed once, for the same reason the
+// status bar and the buttons are: there is no framebuffer behind this display,
+// so filling the panel and then drawing over it are two separate visible
+// states. At 15 Hz that gap is a strobe.
+//
+// Two things were wrong, and the canvas is only the second. The first is that
+// the panel was being recomposed every frame at all - nothing on it changes
+// between fixes except the ranges, and those change once a second at walking
+// pace. It now redraws when its content actually differs, exactly like
+// drawStatus.
+//
+// The sprite is w*h*2 bytes - about 820 KB at 1280x720 - so it is allocated
+// when the panel opens and freed when it closes rather than held for the run.
+// If the allocation fails the direct path still works, strobe and all, which
+// is the same way the status bar degrades.
+static bool g_pinPanel = false;
+static int  g_pinScroll = 0;
+
+static M5Canvas g_pinCv(&M5.Display);
+static bool     g_pinCvOk = false;
+
+// Bumped on every open, and folded into the redraw signature, so reopening a
+// panel whose contents happen to be identical to last time still paints it -
+// the screen underneath was the map by then.
+static uint32_t g_pinEpoch = 0;
+
+static const int PP_ROW_H = 64;
+static const int PP_HEAD_H = 70, PP_FOOT_H = 62;
+
+static void pinPanelRect(int *x, int *y, int *w, int *h) {
+    if (!g_panelOk) { *x = *y = *w = *h = 0; return; }
+    int W = M5.Display.width(), H = M5.Display.height();
+    *w = W * 2 / 3;
+    *h = H * 2 / 3;
+    *x = (W - *w) / 2;
+    *y = (H - *h) / 2;
+}
+
+static int pinPanelRows() {
+    int x, y, w, h; pinPanelRect(&x, &y, &w, &h);
+    int rows = (h - PP_HEAD_H - PP_FOOT_H) / PP_ROW_H;
+    return rows < 1 ? 1 : rows;
+}
+
+static void pinPanelOpen() {
+    g_pinPanel = true;
+    g_pinScroll = 0;
+    g_pinEpoch++;
+    if (!g_panelOk || g_pinCvOk) return;
+    int x, y, w, h; pinPanelRect(&x, &y, &w, &h);
+    g_pinCv.setPsram(true);
+    g_pinCv.setColorDepth(16);
+    g_pinCvOk = g_pinCv.createSprite(w, h);
+    if (!g_pinCvOk)
+        Serial.println("pins: panel canvas failed, drawing direct");
+}
+
+static void pinPanelClose() {
+    g_pinPanel = false;
+    if (g_pinCvOk) { g_pinCv.deleteSprite(); g_pinCvOk = false; }
+    if (!g_panelOk) return;
+    // The panel painted over the map, the status bar and the footer alike, and
+    // the engine would see an unchanged view and skip the repaint - the same
+    // trap the wifi portal leaves behind on the cache button.
+    M5.Display.fillScreen(style_background());
+    map_invalidate();
+}
+
+static void drawPinPanel(const GnssFix &fix) {
+    if (!g_panelOk || !g_pinPanel) return;
+    int x, y, w, h; pinPanelRect(&x, &y, &w, &h);
+
+    const int rows = pinPanelRows();
+    const bool canSave = gnss_coarse(fix) && wp_count() < WP_MAX;
+    const int target = wp_target();
+
+    // What is on the panel, as a string. Ranges are quantised to whole metres
+    // in the rows below, so a stationary device settles and stops repainting
+    // entirely rather than jittering on the last decimal of a fix.
+    char sig[256];
+    int used = snprintf(sig, sizeof sig, "%lu|%d|%d|%d|%d|%d",
+                        (unsigned long)g_pinEpoch,
+                        wp_count(), g_pinScroll, target, (int)canSave, rows);
+    for (int r = 0; r < rows && used < (int)sizeof sig - 1; r++) {
+        int i = g_pinScroll + r;
+        if (i >= wp_count()) break;
+        Waypoint wp;
+        if (!wp_get(i, &wp)) continue;
+        int m = gnss_coarse(fix)
+              ? (int)wp_distance_m(fix.lat, fix.lon, wp.lat, wp.lon) : -1;
+        used += snprintf(sig + used, sizeof sig - used, "|%d", m);
+    }
+    static char lastSig[256] = "";
+    static bool haveLast = false;
+    if (haveLast && strcmp(sig, lastSig) == 0) return;
+    strncpy(lastSig, sig, sizeof lastSig - 1);
+    haveLast = true;
+
+    // Everything below draws in panel-local coordinates, so the same code
+    // serves the sprite and the fallback. The offset is added once, here.
+    lgfx::LovyanGFX *g = g_pinCvOk ? (lgfx::LovyanGFX *)&g_pinCv
+                                   : (lgfx::LovyanGFX *)&M5.Display;
+    const int ox = g_pinCvOk ? 0 : x, oy = g_pinCvOk ? 0 : y;
+
+    if (g_pinCvOk) g_pinCv.fillSprite(M5.Display.color565(20, 20, 26));
+    else           M5.Display.fillRoundRect(x, y, w, h, 14,
+                                            M5.Display.color565(20, 20, 26));
+    g->drawRoundRect(ox, oy, w, h, 14, TFT_WHITE);
+
+    g->setTextDatum(top_left);
+    g->setTextColor(TFT_WHITE);
+    g->setTextSize(2);
+    g->drawString("saved points", ox + 18, oy + 18);
+
+    // Saving without a fix would store 0,0 - the one failure here that looks
+    // exactly like success until you try to walk back to it.
+    g->fillRoundRect(ox + w - 200, oy + 12, 186, 44, 8,
+                     canSave ? M5.Display.color565(40, 110, 60)
+                             : M5.Display.color565(60, 60, 60));
+    g->setTextDatum(middle_center);
+    g->setTextColor(canSave ? TFT_WHITE : TFT_LIGHTGREY);
+    g->drawString(!gnss_coarse(fix) ? "no fix"
+                  : wp_count() >= WP_MAX ? "list full" : "save here",
+                  ox + w - 107, oy + 34);
+
+    for (int r = 0; r < rows; r++) {
+        int i = g_pinScroll + r;
+        if (i >= wp_count()) break;
+        int ry = oy + PP_HEAD_H + r * PP_ROW_H;
+
+        Waypoint wp;
+        if (!wp_get(i, &wp)) continue;
+        bool active = (i == target);
+
+        g->fillRoundRect(ox + 14, ry, w - 28, PP_ROW_H - 8, 8,
+                         active ? M5.Display.color565(110, 45, 25)
+                                : M5.Display.color565(45, 45, 55));
+
+        // Range and bearing where there is a fix to measure from, and the
+        // stored coordinates where there is not - a row that says nothing at
+        // all while the receiver is searching is a row that looks broken.
+        char line[80];
+        if (gnss_coarse(fix)) {
+            double m = wp_distance_m(fix.lat, fix.lon, wp.lat, wp.lon);
+            double b = wp_bearing_deg(fix.lat, fix.lon, wp.lat, wp.lon);
+            if (m < 1000.0)
+                snprintf(line, sizeof line, "%s   %d m   %03d deg",
+                         wp.name, (int)m, (int)b);
+            else
+                snprintf(line, sizeof line, "%s   %.1f km   %03d deg",
+                         wp.name, m / 1000.0, (int)b);
+        } else {
+            snprintf(line, sizeof line, "%s   %.5f %.5f",
+                     wp.name, wp.lat, wp.lon);
+        }
+
+        g->setTextDatum(middle_left);
+        g->setTextColor(TFT_WHITE);
+        g->setTextSize(2);
+        g->drawString(line, ox + 30, ry + (PP_ROW_H - 8) / 2);
+
+        g->setTextDatum(middle_center);
+        g->setTextColor(M5.Display.color565(235, 120, 120));
+        g->drawString("del", ox + w - 50, ry + (PP_ROW_H - 8) / 2);
+    }
+
+    if (wp_count() == 0) {
+        g->setTextDatum(middle_center);
+        g->setTextColor(TFT_LIGHTGREY);
+        g->setTextSize(2);
+        g->drawString("none yet - save here drops one", ox + w / 2, oy + h / 2);
+    }
+
+    g->setTextDatum(middle_center);
+    g->setTextColor(TFT_WHITE);
+    g->fillRoundRect(ox + 14, oy + h - 56, 150, 44, 8,
+                     M5.Display.color565(70, 70, 70));
+    g->drawString("close", ox + 89, oy + h - 34);
+
+    if (target >= 0) {
+        g->fillRoundRect(ox + 178, oy + h - 56, 210, 44, 8,
+                         M5.Display.color565(110, 45, 25));
+        g->drawString("stop guiding", ox + 283, oy + h - 34);
+    }
+
+    if (wp_count() > rows) {
+        g->fillRoundRect(ox + w - 154, oy + h - 56, 64, 44, 8,
+                         M5.Display.color565(70, 70, 70));
+        g->drawString("up", ox + w - 122, oy + h - 34);
+        g->fillRoundRect(ox + w - 80, oy + h - 56, 64, 44, 8,
+                         M5.Display.color565(70, 70, 70));
+        g->drawString("down", ox + w - 48, oy + h - 34);
+    }
+    g->setTextDatum(top_left);
+
+    // One write of final pixels. The rounded corners are square in the sprite
+    // and would paint over the map, so they are keyed out - same trick, and
+    // same reasoning, as drawButton.
+    if (g_pinCvOk) {
+        // Not a colour the panel uses: the fills are greys, greens and rusts,
+        // the text white and pale red.
+        const uint16_t KEY = 0xF81F;
+        for (int i = 0; i < 14; i++) {
+            for (int j = 0; j < 14; j++) {
+                int dx = 14 - i, dy = 14 - j;
+                if (dx * dx + dy * dy <= 196) continue;
+                g_pinCv.drawPixel(i, j, KEY);
+                g_pinCv.drawPixel(w - 1 - i, j, KEY);
+                g_pinCv.drawPixel(i, h - 1 - j, KEY);
+                g_pinCv.drawPixel(w - 1 - i, h - 1 - j, KEY);
+            }
+        }
+        g_pinCv.pushSprite(x, y, KEY);
+    }
+}
+
+// True when the tap belonged to the panel, so handleTouch stops there.
+static bool pinPanelTouch(int px, int py, const GnssFix &fix) {
+    if (!g_pinPanel) return false;
+    int x, y, w, h; pinPanelRect(&x, &y, &w, &h);
+
+    // A tap anywhere outside closes it. Requiring the close button would trap
+    // anyone who did not find it, over a map they can no longer see.
+    if (px < x || px >= x + w || py < y || py >= y + h) { pinPanelClose(); return true; }
+
+    if (py < y + PP_HEAD_H - 10) {
+        if (px > x + w - 200 && wp_add_fix(fix) >= 0) map_invalidate();
+        return true;
+    }
+
+    if (py > y + h - PP_FOOT_H) {
+        if (px < x + 170) {
+            pinPanelClose();
+        } else if (px < x + 400 && wp_target() >= 0) {
+            wp_clear_target();
+            map_invalidate();
+        } else if (px > x + w - 154 && px < x + w - 86) {
+            if (g_pinScroll > 0) g_pinScroll--;
+        } else if (px > x + w - 86) {
+            if (g_pinScroll + pinPanelRows() < wp_count()) g_pinScroll++;
+        }
+        return true;
+    }
+
+    int r = (py - (y + PP_HEAD_H)) / PP_ROW_H;
+    int i = g_pinScroll + r;
+    if (r >= 0 && r < pinPanelRows() && i < wp_count()) {
+        if (px > x + w - 84) {
+            wp_remove(i);
+            // The list just got shorter under the scroll offset, which would
+            // otherwise leave the panel showing an empty page of a non-empty
+            // list.
+            while (g_pinScroll > 0 && g_pinScroll + pinPanelRows() > wp_count())
+                g_pinScroll--;
+            map_invalidate();
+        } else {
+            // Tapping the current target clears it, so the row is its own
+            // toggle and the footer button is only ever a shortcut.
+            wp_set_target(i == wp_target() ? -1 : i);
+            pinPanelClose();
+        }
+    }
+    return true;
+}
+
+static void handleTouch(const GnssFix &fix) {
     // No panel means no buttons and no wake zone: every hit test below asks
     // the display for its geometry. An earlier pass left this unguarded on the
     // reasoning that loop() was already gated on g_panelOk - but the gate is
@@ -592,12 +886,22 @@ static void handleTouch() {
     }
 
     auto t = M5.Touch.getDetail();
+
+    // The panel is over everything, so it gets first refusal on the tap -
+    // otherwise a row landing on a footer button would trigger both.
+    if (pinPanelTouch(t.x, t.y, fix)) return;
+
     int b = buttonAt(t.x, t.y);
     if (b != BTN_CACHE) g_confirmUntil = 0;
 
     switch (b) {
     case BTN_SLEEP:
         screenOff();
+        break;
+
+    case BTN_PINS:
+        if (g_pinPanel) pinPanelClose();
+        else            pinPanelOpen();
         break;
 
     case BTN_POI:
@@ -1874,8 +2178,12 @@ static const size_t STATUS_STATS_MAX = 192;
 // States" is 44 characters, and a long region name in a country that uses
 // them can beat that comfortably.
 static const size_t STATUS_PLACE_MAX = 112;
+// Plus the navigation readout, which changes as the range does and so has to
+// be in the signature or the bar would stop noticing that it moved.
+static const size_t STATUS_NAV_MAX   = 64;
 static const size_t STATUS_SIG_MAX   =
-    STATUS_LINE_MAX + 1 + STATUS_STATS_MAX + 1 + STATUS_PLACE_MAX + 1 + 20 + 1;
+    STATUS_LINE_MAX + 1 + STATUS_STATS_MAX + 1 + STATUS_PLACE_MAX + 1 + 20 + 1
+    + STATUS_NAV_MAX + 1;
 
 static void drawStatus(const GnssFix &fix) {
     if (!g_panelOk) return;   // no display attached
@@ -1897,6 +2205,12 @@ static void drawStatus(const GnssFix &fix) {
     // which is why map_place_text() holds the last known name.
     char place[STATUS_PLACE_MAX];
     bool havePlace = map_place_text(place, sizeof place);
+
+    // Where the target is, in words. Empty when nothing is being navigated to,
+    // which is the common case, so it costs a byte in the signature and no
+    // pixels on the bar.
+    char nav[STATUS_NAV_MAX];
+    wp_target_text(fix, nav, sizeof nav);
 
     bool have = (fix.status == 'A');
     char statusLine1[STATUS_LINE_MAX];
@@ -1932,8 +2246,8 @@ static void drawStatus(const GnssFix &fix) {
     // until something else on the bar happened to change.
     time_t nowt = time(nullptr);
     char combined[STATUS_SIG_MAX];
-    snprintf(combined, sizeof combined, "%s|%s|%s|%ld",
-             statusLine1, buf, place, (long)(nowt / 60));
+    snprintf(combined, sizeof combined, "%s|%s|%s|%s|%ld",
+             statusLine1, buf, place, nav, (long)(nowt / 60));
     if (strcmp(combined, last) == 0 && millis() - lastDraw < 2000) return;
     strncpy(last, combined, sizeof last - 1);
     lastDraw = millis();
@@ -1966,7 +2280,16 @@ static void drawStatus(const GnssFix &fix) {
     g->setTextColor(TFT_WHITE);
     g->drawString(statusLine1, x1, 6);
     g->setTextColor(TFT_LIGHTGREY);
-    g->drawString(buf, 12, 28);
+    int x2 = 12;
+    if (nav[0]) {
+        // Same colour as the pin and its guide line, so the three read as one
+        // thing rather than three unrelated orange elements.
+        g->setTextColor(M5.Display.color565(255, 130, 80));
+        g->drawString(nav, x2, 28);
+        x2 += (int)g->textWidth(nav) + 18;
+        g->setTextColor(TFT_LIGHTGREY);
+    }
+    g->drawString(buf, x2, 28);
     drawClockBattery(fix, g);
 
     // Stale-link warning: the module going quiet looks identical to "no fix"
@@ -2445,12 +2768,23 @@ void setup() {
         map_world_floor_start();
     }
 
+    // The saved-point list, off the same card. Read here rather than lazily:
+    // the first map_draw asks for it, and that runs on the UI task while the
+    // render worker already has the archive open.
+    wp_begin();
+    {
+        char m[40];
+        snprintf(m, sizeof m, "waypoints: %d saved", wp_count());
+        bootStep(m);
+    }
+
     // Decide day or night before bootEnd() paints anything in it. After
     // map_begin, because map_set_dark() reaches into the tile grid.
     themeBoot();
 
     bootStepBusy("waiting for GPS fix");
     delay(600);
+
     bootEnd();
     // 30 s: far longer than any legitimate operation in loop(), so this only
     // fires on a genuine wedge. portal_run blocks for minutes by design and
@@ -2522,7 +2856,7 @@ void loop() {
     gnss_get(&fix);
 
     batteryPoll(false);                // 1 Hz internally
-    handleTouch();
+    handleTouch(fix);
     handlePowerButton();
     flushIfIdle();
     applyTheme(fix);
@@ -2619,9 +2953,15 @@ void loop() {
     uint32_t now = millis();
     if (g_panelOk && !g_screenOff && now - last >= 66) {
         last = now;
-        map_draw(fix);
+        // The panel covers the middle of the screen and the marker moves
+        // underneath it. Skipping the map draw entirely while it is open is
+        // simpler than clipping around it, and costs nothing: the panel is a
+        // deliberate, short-lived interaction, and pinPanelClose() forces the
+        // repaint on the way out.
+        if (!g_pinPanel) map_draw(fix);
         drawStatus(fix);
         drawFooter();
+        drawPinPanel(fix);
     }
 
     vTaskDelay(pdMS_TO_TICKS(5));

@@ -47,6 +47,25 @@
 #define MARKER_CLEAR_R 36
 #endif
 
+// Radius the target guide is drawn within, and the radius reserved for it
+// when repainting.
+//
+// The guide used to be a line all the way to the pin, which meant the marker
+// repaint could not put back what it erased, which meant every marker move
+// took the full-screen path - a whole-screen blit at up to 15 Hz, which is
+// what the flashing was. Bounding the guide to a fixed radius puts it back
+// inside the partial path: a hundred-odd pixels of blit per move instead of
+// a million.
+//
+// The direction is all a bearing can honestly convey anyway; the distance is
+// in the status bar, where a number belongs.
+#ifndef GUIDE_R
+#define GUIDE_R 74
+#endif
+#ifndef GUIDE_CLEAR_R
+#define GUIDE_CLEAR_R (GUIDE_R + 18)
+#endif
+
 // ---- grid size -------------------------------------------------------------
 // Tiles held resident, GRID_N x GRID_N. May be even.
 //

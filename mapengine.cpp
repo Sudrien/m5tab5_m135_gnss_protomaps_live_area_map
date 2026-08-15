@@ -26,6 +26,7 @@ extern "C" {
 }
 #include "mercator.h"
 #include "mapconfig.h"
+#include "waypoints.h"
 
 // ---- configuration ---------------------------------------------------------
 // Scratch for one tile, compressed and inflated.
@@ -137,6 +138,7 @@ static LabelSet  g_labelbuf[GRID_COUNT + 1];
 static LabelSet *g_labels[GRID_COUNT];
 static LabelSet *w_labels = nullptr;   // the spare; worker-owned
 static bool      g_labels_on = true;
+static bool      g_pins_on   = true;
 
 static void labels_init() {
     for (int i = 0; i < GRID_COUNT; i++) { g_labelbuf[i].n = 0; g_labels[i] = &g_labelbuf[i]; }
@@ -1318,6 +1320,14 @@ void map_set_labels(bool on) {
 }
 bool map_labels_on() { return g_labels_on; }
 
+void map_set_pins(bool on) {
+    if (g_pins_on == on) return;
+    g_pins_on = on;
+    g_force_redraw = true;
+    Serial.printf("map: pins %s\n", on ? "on" : "off");
+}
+bool map_pins_on() { return g_pins_on; }
+
 bool map_place_text(char *out, size_t cap) {
     if (!out || cap == 0) return false;
     out[0] = 0;
@@ -1690,6 +1700,151 @@ static void draw_labels(int32_t canvas_x, int32_t canvas_y,
     M5.Display.clearClipRect();
 }
 
+// ---- saved-point overlay ---------------------------------------------------
+//
+// Same clip convention as draw_labels: a null clip draws everything, a
+// non-null one restricts to the rectangle blit_region has just overwritten.
+//
+// Drawn after the labels and before the marker, so a pin may cover a place
+// name but never the position dot. The dot is the one thing on this screen
+// that has to be findable at all times.
+static void draw_pins(int32_t canvas_x, int32_t canvas_y, const LabelBox *clip)
+{
+    // The pins are positioned from the view, not the canvas, exactly as the
+    // marker is - a pin is a world position, not a feature of any tile.
+    (void)canvas_x; (void)canvas_y;
+    if (!g_pins_on || !g_view_set) return;
+    const int n = wp_count();
+    if (n <= 0) return;
+
+    const int SW = M5.Display.width(), SH = M5.Display.height();
+    const int visTop = STATUS_H, visBot = SH - FOOTER_H;
+    const int target = wp_target();
+
+    M5.Display.setClipRect(0, visTop, SW, visBot - visTop);
+    M5.Display.setFont(&fonts::FreeSansBold9pt7b);
+    M5.Display.setTextSize(1);
+    M5.Display.setTextDatum(middle_center);
+
+    for (int i = 0; i < n; i++) {
+        Waypoint w;
+        if (!wp_get(i, &w)) continue;
+
+        merc_pt_t p = merc_from_ll(w.lat, w.lon, g_zoom);
+        int sx = (int)((p.x - g_view_wx) * SUBTILE_PX);
+        int sy = visTop + (int)((p.y - g_view_wy) * SUBTILE_PX);
+
+        // Off-screen pins are the edge arrow's job, not this one's.
+        if (sx < -60 || sx > SW + 60 || sy < visTop - 60 || sy > visBot + 60)
+            continue;
+
+        // The reserved box covers the stem, the head and the name above it.
+        LabelBox b = { (int16_t)(sx - 50), (int16_t)(sy - 56),
+                       (int16_t)100, (int16_t)62 };
+        if (clip && (b.x + b.w < clip->x || clip->x + clip->w < b.x ||
+                     b.y + b.h < clip->y || clip->y + clip->h < b.y))
+            continue;
+
+        const bool active = (i == target);
+        const uint16_t ink  = active ? M5.Display.color565(230, 80, 40)
+                                     : M5.Display.color565(200, 40, 140);
+        // The same halo pair the labels use, and for the same reason: it has
+        // to separate from water, parkland and building fills alike, not just
+        // from the background.
+        const uint16_t halo = map_is_dark() ? (uint16_t)0x0000 : (uint16_t)0xFFFF;
+
+        // A teardrop anchored at the point rather than centred on it: the tip
+        // is what marks the position, so a circle centred there would put the
+        // pin half a diameter off in whichever direction it was drawn.
+        M5.Display.drawLine(sx, sy, sx, sy - 16, halo);
+        M5.Display.drawLine(sx + 1, sy, sx + 1, sy - 16, halo);
+        M5.Display.fillCircle(sx, sy - 22, 10, halo);
+        M5.Display.fillCircle(sx, sy - 22, 8, ink);
+        if (active) M5.Display.drawCircle(sx, sy - 22, 12, ink);
+        M5.Display.fillCircle(sx, sy, 2, ink);
+
+        M5.Display.setTextColor(halo);
+        for (int dy = -2; dy <= 2; dy += 2)
+            for (int dx = -2; dx <= 2; dx += 2)
+                if (dx || dy) M5.Display.drawString(w.name, sx + dx, sy - 42 + dy);
+        M5.Display.setTextColor(ink);
+        M5.Display.drawString(w.name, sx, sy - 42);
+    }
+
+    // Hand the panel back as it was found, for the same reason draw_labels
+    // does: the status bar sets a size but never a font.
+    M5.Display.setFont(&fonts::Font0);
+    M5.Display.setTextSize(1);
+    M5.Display.setTextDatum(top_left);
+    M5.Display.clearClipRect();
+}
+
+// A fixed-length arrow from the marker towards the target.
+//
+// Bounded to GUIDE_R deliberately - see mapconfig.h. A line drawn all the way
+// to the pin cannot be erased by the marker's own repaint rectangles, so it
+// forced the full-screen path on every fix; this fits inside GUIDE_CLEAR_R and
+// costs the same as the marker itself.
+//
+// This is the whole of the "directions" claim, and it is deliberately modest.
+// The archive holds rendering geometry - road lines clipped per tile, with no
+// node identity across tile boundaries - so there is no graph to route on. A
+// bearing cannot tell you which turn to take, but it is never wrong about
+// which way the point is, which is the failure that matters when the
+// alternative is a confident instruction into a field.
+static void draw_target_guide(const GnssFix &fix, int mx, int my) {
+    if (!g_pins_on || !g_view_set) return;
+    if (wp_target() < 0 || !gnss_coarse(fix)) return;
+
+    Waypoint w;
+    if (!wp_get(wp_target(), &w)) return;
+
+    const int SW = M5.Display.width(), SH = M5.Display.height();
+    const int visTop = STATUS_H, visBot = SH - FOOTER_H;
+
+    merc_pt_t p = merc_from_ll(w.lat, w.lon, g_zoom);
+    double dx = (p.x - g_view_wx) * SUBTILE_PX - mx;
+    double dy = visTop + (p.y - g_view_wy) * SUBTILE_PX - my;
+    double len = sqrt(dx * dx + dy * dy);
+
+    // Standing on it. A bearing derived from a metre of consumer-receiver
+    // noise spins, and a spinning arrow reads as a fault rather than as
+    // arrival - so nothing is drawn and the status bar says "here".
+    if (len < 12.0) return;
+    dx /= len; dy /= len;
+
+    const uint16_t col  = M5.Display.color565(230, 80, 40);
+    const uint16_t halo = map_is_dark() ? (uint16_t)0x0000 : (uint16_t)0xFFFF;
+    M5.Display.setClipRect(0, visTop, SW, visBot - visTop);
+
+    // Start clear of the marker ring, or the shaft eats the dot it is drawn
+    // from. Stop short of GUIDE_R so the head has room inside the reserved
+    // rectangle.
+    int x0 = mx + (int)(dx * 16),          y0 = my + (int)(dy * 16);
+    int x1 = mx + (int)(dx * (GUIDE_R - 16)), y1 = my + (int)(dy * (GUIDE_R - 16));
+
+    double px = -dy, py = dx;
+    int hx = mx + (int)(dx * GUIDE_R), hy = my + (int)(dy * GUIDE_R);
+
+    // Haloed, like the labels: an orange arrow over an orange roof casing is
+    // otherwise invisible at exactly the moment it is being looked for.
+    for (int o = -1; o <= 1; o++) {
+        int ox = (int)(px * o), oy = (int)(py * o);
+        M5.Display.drawLine(x0 + ox, y0 + oy, x1 + ox, y1 + oy, halo);
+    }
+    M5.Display.fillTriangle(hx + (int)(dx * 2),  hy + (int)(dy * 2),
+                            x1 + (int)(px * 11), y1 + (int)(py * 11),
+                            x1 - (int)(px * 11), y1 - (int)(py * 11), halo);
+
+    M5.Display.drawLine(x0, y0, x1, y1, col);
+    M5.Display.drawLine(x0 + (int)px, y0 + (int)py, x1 + (int)px, y1 + (int)py, col);
+    M5.Display.fillTriangle(hx, hy,
+                            x1 + (int)(px * 9), y1 + (int)(py * 9),
+                            x1 - (int)(px * 9), y1 - (int)(py * 9), col);
+
+    M5.Display.clearClipRect();
+}
+
 void map_draw(const GnssFix &fix) {
     if (g_headless) return;
     if (!g_visible || !g_view_set) return;
@@ -1720,6 +1875,10 @@ void map_draw(const GnssFix &fix) {
     bool viewMoved  = (canvas_x != last_cx || canvas_y != last_cy);
     bool tilesMoved = (gen != last_gen || states != last_states);
     bool markerMoved = (mx != last_mx || my != last_my);
+
+    // The guide is drawn around the marker, so it stays inside the partial
+    // repaint path - it only needs a larger rectangle reserved for it.
+    bool guiding = (g_pins_on && wp_target() >= 0);
 
     if (have_last && !viewMoved && !tilesMoved && !markerMoved && !g_force_redraw)
         return;
@@ -1758,11 +1917,12 @@ void map_draw(const GnssFix &fix) {
         // Everything can have changed; repaint the visible area.
         blit_region(0, visTop, SW, visBot - visTop, canvas_x, canvas_y);
         draw_labels(canvas_x, canvas_y, nullptr);
+        draw_pins(canvas_x, canvas_y, nullptr);
     } else {
         // Only the marker moved, which is the common case now that the view
         // sits still inside the band. Repainting its old and new
         // neighbourhoods is a few thousand pixels instead of a million.
-        const int R = MARKER_CLEAR_R;
+        const int R = guiding ? GUIDE_CLEAR_R : MARKER_CLEAR_R;
         blit_region(last_mx - R, last_my - R, R * 2, R * 2, canvas_x, canvas_y);
         blit_region(mx - R, my - R, R * 2, R * 2, canvas_x, canvas_y);
         // Those two rectangles have just erased any label crossing them.
@@ -1773,9 +1933,12 @@ void map_draw(const GnssFix &fix) {
                            (int16_t)(R * 2), (int16_t)(R * 2) };
             draw_labels(canvas_x, canvas_y, &a);
             draw_labels(canvas_x, canvas_y, &b);
+            draw_pins(canvas_x, canvas_y, &a);
+            draw_pins(canvas_x, canvas_y, &b);
         }
     }
 
+    draw_target_guide(fix, mx, my);
     M5.Display.setClipRect(0, visTop, SW, visBot - visTop);
     draw_marker(fix, mx, my);
     M5.Display.clearClipRect();

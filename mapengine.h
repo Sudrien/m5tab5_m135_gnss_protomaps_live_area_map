@@ -113,6 +113,16 @@ void map_invalidate();
 void map_set_labels(bool on);
 bool map_labels_on();
 
+// Saved-point overlay: the pins themselves, and the bearing line to whichever
+// one is the current navigation target. Same cost as labels - drawn at
+// composite time, so this is a repaint rather than a re-render.
+//
+// Note that a target set makes every marker move a full repaint: the guide
+// line sweeps far outside MARKER_CLEAR_R, so the partial path cannot put back
+// what it erased.
+void map_set_pins(bool on);
+bool map_pins_on();
+
 // Roughly where the marker is, as "Locality, Region" - whichever of the two
 // is known. False, and an empty string, until a named place turns up.
 //
