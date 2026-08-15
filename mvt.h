@@ -64,6 +64,13 @@ typedef struct {
     uint64_t    feature_id;
     uint32_t    feature_index;  // 0-based within the layer
 
+    // The feature's label text, when a name_key was set and this feature
+    // carries it. Points into the tile buffer and is NOT null-terminated;
+    // like everything else here it is only valid for the duration of the
+    // callback. NULL when the feature has no name.
+    const char *name;
+    uint32_t    name_len;
+
     const int32_t *pts;        // x,y interleaved, tile-local coords
     uint32_t       n_pts;
     uint32_t       part_index; // 0-based within the feature
@@ -91,6 +98,12 @@ typedef struct {
     // schema) when left NULL.
     const char *style_key;
 
+    // Which key carries label text, e.g. "name". Leave NULL - the default -
+    // to skip name resolution entirely, which is what every layer that is
+    // only ever filled or stroked should do: the extra table costs a pass
+    // over the value list and 6 bytes per entry, and no fill needs it.
+    const char *name_key;
+
     // Scratch: decoded points for the feature currently being emitted.
     // Sized for the largest single part in the tile. 8192 points (64 KiB)
     // clears everything in the Protomaps basemap comfortably.
@@ -100,6 +113,13 @@ typedef struct {
     // Scratch: one style byte per value-table entry, per layer.
     uint8_t  *val_style;
     uint32_t  val_cap;
+
+    // Scratch: the string payload of each value-table entry, for name_key.
+    // Same indexing as val_style, and the same trick - the name is resolved
+    // once per layer rather than once per feature. Both may be NULL when
+    // name_key is NULL. Sized val_cap.
+    const char **val_name;
+    uint16_t    *val_name_len;
 
     // Populated during decode, useful for diagnostics.
     uint32_t stat_layers, stat_features, stat_parts, stat_points;

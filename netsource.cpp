@@ -1185,6 +1185,27 @@ bool netsource_get(uint8_t z, uint32_t x, uint32_t y,
     return r;
 }
 
+static bool netsource_get_local_locked(uint8_t z, uint32_t x, uint32_t y,
+                                       uint8_t *dst, uint32_t *len)
+{
+    uint32_t cap = *len;
+    if (g_build[0] && !cache_is_empty_marker(z, x, y)) {
+        uint32_t n = cap;
+        if (cache_read(z, x, y, dst, &n)) { *len = n; g_stats.cache_hits++; return true; }
+    }
+    return local_try(z, x, y, dst, cap, len);
+}
+
+bool netsource_get_local(uint8_t z, uint32_t x, uint32_t y,
+                         uint8_t *dst, uint32_t *len)
+{
+    if (!g_lock) return netsource_get_local_locked(z, x, y, dst, len);
+    if (xSemaphoreTake(g_lock, portMAX_DELAY) != pdTRUE) return false;
+    bool r = netsource_get_local_locked(z, x, y, dst, len);
+    xSemaphoreGive(g_lock);
+    return r;
+}
+
 void netsource_stats(NetStats *out) {
     *out = g_stats;
     snprintf(out->build, sizeof out->build, "%s", g_build);

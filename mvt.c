@@ -204,11 +204,37 @@ static uint8_t value_style(mvt_decoder_t *d, const mvt_layer_t *layer,
     return 0;
 }
 
+// Record a Value message's string payload, for name_key. Non-string values
+// are left as NULL rather than formatted: a label is text or it is nothing,
+// and stringifying an int here would mean owning a buffer for it.
+static void value_name(mvt_decoder_t *d, uint32_t idx,
+                       const uint8_t *buf, uint32_t s, uint32_t e)
+{
+    d->val_name[idx] = NULL;
+    d->val_name_len[idx] = 0;
+    rd_t r = { buf, s, e, 0 };
+    uint32_t f, wt;
+    while (rd_key(&r, &f, &wt)) {
+        if (f == 1 && wt == WT_LEN) {
+            uint32_t vs, ve;
+            if (!rd_bytes(&r, &vs, &ve)) return;
+            uint32_t len = ve - vs;
+            // Clamp rather than reject. A label longer than this is not a
+            // label, and the length field is 16 bits.
+            if (len > 0xFFFF) len = 0xFFFF;
+            d->val_name[idx] = (const char *)buf + vs;
+            d->val_name_len[idx] = (uint16_t)len;
+            return;
+        }
+        if (!rd_skip(&r, wt)) return;
+    }
+}
+
 // ---- feature ---------------------------------------------------------------
 static mvt_err_t decode_feature(mvt_decoder_t *d, const mvt_layer_t *layer,
                                 const uint8_t *buf, uint32_t s, uint32_t e,
-                                int32_t style_key_idx, uint32_t n_values,
-                                uint32_t feature_index)
+                                int32_t style_key_idx, int32_t name_key_idx,
+                                uint32_t n_values, uint32_t feature_index)
 {
     rd_t r = { buf, s, e, 0 };
     uint32_t f, wt;
@@ -236,17 +262,31 @@ static mvt_err_t decode_feature(mvt_decoder_t *d, const mvt_layer_t *layer,
     // Resolve style by scanning the tag pairs for the styling key. Tags are
     // (key_index, value_index) pairs; the pre-resolved table turns the second
     // half of the lookup into an array index.
+    //
+    // Both keys are resolved in the same walk. They were separate scans in an
+    // earlier draft, which doubled the per-feature tag work on exactly the
+    // two layers - pois and places - that have the most features carrying
+    // tags in the first place.
     uint8_t style = 0;
-    if (style_key_idx >= 0 && tags_e > tags_s) {
+    const char *name = NULL;
+    uint32_t name_len = 0;
+    if ((style_key_idx >= 0 || name_key_idx >= 0) && tags_e > tags_s) {
+        int want = (style_key_idx >= 0) + (name_key_idx >= 0);
         rd_t t = { buf, tags_s, tags_e, 0 };
-        while (t.p < t.n) {
+        while (t.p < t.n && want > 0) {
             uint64_t k = rd_varint(&t);
             if (t.bad || t.p >= t.n) break;
             uint64_t v = rd_varint(&t);
             if (t.bad) break;
             if ((int32_t)k == style_key_idx) {
                 if (v < n_values) style = d->val_style[v];
-                break;
+                want--;
+            } else if ((int32_t)k == name_key_idx) {
+                if (v < n_values && d->val_name) {
+                    name     = d->val_name[v];
+                    name_len = d->val_name_len[v];
+                }
+                want--;
             }
         }
     }
@@ -257,6 +297,8 @@ static mvt_err_t decode_feature(mvt_decoder_t *d, const mvt_layer_t *layer,
     g.part.layer  = layer;
     g.part.geom   = gt;
     g.part.style  = style;
+    g.part.name     = name;
+    g.part.name_len = name_len;
     g.part.feature_id    = fid;
     g.part.feature_index = feature_index;
 
@@ -303,7 +345,10 @@ static mvt_err_t decode_layer(mvt_decoder_t *d, const uint8_t *buf,
     // Pass 2: find the index of the styling key.
     const char *skey = d->style_key ? d->style_key : "kind";
     uint32_t skey_len = (uint32_t)strlen(skey);
-    int32_t style_key_idx = -1;
+    // Names are opt-in: no name_key, no name table, no third pass.
+    const char *nkey = (d->val_name && d->val_name_len) ? d->name_key : NULL;
+    uint32_t nkey_len = nkey ? (uint32_t)strlen(nkey) : 0;
+    int32_t style_key_idx = -1, name_key_idx = -1;
     {
         rd_t r = { buf, s, e, 0 };
         uint32_t f, wt, ki = 0;
@@ -314,6 +359,9 @@ static mvt_err_t decode_layer(mvt_decoder_t *d, const uint8_t *buf,
                 if (style_key_idx < 0 && ke - ks == skey_len &&
                     memcmp(buf + ks, skey, skey_len) == 0)
                     style_key_idx = (int32_t)ki;
+                if (nkey && name_key_idx < 0 && ke - ks == nkey_len &&
+                    memcmp(buf + ks, nkey, nkey_len) == 0)
+                    name_key_idx = (int32_t)ki;
                 ki++;
             } else if (!rd_skip(&r, wt)) {
                 return MVT_EFORMAT;
@@ -331,7 +379,9 @@ static mvt_err_t decode_layer(mvt_decoder_t *d, const uint8_t *buf,
                 uint32_t vs, ve;
                 if (!rd_bytes(&r, &vs, &ve)) return MVT_EFORMAT;
                 if (n_values >= d->val_cap) return MVT_ENOMEM;
-                d->val_style[n_values++] = value_style(d, &layer, buf, vs, ve);
+                d->val_style[n_values] = value_style(d, &layer, buf, vs, ve);
+                if (name_key_idx >= 0) value_name(d, n_values, buf, vs, ve);
+                n_values++;
             } else if (!rd_skip(&r, wt)) {
                 return MVT_EFORMAT;
             }
@@ -348,7 +398,8 @@ static mvt_err_t decode_layer(mvt_decoder_t *d, const uint8_t *buf,
                 uint32_t fs, fe;
                 if (!rd_bytes(&r, &fs, &fe)) return MVT_EFORMAT;
                 mvt_err_t err = decode_feature(d, &layer, buf, fs, fe,
-                                               style_key_idx, n_values, fi++);
+                                               style_key_idx, name_key_idx,
+                                               n_values, fi++);
                 if (err != MVT_OK) return err;
             } else if (!rd_skip(&r, wt)) {
                 return MVT_EFORMAT;

@@ -391,7 +391,10 @@ static bool     g_btnCvOk    = false;
 // the map and downward to the screen edge.
 static const int BTN_PAD_TOP = 26, BTN_PAD_SIDE = 6;
 
-enum { BTN_CACHE = 0, BTN_THEME, BTN_SLEEP, BTN_COUNT };
+// Four across the bottom now. At 1280 px that is 305 px each, still a wide
+// target on a moving vehicle - and the touch zone extends past the drawn
+// outline in every direction (BTN_PAD_*), so the usable area is larger again.
+enum { BTN_CACHE = 0, BTN_THEME, BTN_POI, BTN_SLEEP, BTN_COUNT };
 
 static uint32_t g_confirmUntil = 0;      // armed state for the cache button
 static uint32_t g_lastTouchMs = 0;
@@ -520,6 +523,13 @@ static void drawFooter() {
                g_themeMode == THEME_AUTO ? M5.Display.color565(60, 90, 60)
                                          : M5.Display.color565(70, 70, 90));
 
+    // Labels are an overlay, so this is genuinely instant - there is no
+    // "re-rendering" state to show, unlike the theme button.
+    bool lab = map_labels_on();
+    drawButton(BTN_POI, lab ? "labels on" : "labels off",
+               lab ? M5.Display.color565(60, 80, 110)
+                   : M5.Display.color565(70, 70, 70));
+
     drawButton(BTN_SLEEP, "screen off", M5.Display.color565(70, 70, 70));
 }
 
@@ -588,6 +598,10 @@ static void handleTouch() {
     switch (b) {
     case BTN_SLEEP:
         screenOff();
+        break;
+
+    case BTN_POI:
+        map_set_labels(!map_labels_on());
         break;
 
     case BTN_THEME:
@@ -1853,8 +1867,15 @@ static void drawClockBattery(const GnssFix &fix, lgfx::LovyanGFX *g) {
 // is written down instead.
 static const size_t STATUS_LINE_MAX  = 128;
 static const size_t STATUS_STATS_MAX = 192;
+// The place name joined the signature, so it has to be budgeted for here or
+// the bar would stop noticing when it changes - snprintf would truncate the
+// clock field off the end and the comparison would go stale.
+// Four ranks joined with ", " - "Kerrytown, Ann Arbor, Michigan, United
+// States" is 44 characters, and a long region name in a country that uses
+// them can beat that comfortably.
+static const size_t STATUS_PLACE_MAX = 112;
 static const size_t STATUS_SIG_MAX   =
-    STATUS_LINE_MAX + 1 + STATUS_STATS_MAX + 1 + 20 + 1;
+    STATUS_LINE_MAX + 1 + STATUS_STATS_MAX + 1 + STATUS_PLACE_MAX + 1 + 20 + 1;
 
 static void drawStatus(const GnssFix &fix) {
     if (!g_panelOk) return;   // no display attached
@@ -1869,6 +1890,13 @@ static void drawStatus(const GnssFix &fix) {
     // clip would simply let the map paint over it.
     static char last[STATUS_SIG_MAX] = "";
     static uint32_t lastDraw = 0;
+
+    // Where we are, in words, ahead of where we are in numbers. This is the
+    // one part of the bar that is worth reading at a glance while driving,
+    // so it leads - and it stays put rather than appearing and vanishing,
+    // which is why map_place_text() holds the last known name.
+    char place[STATUS_PLACE_MAX];
+    bool havePlace = map_place_text(place, sizeof place);
 
     bool have = (fix.status == 'A');
     char statusLine1[STATUS_LINE_MAX];
@@ -1904,8 +1932,8 @@ static void drawStatus(const GnssFix &fix) {
     // until something else on the bar happened to change.
     time_t nowt = time(nullptr);
     char combined[STATUS_SIG_MAX];
-    snprintf(combined, sizeof combined, "%s|%s|%ld",
-             statusLine1, buf, (long)(nowt / 60));
+    snprintf(combined, sizeof combined, "%s|%s|%s|%ld",
+             statusLine1, buf, place, (long)(nowt / 60));
     if (strcmp(combined, last) == 0 && millis() - lastDraw < 2000) return;
     strncpy(last, combined, sizeof last - 1);
     lastDraw = millis();
@@ -1924,9 +1952,19 @@ static void drawStatus(const GnssFix &fix) {
     else              M5.Display.fillRect(0, 0, W, UI_STATUS_H, barBg);
 
     g->setTextDatum(top_left);
+    int x1 = 12;
+    if (havePlace) {
+        // Brighter and drawn first, with the numbers flowing after it on the
+        // same row. A separate row would need the bar taller, and STATUS_H
+        // is shared with mapengine's clip - changing it means changing both.
+        g->setTextSize(2);
+        g->setTextColor(TFT_YELLOW);
+        g->drawString(place, x1, 6);
+        x1 += (int)g->textWidth(place) + 18;
+    }
     g->setTextSize(2);
     g->setTextColor(TFT_WHITE);
-    g->drawString(statusLine1, 12, 6);
+    g->drawString(statusLine1, x1, 6);
     g->setTextColor(TFT_LIGHTGREY);
     g->drawString(buf, 12, 28);
     drawClockBattery(fix, g);

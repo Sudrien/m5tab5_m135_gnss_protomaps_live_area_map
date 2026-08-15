@@ -51,6 +51,20 @@ bool netsource_set_date_from_clock();
 bool netsource_get(uint8_t z, uint32_t x, uint32_t y,
                    uint8_t *dst, uint32_t *len, bool *from_net);
 
+// Cache and local archives only - never the network, and never a miss that
+// costs anything.
+//
+// For callers that want a tile if it is already to hand and would rather have
+// nothing than wait: the place-name lookups, which read a 3x3 block at once.
+// Going to the wire for those is a bad trade in both directions. A failed
+// range request blocks the render worker for seconds and, on this hardware,
+// the TLS handshake competes for the same DMA-capable heap the wifi driver
+// needs - nine of them in a row is what drove the free block down to 23 KB
+// and made the driver start dropping received frames. And the reward for all
+// that is a place name, which is a nicety on a map that is already drawing.
+bool netsource_get_local(uint8_t z, uint32_t x, uint32_t y,
+                         uint8_t *dst, uint32_t *len);
+
 // Populate the offline floor by pulling every tile from z0 to maxz into the
 // cache. 5461 tiles at maxz 6; slow (one request each) but resumable, since
 // anything already cached is skipped. `buf`/`cap` is scratch for one tile.

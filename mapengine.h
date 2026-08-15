@@ -21,6 +21,7 @@
 #define MAPENGINE_H
 
 #include <stdint.h>
+#include <stddef.h>
 #include "gnss.h"
 
 extern "C" {
@@ -106,6 +107,18 @@ void map_set_visible(bool visible);
 // Force the next map_draw to repaint. Needed after anything that alters the
 // screen behind the engine's back.
 void map_invalidate();
+
+// POI and place labels. Drawn as an overlay at composite time, so this is a
+// repaint rather than a re-render - unlike map_set_dark(), it is instant.
+void map_set_labels(bool on);
+bool map_labels_on();
+
+// Roughly where the marker is, as "Locality, Region" - whichever of the two
+// is known. False, and an empty string, until a named place turns up.
+//
+// Nearest-centroid, not point-in-polygon: near a boundary it can name the
+// neighbour. See REGION_ZOOM in mapengine.cpp.
+bool map_place_text(char *out, size_t cap);
 
 uint8_t  map_zoom();
 void     map_stats(MapStats *out);
