@@ -1315,5 +1315,6 @@ bool netsource_get_local(uint8_t z, uint32_t x, uint32_t y,
 
 void netsource_stats(NetStats *out) {
     *out = g_stats;
+    out->locals = (uint8_t)g_local_n;
     snprintf(out->build, sizeof out->build, "%s", g_build);
 }

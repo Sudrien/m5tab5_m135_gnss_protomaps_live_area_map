@@ -31,6 +31,12 @@ struct NetStats {
     uint32_t last_fetch_ms = 0;
     char     build[16] = "";
     bool     online = false;
+    // How many local .pmtiles are open. Not a diagnostic in itself - it tells
+    // a caller which of the counters above can ever be non-zero. With a planet
+    // archive mounted, tiles are served locally and cache_hits, net_hits and
+    // the blob's entry count all stay at zero permanently, which reads as a
+    // fault rather than as the intended offline path doing its job.
+    uint8_t  locals = 0;
 };
 
 // `local_path` is the always-present low-zoom archive (world.pmtiles).

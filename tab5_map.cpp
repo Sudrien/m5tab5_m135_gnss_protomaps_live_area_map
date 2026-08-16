@@ -45,6 +45,7 @@
 #include "mapconfig.h"
 #include "style.h"
 #include "waypoints.h"
+#include "compass.h"
 
 constexpr int      PIN_GNSS_TX = 7;    // module transmits here -> ESP32 RX
 constexpr int      PIN_GNSS_RX = 6;    // module listens here   -> ESP32 TX
@@ -383,8 +384,10 @@ static const int UI_STATUS_H = 52;          // must match STATUS_H in mapengine
 
 static M5Canvas g_statusCv(&M5.Display);
 static M5Canvas g_btnCv(&M5.Display);
-static bool     g_statusCvOk = false;
-static bool     g_btnCvOk    = false;
+static M5Canvas g_compassCv(&M5.Display);
+static bool     g_statusCvOk  = false;
+static bool     g_btnCvOk     = false;
+static bool     g_compassCvOk = false;
 
 // The touch target is taller than the drawn button. A 54 px outline is a
 // small thing to hit on a moving vehicle, and there is nothing else along
@@ -397,15 +400,32 @@ static const int BTN_PAD_TOP = 26, BTN_PAD_SIDE = 6;
 // outline in every direction (BTN_PAD_*), so the usable area is larger again.
 enum { BTN_CACHE = 0, BTN_THEME, BTN_POI, BTN_PINS, BTN_SLEEP, BTN_COUNT };
 
+// The compass occupies the left end of the footer strip, where BTN_CACHE used
+// to start. Square and the same height as a button, so it shares the row's
+// vertical rhythm rather than introducing a second one to keep in sync.
+static const int COMPASS_D = BTN_H;
+
+static void compassRect(int *x, int *y, int *d) {
+    if (!g_panelOk) { *x = *y = *d = 0; return; }
+    *d = COMPASS_D;
+    *x = BTN_M;
+    *y = M5.Display.height() - BTN_H - BTN_M;
+}
+
 static uint32_t g_confirmUntil = 0;      // armed state for the cache button
 static uint32_t g_lastTouchMs = 0;
 
 static void buttonRect(int i, int *x, int *y, int *w, int *h) {
     if (!g_panelOk) { *x = *y = *w = *h = 0; return; }
-    int total = M5.Display.width() - BTN_M * (BTN_COUNT + 1);
+    // The compass and its own right margin come off the top of the row, then
+    // the five buttons divide what is left. Taking it out here rather than
+    // shrinking each button by a fifth keeps buttonAt() and the canvas sizing
+    // honest without either needing to know the compass exists.
+    int lead  = COMPASS_D + BTN_M;
+    int total = M5.Display.width() - lead - BTN_M * (BTN_COUNT + 1);
     *w = total / BTN_COUNT;
     *h = BTN_H;
-    *x = BTN_M + i * (*w + BTN_M);
+    *x = BTN_M + lead + i * (*w + BTN_M);
     *y = M5.Display.height() - BTN_H - BTN_M;
 }
 
@@ -451,9 +471,16 @@ static void uiCanvasesBegin() {
         g_btnCv.setColorDepth(16);
         g_btnCvOk = g_btnCv.createSprite(w, h);
     }
-    Serial.printf("ui: status canvas %s, button canvas %s\n",
+    if (!g_compassCvOk) {
+        int x, y, d; compassRect(&x, &y, &d);
+        g_compassCv.setPsram(true);
+        g_compassCv.setColorDepth(16);
+        g_compassCvOk = g_compassCv.createSprite(d, d);
+    }
+    Serial.printf("ui: status canvas %s, button canvas %s, compass canvas %s\n",
                   g_statusCvOk ? "ok" : "FAILED (will draw direct)",
-                  g_btnCvOk ? "ok" : "FAILED (will draw direct)");
+                  g_btnCvOk ? "ok" : "FAILED (will draw direct)",
+                  g_compassCvOk ? "ok" : "FAILED (will draw direct)");
 }
 
 static void drawButton(int i, const char *label, uint16_t bg) {
@@ -493,9 +520,101 @@ static void drawButton(int i, const char *label, uint16_t bg) {
     M5.Display.setTextDatum(top_left);
 }
 
-static void drawFooter() {
+// The map does not rotate - north is up, the same as every tile in the
+// archive - so the ring and its N are fixed, and the needle is what moves.
+//
+// TWO SOURCES, DELIBERATELY DIFFERENT THINGS
+// The magnetometer measures where the device is *pointing* and works standing
+// still. GNSS course measures where it is *going* and only exists above
+// walking pace, because it is derived from successive fixes rather than
+// measured - a parked receiver leaves the course field empty, which parses to
+// zero, so an ungated needle would sit convincingly at north.
+//
+// They agree in a car and diverge on foot, which is a feature: the compass
+// answers "which way am I facing relative to these streets", and that is the
+// question you have while stationary and holding the thing.
+//
+// The magnetometer wins where available, since it is the better answer to
+// that question and it is available more of the time. Course is the fallback,
+// drawn hollow so the two are never confused for one another - a heading you
+// can turn on the spot and watch track is a different claim from one that
+// only updates while you travel.
+static void drawCompass(const GnssFix &fix) {
+    if (!g_panelOk) return;
+    if (g_screenOff) return;
+
+    int x, y, d; compassRect(&x, &y, &d);
+    int r = d / 2 - 3;
+
+    float mag    = compass_heading();          // negative when unavailable
+    bool  useMag = mag >= 0.0f;
+    bool  moving = gnss_coarse(fix) && fix.speedKmh > 3.0;
+    float course = (float)fix.course;
+    bool  calibrating = compass_calibrating();
+
+    uint16_t live = M5.Display.color565(30, 90, 220);
+    uint16_t dim  = M5.Display.color565(150, 150, 160);
+    uint16_t dot  = (useMag || gnss_coarse(fix)) ? live : dim;
+
+    auto paint = [&](lgfx::LovyanGFX *g, int cx, int cy) {
+        g->fillCircle(cx, cy, r, style_background());
+        g->drawCircle(cx, cy, r, TFT_WHITE);
+        g->setTextDatum(middle_center);
+        g->setTextColor(TFT_WHITE);
+        g->setTextSize(1);
+
+        if (calibrating) {
+            // No needle mid-calibration: the offsets are half-measured and
+            // anything drawn from them would be worse than nothing. The
+            // percentage is by coverage, so it advances when the device is
+            // turned rather than when time passes - which is also the
+            // instruction, without room for a sentence saying so.
+            char pc[8];
+            snprintf(pc, sizeof pc, "%d%%", compass_calibrate_progress());
+            g->drawString(pc, cx, cy);
+            return;
+        }
+
+        g->drawString("N", cx, cy - r + 7);
+
+        // Screen angle: heading 0 is north, which is up, which is -90 in
+        // atan2 space - the same convention as the marker's direction line.
+        if (useMag) {
+            float a = (mag - 90.0f) * 0.017453292f;
+            g->drawLine(cx, cy, cx + (int)((r - 7) * cosf(a)),
+                        cy + (int)((r - 7) * sinf(a)), live);
+        } else if (moving) {
+            // Hollow: two ticks short of centre, so a travel-direction needle
+            // reads differently at a glance from a facing one.
+            float a = (course - 90.0f) * 0.017453292f;
+            float c = cosf(a), s = sinf(a);
+            g->drawLine(cx + (int)(5 * c), cy + (int)(5 * s),
+                        cx + (int)((r - 7) * c), cy + (int)((r - 7) * s), dim);
+        }
+        g->fillCircle(cx, cy, 3, dot);
+    };
+
+    if (g_compassCvOk) {
+        // Colour-keyed for the same reason drawButton is: the sprite is
+        // square and the compass is round, so the corners belong to whatever
+        // painted the footer, not to us. The key only has to be absent from
+        // this sprite - which is white, grey, blue and the map background.
+        const uint16_t KEY = 0xF81F;            // magenta, unused here
+        g_compassCv.fillSprite(KEY);
+        paint(&g_compassCv, d / 2, d / 2);
+        g_compassCv.pushSprite(x, y, KEY);
+        return;
+    }
+
+    paint(&M5.Display, x + d / 2, y + d / 2);
+    M5.Display.setTextDatum(top_left);
+}
+
+static void drawFooter(const GnssFix &fix) {
     if (!g_panelOk) return;   // no display attached
     if (g_screenOff) return;
+
+    drawCompass(fix);
 
     bool armed = (millis() < g_confirmUntil);
     bool busy  = map_prefetch_busy();
@@ -905,6 +1024,26 @@ static void handleTouch(const GnssFix &fix) {
     // The panel is over everything, so it gets first refusal on the tap -
     // otherwise a row landing on a footer button would trigger both.
     if (pinPanelTouch(t.x, t.y, fix)) return;
+
+    // The compass dial is its own control: tap to calibrate, tap again to
+    // stop. Tested before buttonAt() because the two regions do not overlap
+    // but the button hit zones are padded outward (BTN_PAD_SIDE) and would
+    // otherwise reach across.
+    //
+    // Calibration has to be a deliberate act rather than something automatic:
+    // it needs the device turned through every orientation, which nothing can
+    // ask for on its own behalf, and a half-finished sweep produces an offset
+    // that biases every heading afterwards.
+    if (compass_ok()) {
+        int cx, cy, cd; compassRect(&cx, &cy, &cd);
+        if (t.x >= cx - BTN_PAD_SIDE && t.x < cx + cd + BTN_PAD_SIDE &&
+            t.y >= cy - BTN_PAD_TOP  && t.y < M5.Display.height()) {
+            if (compass_calibrating()) compass_calibrate_cancel();
+            else                       compass_calibrate_start();
+            g_confirmUntil = 0;
+            return;
+        }
+    }
 
     int b = buttonAt(t.x, t.y);
     if (b != BTN_CACHE) g_confirmUntil = 0;
@@ -2251,14 +2390,41 @@ static void drawStatus(const GnssFix &fix) {
 
     NetStats ns; netsource_stats(&ns);
     CacheStats cs; tilecache_stats(&cs);
-    snprintf(buf, sizeof buf,
-             "tiles %lu q%lu  c%lu n%lu  render %lums  blit %lu/%lums  blob %lu  %s%s",
-             (unsigned long)st.rendered, (unsigned long)st.queue_depth,
-             (unsigned long)ns.cache_hits, (unsigned long)ns.net_hits,
-             (unsigned long)st.last_render_ms,
-             (unsigned long)st.last_draw_ms, (unsigned long)st.max_draw_ms,
-             (unsigned long)cs.entries,
-             ns.build[0] ? ns.build : "none", ns.online ? "" : " (offline)");
+
+    // Which counters get the space depends on where tiles are coming from.
+    //
+    // The bar used to show cache hits, net hits and the blob entry count
+    // unconditionally. On a device with a planet archive on the card those
+    // are all permanently zero - nothing is fetched, so nothing is cached -
+    // while local_hits, the one counter actually moving, was tracked and
+    // never displayed. Three zeros and no explanation reads as a broken
+    // downloader rather than as the offline path working exactly as intended.
+    //
+    // So: local hits are shown whenever a local archive is open, and the
+    // network-side counters are dropped once it is clear they are not the
+    // story - no build adopted, nothing cached, nothing fetched.
+    bool netpath = ns.build[0] || cs.entries || ns.net_hits || ns.cache_hits;
+    if (ns.locals && !netpath) {
+        snprintf(buf, sizeof buf,
+                 "tiles %lu q%lu  local %lu  render %lums  blit %lu/%lums  "
+                 "%u archive%s",
+                 (unsigned long)st.rendered, (unsigned long)st.queue_depth,
+                 (unsigned long)ns.local_hits,
+                 (unsigned long)st.last_render_ms,
+                 (unsigned long)st.last_draw_ms, (unsigned long)st.max_draw_ms,
+                 (unsigned)ns.locals, ns.locals == 1 ? "" : "s");
+    } else {
+        snprintf(buf, sizeof buf,
+                 "tiles %lu q%lu  c%lu n%lu l%lu  render %lums  blit %lu/%lums  "
+                 "blob %lu  %s%s",
+                 (unsigned long)st.rendered, (unsigned long)st.queue_depth,
+                 (unsigned long)ns.cache_hits, (unsigned long)ns.net_hits,
+                 (unsigned long)ns.local_hits,
+                 (unsigned long)st.last_render_ms,
+                 (unsigned long)st.last_draw_ms, (unsigned long)st.max_draw_ms,
+                 (unsigned long)cs.entries,
+                 ns.build[0] ? ns.build : "none", ns.online ? "" : " (offline)");
+    }
     if (map_prefetch_busy()) {
         char pf[64];
         snprintf(pf, sizeof pf, "  PREFETCH %d%%", map_prefetch_progress());
@@ -2791,6 +2957,19 @@ void setup() {
         map_world_floor_start();
     }
 
+    // The magnetometer, for a heading that exists while standing still.
+    //
+    // After M5.begin() and not before: bringing it up means driving EXT_5V on
+    // the expander at 0x43, and Power_Class::begin() rewrites that expander's
+    // direction register - the same ordering trap storage.cpp documents for
+    // USB VBUS on 0x44. Optional in every sense: no module, no drivers, or a
+    // dead sensor all leave the dial falling back to GNSS course.
+    if (compass_begin()) {
+        bootStep("compass ready");
+    } else if (compass_supported()) {
+        bootStep("no compass (see log)");
+    }
+
     // The saved-point list, off the same card. Read here rather than lazily:
     // the first map_draw asks for it, and that runs on the UI task while the
     // render worker already has the archive open.
@@ -2879,7 +3058,15 @@ void loop() {
     gnss_get(&fix);
 
     batteryPoll(false);                // 1 Hz internally
+    compass_update();                  // 10 Hz internally, loop()'s task only
     handleTouch(fix);
+
+    // True north correction. The map is drawn in true north and the sensor
+    // reports magnetic, and the difference is over ten degrees across much of
+    // the continental US - enough that the needle would visibly disagree with
+    // the streets under it. Recomputed only when the position has moved far
+    // enough to matter.
+    if (gnss_coarse(fix)) compass_set_position(fix.lat, fix.lon);
     handlePowerButton();
     flushIfIdle();
     applyTheme(fix);
@@ -2967,6 +3154,17 @@ void loop() {
                           (unsigned long)st.coarse_gap,
                           (unsigned long)st.coarse_wait,
                           (unsigned)(ESP.getFreePsram() / 1024));
+            // Separate line rather than more fields on that one: the compass
+            // is the thing most likely to need watching over time (a drifting
+            // |B| means the calibration has gone stale, or something magnetic
+            // moved), and it is easier to grep for on its own.
+            if (compass_ok()) {
+                float h = compass_heading();
+                Serial.printf("compass: %s, %.0f deg %s, |B| %.1f uT\n",
+                              compass_status(),
+                              h < 0 ? 0.0f : h, compass_label(h),
+                              compass_field_ut());
+            }
         }
     }
 
@@ -2983,7 +3181,7 @@ void loop() {
         // repaint on the way out.
         if (!g_pinPanel) map_draw(fix);
         drawStatus(fix);
-        drawFooter();
+        drawFooter(fix);
         drawPinPanel(fix);
     }
 

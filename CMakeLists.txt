@@ -174,6 +174,80 @@ if(NOT EXISTS "${SUNSET_DIR}/src/sunset.cpp")
 endif()
 
 # ---------------------------------------------------------------------------
+# Bosch BMI270 + BMM150 drivers, fetched on first configure.
+#
+# These are what compass.cpp needs to produce a heading while stationary. GNSS
+# course over ground is derived from successive fixes, so it does not exist at
+# a standstill - a parked receiver leaves the RMC course field empty. Only a
+# magnetometer answers "which way am I facing" when nothing is moving.
+#
+# Fetched rather than committed, and fetched here rather than by a script the
+# user has to remember, for the same two reasons as everything else in this
+# file: they are byte-exact copies from a pinned upstream under a different
+# licence (BSD-3-Clause), and a missing optional step whose failure mode is a
+# silently absent feature is a bad trade against one network call.
+#
+# Unlike sunset this is NOT fatal when it fails. compass.cpp guards on
+# __has_include("bmi270.h") and degrades to GNSS course, so a build behind a
+# firewall, or offline, still produces working firmware - just without a
+# standstill compass. It says so rather than failing.
+#
+#   idf.py -DMAP_HAVE_COMPASS=0 build     skip the fetch entirely
+#   ./tools/fetch_bosch_drivers.sh --revert
+#
+# src: the driver set and the reason for vendoring them are from
+#      Sudrien/m5tab5_esp_idf_m135_examples; see tools/fetch_bosch_drivers.sh.
+if(NOT DEFINED MAP_HAVE_COMPASS)
+    set(MAP_HAVE_COMPASS 1)
+endif()
+
+set(BOSCH_DIR "${CMAKE_CURRENT_LIST_DIR}/components/bosch_sensortec")
+if(MAP_HAVE_COMPASS AND NOT EXISTS "${BOSCH_DIR}/bmi270.c")
+    message(STATUS "compass: fetching Bosch BMI270/BMM150 drivers")
+    execute_process(
+        COMMAND "${CMAKE_CURRENT_LIST_DIR}/tools/fetch_bosch_drivers.sh"
+                --keep-build
+        # Both of these matter, and neither is tidiness.
+        #
+        # --keep-build: the script's normal ending is `rm -rf build/`, because
+        # a stale build directory reuses old objects and leaves the sensor
+        # dead with good sources on disk. That is right when a human runs it
+        # from the project root, and fatal here - configure runs *with build/
+        # as its working directory*, so deleting it removes cmake's own CWD
+        # and the next thing to touch the filesystem fails with "Current
+        # working directory cannot be established", pointing at
+        # component.cmake rather than at this.
+        #
+        # WORKING_DIRECTORY: without it the child inherits that same build/
+        # CWD. The script only uses absolute paths derived from BASH_SOURCE so
+        # it would survive, but nothing should be running out of a directory
+        # this project deletes and recreates.
+        WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}"
+        RESULT_VARIABLE BOSCH_RC
+        OUTPUT_VARIABLE BOSCH_OUT
+        ERROR_VARIABLE  BOSCH_ERR)
+    if(NOT BOSCH_RC EQUAL 0)
+        # Not fatal, deliberately. The build that follows is a working build
+        # without a standstill compass, which is strictly better than no build
+        # at all for anyone who does not have the M135 fitted anyway.
+        message(WARNING
+            "compass: fetching Bosch's drivers failed (${BOSCH_RC}).\n"
+            "${BOSCH_ERR}"
+            "Building without a magnetometer - the compass dial will fall back "
+            "to GNSS course over ground, which only exists while moving.\n"
+            "Re-run ./tools/fetch_bosch_drivers.sh when the network is "
+            "available, or build with -DMAP_HAVE_COMPASS=0 to stop asking.")
+    else()
+        message(STATUS "compass: vendored into components/bosch_sensortec")
+    endif()
+endif()
+
+if(NOT MAP_HAVE_COMPASS AND EXISTS "${BOSCH_DIR}")
+    file(REMOVE_RECURSE "${BOSCH_DIR}")
+    message(STATUS "compass: vendored drivers removed (MAP_HAVE_COMPASS=0)")
+endif()
+
+# ---------------------------------------------------------------------------
 # Board variant for the managed arduino-esp32 component.
 #
 # The component the IDF registry ships carries only generic target variants -

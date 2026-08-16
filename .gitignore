@@ -33,3 +33,15 @@ dependencies.lock
 # components to whichever IDF was installed the day it was made. The patch that
 # produces it lives in tools/patch_ffconf.py, which is committed.
 components/fatfs/
+
+# Bosch's BMI270 and BMM150 reference drivers, fetched by CMakeLists.txt on
+# first configure (or by tools/fetch_bosch_drivers.sh by hand).
+#
+# Ignored for the same reason as components/fatfs/: a byte-exact copy of a
+# pinned upstream, under a different licence to this repo (BSD-3-Clause), that
+# is re-derived automatically. Committing it would vendor a fork of somebody
+# else's driver and pin it to whatever was on the server that day.
+#
+# compass.cpp guards on __has_include("bmi270.h"), so a tree without these
+# builds and runs - the compass dial falls back to GNSS course over ground.
+components/bosch_sensortec/

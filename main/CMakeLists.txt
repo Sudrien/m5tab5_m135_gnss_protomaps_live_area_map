@@ -4,6 +4,20 @@
 # exists only because arduino-cli requires a .ino matching the folder name.
 # The sketch itself is tab5_map.cpp.
 
+# Bosch's BMI270/BMM150 drivers, for the standstill compass. Optional, and the
+# conditional is not decoration: naming a component that does not exist is a
+# hard configure error, not a warning, so an unconditional entry here would
+# turn a failed or skipped driver fetch into a build that cannot configure at
+# all. compass.cpp guards on __has_include to match, so the two agree about
+# what "absent" means.
+set(MAP_BOSCH_REQUIRES "")
+if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/../components/bosch_sensortec/bmi270.c")
+    set(MAP_BOSCH_REQUIRES bosch_sensortec)
+else()
+    message(STATUS "compass: no vendored Bosch drivers - building without a "
+                   "magnetometer (dial falls back to GNSS course)")
+endif()
+
 idf_component_register(
     SRCS
         "../tab5_map.cpp"
@@ -16,6 +30,7 @@ idf_component_register(
         "../waypoints.cpp"
         "../storage.cpp"
         "../bigfile.cpp"
+        "../compass.cpp"
         "../raster.c"
         "../mvt.c"
         "../inflate.c"
@@ -43,6 +58,7 @@ idf_component_register(
         fatfs
         vfs
         sunset
+        ${MAP_BOSCH_REQUIRES}
 )
 
 # Tells features.h which build this is. Deliberately explicit rather than
