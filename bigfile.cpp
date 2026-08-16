@@ -10,11 +10,22 @@
 #include "ff.h"
 
 // FF_FS_EXFAT is what makes FSIZE_t 64-bit. Without it every offset below
-// silently truncates, which is the exact failure this file exists to remove -
-// so it is a hard stop, not a warning.
+// silently truncates, which is the exact failure this file exists to remove,
+// so the 64-bit path is withdrawn rather than left looking available.
+//
+// Withdrawn, not fatal: a stock ESP-IDF hardcodes FF_FS_EXFAT to 0, and an
+// #error here would mean nobody who has not vendored the component can build
+// the IDF target at all - which is a poor trade for a feature that degrades
+// perfectly well. The stubs at the bottom of this file take over, callers see
+// bigfile_supported() == false, and the boot log says so.
 #if !FF_FS_EXFAT
-#error "MAP_HAVE_BIGFILE needs a fatfs built with FF_FS_EXFAT=1. See bigfile.h."
+#warning "MAP_HAVE_BIGFILE is set but fatfs has FF_FS_EXFAT=0 - 64-bit reads disabled, see bigfile.h"
+#undef  MAP_HAVE_BIGFILE
+#define MAP_HAVE_BIGFILE 0
 #endif
+#endif
+
+#if MAP_HAVE_BIGFILE
 
 // FatFs volumes are numbered in registration order by ff_diskio_register(),
 // which esp_vfs_fat_*_mount() calls. Two media at most here, but probing the

@@ -14,6 +14,7 @@
 
 #include "tilecache.h"
 #include "mapconfig.h"
+#include "bigfile.h"
 
 extern "C" {
   #include "pmtiles.h"
@@ -88,11 +89,18 @@ static fs::FS *g_fs = nullptr;
 #define LOCAL_ARCHIVE_MAX 16
 #endif
 
+// Two handles, one of which is null.
+//
+// `big` is the 64-bit reader and the only one that can address an archive over
+// 4 GiB; `file` is the fs::File path, which is all the Arduino build has and
+// is correct for everything under the limit. try_open() picks; every other
+// function asks which it got rather than assuming.
 typedef struct {
-    pmt_t    pmt;
-    File     file;
-    char     path[40];
-    bool     ok;
+    pmt_t      pmt;
+    File       file;
+    bigfile_t *big;
+    char       path[40];
+    bool       ok;
 } local_src_t;
 
 static local_src_t g_locals[LOCAL_ARCHIVE_MAX];
@@ -518,11 +526,39 @@ static int net_read(void *ctx, uint64_t off, uint32_t len, uint8_t *dst) {
 
 // ---- SD-backed pmtiles read ------------------------------------------------
 
+// Release whichever handle this archive holds. Called from every failure exit
+// in try_open(), so the two-handle split stays there rather than spreading.
+static void local_close(local_src_t *src) {
+    if (src->big) { bigfile_close(src->big); src->big = nullptr; }
+    if (src->file) src->file.close();
+}
+
 // Reads come from whichever archive asked, passed through io_ctx - there is no
 // longer a single local file to reach for.
 static int sd_read(void *ctx, uint64_t off, uint32_t len, uint8_t *dst) {
     local_src_t *src = (local_src_t *)ctx;
-    if (!src || !src->file) return -1;
+    if (!src) return -1;
+
+    // The 64-bit reader when the archive was opened with one. bigfile_read()
+    // already matches pmt_read_fn, chunks by STORAGE_IO_CHUNK for the same USB
+    // reason as below, and checks with f_tell() that the seek landed where it
+    // was asked - which is what turns a read past the end of a truncated
+    // archive into a failure instead of a short one.
+    if (src->big) return bigfile_read(src->big, off, len, dst);
+
+    if (!src->file) return -1;
+
+    // fs::File::seek() takes a uint32_t and the cast below used to be silent,
+    // so an offset past 4 GiB read from off % 2^32 and returned bytes that
+    // were wrong rather than absent. try_open() refuses archives that need
+    // offsets this large, so this should be unreachable - which is the reason
+    // to say something if it is not.
+    if (off + (uint64_t)len > 0xFFFFFFFFULL) {
+        Serial.printf("netsource: read at %llu+%lu is past the 4 GiB this "
+                      "build can address\n",
+                      (unsigned long long)off, (unsigned long)len);
+        return -1;
+    }
     if (!src->file.seek((uint32_t)off)) return -1;
     // Chunked: a pmtiles blob or leaf directory can be tens of KB, and a
     // single read that large is what the USB driver cannot allocate a
@@ -746,14 +782,23 @@ bool netsource_begin(const char *local_path) {
 
         local_src_t *src = &g_locals[g_local_n];
         memset(&src->pmt, 0, sizeof src->pmt);
+        src->big = nullptr;
         src->ok = false;
         snprintf(src->path, sizeof src->path, "%s", path);
 
-        src->file = g_fs->open(path, FILE_READ);
-        if (!src->file) return false;
+        // The 64-bit reader first, since it is the only one that can open an
+        // archive over 4 GiB. It returns null under Arduino, under an IDF
+        // build without exFAT, and when the file is not on a FatFs volume it
+        // can see - all of which fall back to fs::File, which reads anything
+        // below the limit perfectly well.
+        src->big = bigfile_open(path);
+        if (!src->big) {
+            src->file = g_fs->open(path, FILE_READ);
+            if (!src->file) return false;
+        }
 
         uint8_t *root = (uint8_t *)ps_malloc(LOCAL_ROOT_CAP);
-        if (!root) { src->file.close(); return false; }
+        if (!root) { local_close(src); return false; }
 
         src->pmt.read = sd_read;
         src->pmt.io_ctx = src;
@@ -764,7 +809,7 @@ bool netsource_begin(const char *local_path) {
 
         if (pmt_open(&src->pmt) != PMT_OK) {
             Serial.printf("netsource: local %s FAILED to open\n", path);
-            free(root); src->file.close();
+            free(root); local_close(src);
             return false;
         }
 
@@ -777,24 +822,50 @@ bool netsource_begin(const char *local_path) {
         // inflate somewhere out on a drive. The header says where the data
         // ends, so this costs one size() call and no reading.
         uint64_t need = src->pmt.hdr.data_off + src->pmt.hdr.data_len;
-        uint64_t have = (uint64_t)src->file.size();
+        uint64_t have = src->big ? bigfile_size(src->big)
+                                 : (uint64_t)src->file.size();
+
+        // fs::File::size() returns size_t, so on that path `have` is the low 32
+        // bits of the real size and the comparison below is meaningless for an
+        // archive this large - it reported a 126 GB planet file as 4195665535 B
+        // and called it 3.1% complete. The reads would not work either, so the
+        // answer is the same in both cases; only the reason given differs.
+        if (!src->big && need > 0xFFFFFFFFULL) {
+            Serial.printf("netsource: local %s needs %llu B, past the 4 GiB this "
+                          "build can address (%s). Ignoring it.\n",
+                          path, (unsigned long long)need,
+                          bigfile_supported()
+                              ? "64-bit reads are available but this file is "
+                                "not on a FatFs volume they can reach"
+                              : "no 64-bit reads - see MAP_HAVE_BIGFILE");
+            free(root); local_close(src);
+            return false;
+        }
+
         if (have < need) {
             Serial.printf("netsource: local %s TRUNCATED - header needs %llu B, "
                           "file is %llu B (%.1f%%). Ignoring it.\n",
                           path, (unsigned long long)need,
                           (unsigned long long)have, 100.0 * have / (double)need);
-            free(root); src->file.close();
+            free(root); local_close(src);
             return false;
         }
 
         src->ok = true;
-        Serial.printf("netsource: local %s z%u..%u  lon %.2f..%.2f  %.1f MB\n",
+        Serial.printf("netsource: local %s z%u..%u  lon %.2f..%.2f  %.1f MB%s\n",
                       path, src->pmt.hdr.min_zoom, src->pmt.hdr.max_zoom,
                       src->pmt.hdr.min_lon_e7 / 1e7, src->pmt.hdr.max_lon_e7 / 1e7,
-                      have / 1048576.0);
+                      have / 1048576.0, src->big ? "  [64-bit]" : "");
         g_local_n++;
         return true;
     };
+
+    // Said once, before any archive is judged by it: whether this build can
+    // read past 4 GiB decides which failures below are the file's fault and
+    // which are the build's.
+    Serial.printf("netsource: 64-bit local reads %s\n",
+                  bigfile_supported() ? "available"
+                                      : "unavailable - archives cap at 4 GiB");
 
     if (local_path && *local_path && g_fs->exists(local_path)) try_open(local_path);
 

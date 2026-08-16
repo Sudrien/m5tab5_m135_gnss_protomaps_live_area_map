@@ -23,8 +23,9 @@
 //   1. FF_FS_EXFAT = 1. ESP-IDF hardcodes it to 0 in
 //      components/fatfs/src/ffconf.h and exposes no Kconfig for it, so this
 //      means vendoring the fatfs component. Without it FSIZE_t stays 32-bit
-//      and this file is no better than fs::File - which is why bigfile_open()
-//      refuses at compile time rather than letting it look like it works.
+//      and this file is no better than fs::File, so it compiles its stubs
+//      instead and bigfile_supported() answers false. The build still works;
+//      the boot log says the 64-bit path is missing, and callers fall back.
 //
 //   2. The archive has to be on a volume that can hold it, which for 126 GB
 //      means exFAT, which is the same switch. FAT32 caps one file at 4 GiB

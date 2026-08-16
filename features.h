@@ -48,6 +48,30 @@
 #  define MAP_HAVE_USB_MSC MAP_BUILD_IDF
 #endif
 
+// ---- 64-bit file offsets ----------------------------------------------------
+// The read path netsource uses is 32-bit end to end and none of it reports an
+// overflow: fs::File::seek() takes a uint32_t, fs::File::size() returns size_t,
+// and esp_vfs_fat's lseek() takes off_t, which is a 32-bit long here. A 126 GB
+// planet archive measured 4195665535 B - the low 32 bits of its real size -
+// and was rejected as 3.1% complete, which is the only reason the wrong bytes
+// were never read.
+//
+// bigfile.cpp gets past that by calling FatFs directly, where FSIZE_t is a
+// QWORD once FF_FS_EXFAT is set. IDF-only for the same reason USB MSC is: it
+// needs a vendored fatfs component, and the Arduino build has no mechanism to
+// supply one. That build keeps fs::File unchanged and refuses archives it
+// cannot address, saying which limit it hit.
+//
+// On by default under IDF. If the fatfs in use still has FF_FS_EXFAT=0,
+// bigfile.cpp warns, compiles its stubs instead, and the boot log reports the
+// 64-bit path as absent - so a stock IDF checkout still builds and runs.
+//
+// To turn it off explicitly:
+//   idf.py -DMAP_HAVE_BIGFILE=0 build
+#ifndef MAP_HAVE_BIGFILE
+#  define MAP_HAVE_BIGFILE MAP_BUILD_IDF
+#endif
+
 // ---- what is NOT gained by building under IDF -------------------------------
 // exFAT. Worth stating explicitly because it is the obvious assumption and it
 // is wrong: ESP-IDF hardcodes FF_FS_EXFAT to 0 in components/fatfs/src/ffconf.h
@@ -57,6 +81,10 @@
 //
 // This is why a card over 32 GB, formatted by Windows or a camera, will not
 // mount on either build and mountSD() offers to reformat it as FAT instead.
+//
+// That still describes a stock IDF. Once the fatfs component has been vendored
+// with FF_FS_EXFAT=1, MAP_HAVE_BIGFILE above is what puts it to use - the
+// switch is here, but the patch to fatfs is what makes it mean anything.
 
 // A short description of the build, for the boot banner - so a log always says
 // which variant produced it.

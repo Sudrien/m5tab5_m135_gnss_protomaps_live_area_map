@@ -15,6 +15,7 @@ idf_component_register(
         "../gnss.cpp"
         "../waypoints.cpp"
         "../storage.cpp"
+        "../bigfile.cpp"
         "../raster.c"
         "../mvt.c"
         "../inflate.c"
@@ -62,8 +63,8 @@ target_compile_definitions(${COMPONENT_LIB} PUBLIC MAP_BUILD_IDF=1)
 # That is a warning, not an error, so the build succeeds, flashes and runs -
 # just not the build that was asked for. Both switches documented in features.h
 # are listed here; anything added there needs adding here too.
-foreach(MAP_OPT MAP_HAVE_USB_MSC MAP_STORAGE_PREFER_USB MAP_BATTERY_CELLS
-                MAP_M5_SMOKE_TEST)
+foreach(MAP_OPT MAP_HAVE_USB_MSC MAP_HAVE_BIGFILE MAP_STORAGE_PREFER_USB
+                MAP_BATTERY_CELLS MAP_M5_SMOKE_TEST)
     if(DEFINED ${MAP_OPT})
         target_compile_definitions(${COMPONENT_LIB} PUBLIC ${MAP_OPT}=${${MAP_OPT}})
         message(STATUS "features: ${MAP_OPT}=${${MAP_OPT}} (from the command line)")
