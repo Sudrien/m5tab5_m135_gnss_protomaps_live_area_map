@@ -1995,7 +1995,7 @@ static void prefetch_task(void *arg) {
     int levels = (zs[0] == zs[1]) ? 1 : 2;
     int total = side * side * levels;
 
-    int done = 0, fetched = 0, cached = 0, missing = 0;
+    int done = 0, fetched = 0, cached = 0, missing = 0, offline = 0;
     uint64_t t0 = esp_timer_get_time();
 
     for (int zi = 0; zi < levels; zi++) {
@@ -2006,6 +2006,20 @@ static void prefetch_task(void *arg) {
             for (int dx = -a.radius; dx <= a.radius; dx++) {
                 done++;
                 g_pf_progress = (done * 100) / total;
+
+                // Already on the card. netsource_get() would have served this
+                // from the local archive anyway - but only after trying the
+                // cache and, depending on NET_PREFER_LOCAL, the network, and
+                // it would then have written a cache copy of a tile that is
+                // permanently offline regardless. That is the whole download
+                // this walk was doing over a full planet archive: real bytes
+                // and real minutes, for nothing.
+                if (netsource_local_covers(zs[zi], (uint32_t)(cx + dx),
+                                           (uint32_t)(cy + dy))) {
+                    offline++;
+                    yield_to_renderer();
+                    continue;
+                }
 
                 uint32_t n = TILE_CAP;
                 bool from_net = false;
@@ -2020,31 +2034,68 @@ static void prefetch_task(void *arg) {
                 yield_to_renderer();
             }
         }
-        Serial.printf("prefetch: z%u done (%d fetched, %d cached, %d empty)\n",
-                      zs[zi], fetched, cached, missing);
+        Serial.printf("prefetch: z%u done (%d fetched, %d cached, %d offline, %d empty)\n",
+                      zs[zi], fetched, cached, offline, missing);
     }
 
     free(buf);
-    Serial.printf("prefetch: %d tiles in %lu s (%d from network)\n",
+    Serial.printf("prefetch: %d tiles in %lu s (%d from network, %d already offline)\n",
                   total, (unsigned long)((esp_timer_get_time() - t0) / 1000000),
-                  fetched);
+                  fetched, offline);
     g_pf_progress = 100;
     g_pf_busy = false;
     vTaskDelete(nullptr);
 }
 
-bool map_prefetch_start(int radius, uint8_t z_wide, uint8_t z_close) {
-    if (g_pf_busy || !g_centred) return false;
-    PrefetchArgs *a = (PrefetchArgs *)malloc(sizeof(PrefetchArgs));
-    if (!a) return false;
-
-    // Centre on the grid rather than a fix, so this works even if the fix
-    // has momentarily dropped.
+// Where a prefetch would centre: the grid rather than a fix, so it works even
+// if the fix has momentarily dropped.
+static void prefetch_centre(double *lat, double *lon) {
     xSemaphoreTake(g_glock, portMAX_DELAY);
     tile_id_t c = g_grid.origin;
     xSemaphoreGive(g_glock);
     merc_pt_t mid = { (double)c.x + GRID_N / 2.0, (double)c.y + GRID_N / 2.0, c.z };
-    merc_to_ll(mid, &a->lat, &a->lon);
+    merc_to_ll(mid, lat, lon);
+}
+
+int map_prefetch_pending(int radius, uint8_t z_wide, uint8_t z_close) {
+    if (!g_centred) return 0;
+
+    double lat, lon;
+    prefetch_centre(&lat, &lon);
+
+    const uint8_t zs[2] = { (uint8_t)DATA_ZOOM_OF(z_wide),
+                            (uint8_t)DATA_ZOOM_OF(z_close) };
+    int levels = (zs[0] == zs[1]) ? 1 : 2;
+    int need = 0;
+
+    for (int zi = 0; zi < levels; zi++) {
+        merc_pt_t p = merc_from_ll(lat, lon, zs[zi]);
+        int32_t cx = (int32_t)p.x, cy = (int32_t)p.y;
+        for (int dy = -radius; dy <= radius; dy++)
+            for (int dx = -radius; dx <= radius; dx++)
+                if (!netsource_local_covers(zs[zi], (uint32_t)(cx + dx),
+                                            (uint32_t)(cy + dy)))
+                    need++;
+    }
+    return need;
+}
+
+bool map_prefetch_start(int radius, uint8_t z_wide, uint8_t z_close) {
+    if (g_pf_busy || !g_centred) return false;
+
+    // Nothing here that a local archive does not already hold. A planet file
+    // makes this true everywhere; an extract makes it true inside its own
+    // bounds and at its own zooms, which is why the answer is computed rather
+    // than assumed from the presence of a file.
+    if (map_prefetch_pending(radius, z_wide, z_close) == 0) {
+        Serial.println("prefetch: area is already offline, nothing to download");
+        return false;
+    }
+
+    PrefetchArgs *a = (PrefetchArgs *)malloc(sizeof(PrefetchArgs));
+    if (!a) return false;
+
+    prefetch_centre(&a->lat, &a->lon);
 
     a->radius = radius; a->z1 = z_wide; a->z2 = z_close;
     g_pf_busy = true;
@@ -2099,6 +2150,18 @@ static void world_task(void *arg) {
             if (resuming && z == rz && x < rx) continue;
             for (uint32_t y = 0; y < n; y++) {
                 if (resuming && z == rz && x == rx && y < ry) continue;
+
+                // A local archive already holds it - the floor's entire job
+                // is to guarantee something to draw offline, and this tile
+                // is offline already. Skipped before netsource_get() rather
+                // than inside it, because the point is to avoid the cache
+                // write and, under NET_PREFER_LOCAL=0, the wire.
+                if (netsource_local_covers((uint8_t)z, x, y)) {
+                    cached++;
+                    done++;
+                    done_this_run++;
+                    continue;
+                }
 
                 uint32_t len = TILE_CAP;
                 bool from_net = false;

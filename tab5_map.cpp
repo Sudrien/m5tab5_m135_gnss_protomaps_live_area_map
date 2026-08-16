@@ -500,9 +500,23 @@ static void drawFooter() {
     bool armed = (millis() < g_confirmUntil);
     bool busy  = map_prefetch_busy();
     bool net   = (WiFi.status() == WL_CONNECTED);
+    // Only meaningful while idle; during a run the walk is the authority.
+    //
+    // Memoised: the answer is a few hundred inverse-Mercators and it only
+    // changes as the grid moves or an archive is mounted, neither of which
+    // happens between two repaints. The touch handler asks unmemoised,
+    // because there the answer decides whether to spend minutes downloading.
+    static uint32_t held_at = 0;
+    static bool     held_memo = false;
+    if (!busy && (held_at == 0 || millis() - held_at > 2000)) {
+        held_memo = map_prefetch_pending(PREFETCH_RADIUS, Z_WIDE, Z_CLOSE) == 0;
+        held_at   = millis();
+    }
+    bool held = !busy && held_memo;
 
     char label[40];
     if (busy)       snprintf(label, sizeof label, "caching %d%%", map_prefetch_progress());
+    else if (held)  snprintf(label, sizeof label, "offline");
     else if (armed) snprintf(label, sizeof label, "tap to confirm");
     else if (!net)  snprintf(label, sizeof label, "set up wifi");
     else            snprintf(label, sizeof label, "cache %d km",
@@ -510,6 +524,7 @@ static void drawFooter() {
                                     * 0.74 / (1 << DATA_ZOOM_OF(Z_FLOOR)))));
     drawButton(BTN_CACHE, label,
                busy  ? TFT_DARKGREY :
+               held  ? M5.Display.color565(30, 90, 50) :
                armed ? TFT_ORANGE   :
                net   ? M5.Display.color565(40, 70, 150)
                      : M5.Display.color565(70, 70, 70));
@@ -917,6 +932,14 @@ static void handleTouch(const GnssFix &fix) {
 
     case BTN_CACHE:
         if (map_prefetch_busy()) break;
+        // Checked before wifi: with a planet file on the card there is
+        // nothing to download, so demanding an association first - and
+        // opening the setup portal over the map to get one - is asking the
+        // user to solve a problem they do not have.
+        if (map_prefetch_pending(PREFETCH_RADIUS, Z_WIDE, Z_CLOSE) == 0) {
+            Serial.println("cache: this area is already offline on the card");
+            break;
+        }
         if (WiFi.status() != WL_CONNECTED) {
             Serial.println("wifi: opening setup portal from button");
             wifiSetPins();

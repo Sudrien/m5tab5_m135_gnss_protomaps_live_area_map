@@ -65,6 +65,14 @@ bool netsource_get(uint8_t z, uint32_t x, uint32_t y,
 bool netsource_get_local(uint8_t z, uint32_t x, uint32_t y,
                          uint8_t *dst, uint32_t *len);
 
+// Is this tile inside a local archive's zoom range and bounding box?
+//
+// Header arithmetic only - it does not open a directory or read a tile, so it
+// is cheap enough to ask about thousands of tiles in a row. Used to decide
+// that a tile needs no caching at all: if a local archive holds it, a copy in
+// the SD cache is a second copy of a file already sitting on the same card.
+bool netsource_local_covers(uint8_t z, uint32_t x, uint32_t y);
+
 // Populate the offline floor by pulling every tile from z0 to maxz into the
 // cache. 5461 tiles at maxz 6; slow (one request each) but resumable, since
 // anything already cached is skipped. `buf`/`cap` is scratch for one tile.

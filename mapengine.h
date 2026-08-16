@@ -86,6 +86,12 @@ void map_set_zoom(uint8_t zoom, const GnssFix &fix);
 // still a network to fill it from.
 bool map_prefetch_start(int radius, uint8_t z_wide, uint8_t z_close);
 
+// How many tiles of that same square are not already held by a local archive.
+// Zero means the whole area is offline already and map_prefetch_start() will
+// decline. Cheap enough for the footer to call each repaint: header fields
+// only, no directory reads.
+int  map_prefetch_pending(int radius, uint8_t z_wide, uint8_t z_close);
+
 // 0 when idle, else 1..100.
 // Populate the permanent world floor. Same task machinery as the radius
 // prefetch, so only one runs at a time.

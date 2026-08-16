@@ -15,6 +15,7 @@
 #include "tilecache.h"
 #include "mapconfig.h"
 #include "bigfile.h"
+#include "mercator.h"
 
 extern "C" {
   #include "pmtiles.h"
@@ -115,15 +116,36 @@ static bool local_covers(const local_src_t *s, uint8_t z, uint32_t x, uint32_t y
     if (z < s->pmt.hdr.min_zoom || z > s->pmt.hdr.max_zoom) return false;
 
     // Tile bounds in e7 degrees, compared against the archive's own bbox.
-    // Only longitude is checked directly; latitude needs the inverse Mercator
-    // and the zoom test has already done most of the work, so the extra
-    // precision is not worth the transcendentals here.
     uint32_t n = 1u << z;
     int64_t lon0 = (int64_t)(-1800000000LL) + (int64_t)3600000000LL * x / n;
     int64_t lon1 = (int64_t)(-1800000000LL) + (int64_t)3600000000LL * (x + 1) / n;
     if (lon1 < s->pmt.hdr.min_lon_e7 || lon0 > s->pmt.hdr.max_lon_e7) return false;
-    (void)y;
+
+    // Latitude needs the inverse Mercator. This used to be skipped as not
+    // worth the transcendentals, which was defensible while the answer only
+    // decided whether to attempt a lookup - a wrong "yes" cost one directory
+    // walk. It is no longer only that: netsource_local_covers() answers the
+    // question "is this tile already offline", and a wrong "yes" there means
+    // a tile north or south of the extract silently never gets cached. Two
+    // atan(sinh()) per tile is cheap against that.
+    merc_pt_t t0 = { (double)x, (double)y, z }, t1 = { (double)x, (double)(y + 1), z };
+    double lat_hi, lat_lo, dummy;
+    merc_to_ll(t0, &lat_hi, &dummy);   // y increases southward, so y is the north edge
+    merc_to_ll(t1, &lat_lo, &dummy);
+    int64_t lat0 = (int64_t)(lat_lo * 1e7), lat1 = (int64_t)(lat_hi * 1e7);
+    if (lat1 < s->pmt.hdr.min_lat_e7 || lat0 > s->pmt.hdr.max_lat_e7) return false;
     return true;
+}
+
+// Public form: would some local archive serve this tile without the network?
+//
+// Header fields only - no directory walk, no IO, no lock. A "yes" can still
+// end in PMT_NOTFOUND (ocean inside the bbox), but that is a legitimately
+// empty tile, which is exactly what caching it would have stored anyway.
+bool netsource_local_covers(uint8_t z, uint32_t x, uint32_t y) {
+    for (int i = 0; i < g_local_n; i++)
+        if (local_covers(&g_locals[i], z, x, y)) return true;
+    return false;
 }
 static pmt_t   g_remote;                // current build, over HTTP
 static bool    g_remote_ok = false;
@@ -726,18 +748,32 @@ bool netsource_prefetch_world(uint8_t maxz, uint8_t *buf, uint32_t cap,
         for (uint32_t x = 0; x < n; x++) {
             for (uint32_t y = 0; y < n; y++) {
                 done++;
+                // Held offline already. The floor exists so there is always
+                // something to draw without a network; a local archive that
+                // covers this tile satisfies that on its own, and caching a
+                // copy of it buys nothing. With a planet file on the card
+                // this is every tile, which turns the whole 5461-tile walk
+                // into a no-op instead of an hour of requests.
+                bool have = netsource_local_covers(z, x, y);
+
                 // Already cached, including negative markers, so a resumed
                 // run costs an SD stat rather than a round trip.
                 uint32_t got = cap;
-                if (cache_is_empty_marker(z, x, y) ||
-                    cache_read(z, x, y, buf, &got)) { skipped++; }
+                if (!have)
+                    have = cache_is_empty_marker(z, x, y) ||
+                           cache_read(z, x, y, buf, &got);
+
+                if (have) skipped++;
                 else {
                     got = cap;
                     bool net = false;
                     if (netsource_get(z, x, y, buf, &got, &net)) fetched++;
                 }
+
                 if (progress && (done % 64) == 0) progress(done, total);
-                if (WiFi.status() != WL_CONNECTED) {
+                // Only the wire needs a link. A run that is finding everything
+                // locally should not abort partway because wifi dropped.
+                if (!have && WiFi.status() != WL_CONNECTED) {
                     Serial.println("netsource: link lost, prefetch paused");
                     return false;
                 }
