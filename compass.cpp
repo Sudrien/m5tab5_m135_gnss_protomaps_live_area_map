@@ -154,16 +154,49 @@ static void bmi_delay_us(uint32_t period, void *intf_ptr) {
 // that work (data before address, poll aux_busy, drop power save around each
 // transfer), which is exactly the part that defeated a hand-rolled version in
 // the source project.
+//
+// Manual-mode reads are capped at the burst length in AUX_IF_CONF, and 8 bytes
+// (BMI2_AUX_READ_LEN_3) is the largest the hardware offers. bmm150_init reads
+// its factory trim as 2 bytes from 0x5D, 4 from 0x62 and *10* from 0x64 - and
+// that last one is the first request in the entire bring-up sequence that does
+// not fit. So a 1-byte chip ID read succeeds, every earlier step looks healthy,
+// and the failure lands inside bmm150_init with nothing to say which register
+// it was on.
+//
+// Splitting here rather than shortening the burst: the trim read is the only
+// caller that needs it, and dropping every other transfer to 6 bytes to make
+// one 10-byte read divide evenly would slow the 3-byte data path for nothing.
+static const uint32_t AUX_MAX_BURST = 8;
+
 static BMM150_INTF_RET_TYPE aux_read(uint8_t reg, uint8_t *data,
                                      uint32_t len, void *intf_ptr) {
     (void)intf_ptr;
-    return bmi2_read_aux_man_mode(reg, data, len, &s_bmi);
+    while (len > 0) {
+        uint32_t n = len > AUX_MAX_BURST ? AUX_MAX_BURST : len;
+        int8_t rc = bmi2_read_aux_man_mode(reg, data, n, &s_bmi);
+        if (rc != BMI2_OK) return rc;
+        reg  += (uint8_t)n;
+        data += n;
+        len  -= n;
+    }
+    return BMI2_OK;
 }
 
 static BMM150_INTF_RET_TYPE aux_write(uint8_t reg, const uint8_t *data,
                                       uint32_t len, void *intf_ptr) {
     (void)intf_ptr;
-    return bmi2_write_aux_man_mode(reg, data, len, &s_bmi);
+    // Writes have no equivalent burst register - the aux master pushes one
+    // byte per transaction regardless - but the same chunking costs nothing
+    // and keeps both directions bounded the same way.
+    while (len > 0) {
+        uint32_t n = len > AUX_MAX_BURST ? AUX_MAX_BURST : len;
+        int8_t rc = bmi2_write_aux_man_mode(reg, data, n, &s_bmi);
+        if (rc != BMI2_OK) return rc;
+        reg  += (uint8_t)n;
+        data += n;
+        len  -= n;
+    }
+    return BMI2_OK;
 }
 
 // ---- module power ---------------------------------------------------------
@@ -206,12 +239,15 @@ bool compass_begin() {
     M5.In_I2C.stop();
 
     memset(&s_bmi, 0, sizeof s_bmi);
-    s_bmi.chip_id         = BMI270_M135_ADDR;
+    // chip_id is an output field - bmi270_init overwrites it with what the
+    // part reports. The I2C address reaches the callbacks as a compile-time
+    // constant instead, so nothing reads this; left unset rather than
+    // pre-loaded with an address, which invites the wrong conclusion.
     s_bmi.read            = bmi_read;
     s_bmi.write           = bmi_write;
     s_bmi.delay_us        = bmi_delay_us;
     s_bmi.intf            = BMI2_I2C_INTF;
-    s_bmi.intf_ptr        = nullptr;      // the address is a compile-time constant here
+    s_bmi.intf_ptr        = &s_bmi;       // liveness token; the address is a compile-time constant here
     s_bmi.read_write_len  = 32;
     s_bmi.config_file_ptr = nullptr;      // use the image built into bmi270.c
 
@@ -226,6 +262,39 @@ bool compass_begin() {
         snprintf(s_status, sizeof s_status, "IMU init failed (%d)", rc);
         return false;
     }
+
+    // bmi270_init returning BMI2_OK is not the same as the config image having
+    // landed. The driver reports OK on a scrambled upload; the part tells the
+    // truth in INTERNAL_STATUS, where message[3:0] must read 0x1 (init_ok).
+    // Anything else - 0x0 not_init, 0x2 init_err, 0x3 drv_err - means the
+    // accelerometer and the aux master are both dead while every register
+    // write below still ACKs, which is the whole reason a magnetometer failure
+    // shows up three layers from its cause.
+    //
+    // src: BMI270 datasheet 5.2.5, INTERNAL_STATUS (0x21).
+    uint8_t istat = 0;
+    if (bmi2_get_regs(BMI2_INTERNAL_STATUS_ADDR, &istat, 1, &s_bmi) != BMI2_OK) {
+        Serial.println("compass: INTERNAL_STATUS unreadable");
+        snprintf(s_status, sizeof s_status, "IMU status unreadable");
+        return false;
+    }
+    if ((istat & 0x0F) != 0x01) {
+        Serial.printf("compass: BMI270 config did not take - INTERNAL_STATUS "
+                      "0x%02X (want low nibble 0x1). The 8 KB image uploaded "
+                      "and was rejected; nothing below can work.\n", istat);
+        snprintf(s_status, sizeof s_status, "IMU config rejected (0x%02X)", istat);
+        return false;
+    }
+    Serial.println("compass: BMI270 config uploaded, internal status ok");
+
+    // Advanced power save gates the aux master. Bosch's own aux example
+    // disables it before touching AUX_IF_CONF, and while the man-mode helpers
+    // drop it around each transfer, they restore whatever they found - so
+    // leaving it on turns the first transaction after every idle gap into an
+    // aux_err. Cheap to disable outright; the part is awake anyway for the
+    // accelerometer.
+    if (bmi2_set_adv_power_save(BMI2_DISABLE, &s_bmi) != BMI2_OK)
+        Serial.println("compass: adv_power_save disable failed (continuing)");
 
     // Internal pull-ups on the aux bus - the M135 has no external ones.
     uint8_t pupsel = BMI2_ASDA_PUPSEL_2K;
@@ -276,26 +345,116 @@ bool compass_begin() {
             Serial.println("compass: accel config failed (continuing on defaults)");
     }
 
-    uint8_t sens[2] = { BMI2_ACCEL, BMI2_AUX };
-    if (bmi270_sensor_enable(sens, 2, &s_bmi) != BMI2_OK)
-        Serial.println("compass: sensor_enable failed (continuing)");
+    // Not "continuing" any more. With BMI2_AUX disabled the aux master never
+    // clocks, every man-mode transfer times out, and the first symptom is
+    // bmm150_init failing - which reads as a dead magnetometer. Enable the
+    // accelerometer separately so a failure names which one.
+    uint8_t sens_aux = BMI2_AUX;
+    if (bmi270_sensor_enable(&sens_aux, 1, &s_bmi) != BMI2_OK) {
+        Serial.println("compass: aux master would not enable - the BMM150 is "
+                       "unreachable regardless of whether it is fitted");
+        snprintf(s_status, sizeof s_status, "aux enable failed");
+        return false;
+    }
+    uint8_t sens_acc = BMI2_ACCEL;
+    if (bmi270_sensor_enable(&sens_acc, 1, &s_bmi) != BMI2_OK)
+        Serial.println("compass: accel enable failed - heading will not be "
+                       "tilt compensated (continuing)");
+
+    // The aux master needs a poll interval or two after enable before its
+    // first manual transfer lands. Without this the probe below fails on a
+    // cold boot and passes on a warm one.
+    delay(20);
 
     memset(&s_bmm, 0, sizeof s_bmm);
     s_bmm.read     = aux_read;
     s_bmm.write    = aux_write;
     s_bmm.delay_us = bmi_delay_us;
     s_bmm.intf     = BMM150_I2C_INTF;
-    s_bmm.intf_ptr = nullptr;
+    // Not nullptr, even though nothing reads it. Bosch's null_ptr_check in
+    // bmm150.c rejects a null intf_ptr along with a null read/write/delay, so
+    // bmm150_init returns BMM150_E_NULL_PTR (-1) before issuing a single
+    // transaction - which is indistinguishable, from the outside, from a bus
+    // that just failed. The aux address is not carried here at all; it lives
+    // in the BMI270's AUX_DEV_ID, set by the aux config above, so this is a
+    // liveness token and nothing more.
+    //
+    // The equivalent line for s_bmi is harmless only by accident: bmi2.c has
+    // no intf_ptr check, so the same nullptr passes bmi270_init silently. Both
+    // are pointed at s_bmi rather than leaving one of them to depend on which
+    // vendor driver happens to validate what.
+    s_bmm.intf_ptr = &s_bmi;
     s_bmm.chip_id  = BMM150_DEFAULT_I2C_ADDRESS;
 
     // The BMM150 boots into suspend and answers nothing - not even its chip
-    // ID - until brought out of it, so a failure here is as likely to be the
-    // aux path above as the part itself.
-    if (bmm150_init(&s_bmm) != BMM150_OK) {
-        Serial.println("compass: bmm150_init failed - the magnetometer is "
-                       "behind the BMI270's aux bus, so this usually means "
-                       "the aux config above did not take");
-        snprintf(s_status, sizeof s_status, "no magnetometer");
+    // ID - until POWER_CONTROL (0x4B) bit 0 is set. bmm150_init does write it,
+    // but it then reads the chip ID exactly once, and one failed read there is
+    // indistinguishable from an absent part, a suspended part and a broken aux
+    // path. Doing the wake and the probe here separately is what turns a
+    // single boolean into a diagnosis.
+    //
+    // The retry is not superstition: the first man-mode transfer after enable
+    // is the one that fails, and the second reliably does not.
+    bool woke = false;
+    for (int attempt = 0; attempt < 3 && !woke; attempt++) {
+        uint8_t pwr = 0x01;
+        if (aux_write(BMM150_REG_POWER_CONTROL, &pwr, 1, nullptr) != BMM150_OK) {
+            Serial.printf("compass: aux write to BMM150 0x4B failed "
+                          "(attempt %d) - the fault is in the BMI270's aux "
+                          "master, not the magnetometer\n", attempt + 1);
+            delay(10);
+            continue;
+        }
+        delay(5);                       // BMM150 suspend-to-sleep is ~3 ms
+
+        uint8_t id = 0;
+        if (aux_read(BMM150_REG_CHIP_ID, &id, 1, nullptr) != BMM150_OK) {
+            Serial.printf("compass: aux read of BMM150 chip ID failed "
+                          "(attempt %d)\n", attempt + 1);
+            delay(10);
+            continue;
+        }
+        if (id != BMM150_CHIP_ID) {
+            Serial.printf("compass: aux path works but chip ID is 0x%02X, "
+                          "want 0x%02X - something else is answering at aux "
+                          "address 0x%02X\n",
+                          id, BMM150_CHIP_ID, BMM150_DEFAULT_I2C_ADDRESS);
+            snprintf(s_status, sizeof s_status, "wrong part on aux (0x%02X)", id);
+            return false;
+        }
+        woke = true;
+    }
+    if (!woke) {
+        Serial.println("compass: no answer from the aux bus after three tries "
+                       "- BMI270 config is good and the aux master is enabled, "
+                       "so suspect the M135's BMM150 itself or its aux wiring");
+        snprintf(s_status, sizeof s_status, "aux bus silent");
+        return false;
+    }
+
+    int8_t mrc = bmm150_init(&s_bmm);
+    if (mrc != BMM150_OK) {
+        // The part answered its ID one line ago, so the aux path is not the
+        // problem. What is left inside bmm150_init is the trim read.
+        // -1 is BMM150_E_NULL_PTR and means the struct was rejected before
+        // any transaction; -2 BMM150_E_DEV_NOT_FOUND; -4 BMM150_E_COM_FAIL is
+        // the one that actually implicates the aux path.
+        Serial.printf("compass: bmm150_init failed (%d)%s\n", mrc,
+                      mrc == BMM150_E_NULL_PTR
+                          ? " - struct rejected, no transaction attempted"
+                          : " despite a good chip ID - trim read");
+        snprintf(s_status, sizeof s_status, "mag init failed (%d)", mrc);
+        return false;
+    }
+
+    // Trim of all zeroes compiles, initialises and produces a heading that is
+    // smoothly, confidently wrong - the worst failure mode available here, and
+    // invisible without this check.
+    if (s_bmm.trim_data.dig_z4 == 0 && s_bmm.trim_data.dig_x1 == 0 &&
+        s_bmm.trim_data.dig_xyz1 == 0) {
+        Serial.println("compass: trim registers read back all zero - the "
+                       "transfer succeeded and returned nothing real");
+        snprintf(s_status, sizeof s_status, "trim empty");
         return false;
     }
 
@@ -413,6 +572,12 @@ static void calibrate_finish() {
 static const double MAG_POLE_LAT = 86.5, MAG_POLE_LON = 164.0;
 
 void compass_set_position(double lat, double lon) {
+    // Without this the declination line prints on every boot whether or not a
+    // magnetometer exists, because it is pure arithmetic on the GNSS fix. In a
+    // log where the compass has just failed, a plausible "declination -4.3 deg"
+    // three lines later reads as evidence the compass is alive.
+    if (!s_ok) return;
+
     static double last_lat = 1e9, last_lon = 1e9;
     // Declination changes on the scale of degrees per hundred kilometres, so
     // recomputing for every fix is arithmetic nobody reads.
