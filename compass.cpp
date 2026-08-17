@@ -64,8 +64,16 @@ bool  compass_ok()                  { return false; }
 void  compass_update()              { }
 float compass_heading()             { return -1.0f; }
 float compass_field_ut()            { return 0.0f; }
+float compass_roll()                { return 0.0f; }
+float compass_pitch()               { return 0.0f; }
 void  compass_set_position(double, double) { }
-void  compass_calibrate_start()     { }
+void  compass_calibrate_start()        { }
+void  compass_calibrate_start_refine() { }
+size_t compass_cal_blob_size()         { return 0; }
+size_t compass_cal_export(void *, size_t)      { return 0; }
+bool  compass_cal_import(const void *, size_t) { return false; }
+bool  compass_cal_dirty()              { return false; }
+void  compass_cal_clear_dirty()        { }
 void  compass_calibrate_cancel()    { }
 bool  compass_calibrating()         { return false; }
 int   compass_calibrate_progress()  { return 0; }
@@ -112,6 +120,8 @@ static TaskHandle_t s_owner = nullptr;
 static float s_heading = -1.0f;
 static float s_field   = 0.0f;
 static float s_declination = 0.0f;
+static float s_roll  = 0.0f;
+static float s_pitch = 0.0f;
 static char  s_status[64] = "not started";
 
 // Hard-iron offset, in microtesla, subtracted from every reading. Zero until
@@ -119,6 +129,30 @@ static char  s_status[64] = "not started";
 // this hardware is wrong by up to a quarter turn, so compass_ok() stays true
 // but the status line says so and the UI can decline to trust it.
 static float s_offset[3] = { 0.0f, 0.0f, 0.0f };
+
+// Per-axis gain from the ellipsoid fit. 1.0 means "no soft-iron correction",
+// which is what the min/max path leaves behind and what a rejected fit falls
+// back to - so every code path below stays valid with these untouched.
+static float s_scale[3] = { 1.0f, 1.0f, 1.0f };
+static bool  s_fitted   = false;
+
+// Snapshot taken when a refine starts, so a refine that comes back worse can
+// be undone. Refining is meant to add coverage to a calibration; it has no
+// business replacing a good one with a worse one, which is exactly what a
+// sweep taken next to a phone or a desk frame will otherwise do.
+static float s_prev_offset[3], s_prev_scale[3];
+static bool  s_prev_valid = false;
+
+// Spread of the per-axis gains: 0 for a perfect sphere. The device's own soft
+// iron is small and fixed, so a good fit lands within a few percent. A sweep
+// contaminated by something external stretches the readings and shows up here
+// as a large spread even when the residual looks respectable - the points are
+// consistent, just with the wrong field.
+static float gain_spread(const float g[3]) {
+    float mn = g[0], mx = g[0];
+    for (int i = 1; i < 3; i++) { if (g[i] < mn) mn = g[i]; if (g[i] > mx) mx = g[i]; }
+    return (mn > 0.01f) ? (mx / mn - 1.0f) : 99.0f;
+}
 static bool  s_calibrated = false;
 
 // ---- Bosch interface callbacks, over M5.In_I2C ----------------------------
@@ -489,6 +523,7 @@ bool compass_ok() { return s_ok; }
 // the full minute would otherwise "complete" with an offset that biases every
 // heading it later produces.
 static bool  s_cal_on = false;
+static bool  s_cal_refine = false;
 static float s_cal_min[3], s_cal_max[3];
 
 // Enough range on an axis to call it swept. The earth's field is 25-65 uT, so
@@ -496,9 +531,283 @@ static float s_cal_min[3], s_cal_max[3];
 // fraction of the smallest case without demanding a perfect tumble.
 static const float CAL_RANGE_TARGET = 40.0f;
 
+// ---- ellipsoid fit --------------------------------------------------------
+//
+// Min/max recovers a centre and nothing else, so it models the readings as a
+// sphere that has been shifted. Nearby steel also *stretches* them, and a
+// stretched surface has no centre that makes |B| constant - which is why the
+// axis radii kept disagreeing by ~50% across sweeps with quite different
+// coverage, and why |B| still swung 52-66 uT after a correction that had
+// clearly worked in every other respect.
+//
+// Fitted model, axis-aligned:
+//
+//     a_x x^2 + a_y y^2 + a_z z^2 + b_x x + b_y y + b_z z = 1
+//
+// Completing the square gives centre c_i = -b_i / (2 a_i) and, with
+// K = 1 + sum a_i c_i^2, radius_i = sqrt(K / a_i). Scaling each axis by
+// mean_radius / radius_i is what actually removes the stretch.
+//
+// No cross terms. A full quadric needs nine parameters and an eigen
+// decomposition to find rotated axes, and that is worth doing only when the
+// distortion is not aligned with the sensor. The evidence here - one dominant
+// axis, radii differing per-axis - does not call for it, and the six-parameter
+// form solves with plain elimination and no eigen solver on the device.
+static const int FIT_KEEP = 128;
+static float  s_fit_pt[FIT_KEEP][3];
+static int    s_fit_n = 0;          // points kept
+static int    s_fit_seen = 0;       // points offered (for the stride)
+static double s_ata[6][6], s_atb[6];
+
+static void fit_reset() {
+    s_fit_n = s_fit_seen = 0;
+    for (int i = 0; i < 6; i++) {
+        s_atb[i] = 0.0;
+        for (int j = 0; j < 6; j++) s_ata[i][j] = 0.0;
+    }
+}
+
+static void fit_accumulate(float x, float y, float z) {
+    const double d[6] = { (double)x * x, (double)y * y, (double)z * z,
+                          (double)x,     (double)y,     (double)z };
+    for (int i = 0; i < 6; i++) {
+        s_atb[i] += d[i];
+        for (int j = 0; j < 6; j++) s_ata[i][j] += d[i] * d[j];
+    }
+
+    // Keep a thinned sample so the fit can be scored against real readings
+    // afterwards. A fit with no residual check is the failure mode worth
+    // avoiding here: given partial coverage it does not fail loudly, it
+    // returns a confident wrong centre, which is strictly worse than min/max
+    // because it looks rigorous.
+    if (s_fit_n < FIT_KEEP) {
+        s_fit_pt[s_fit_n][0] = x; s_fit_pt[s_fit_n][1] = y;
+        s_fit_pt[s_fit_n][2] = z; s_fit_n++;
+    } else if ((s_fit_seen % 4) == 0) {
+        int slot = (s_fit_seen / 4) % FIT_KEEP;
+        s_fit_pt[slot][0] = x; s_fit_pt[slot][1] = y; s_fit_pt[slot][2] = z;
+    }
+    s_fit_seen++;
+}
+
+// Gaussian elimination with partial pivoting on the 6x6 normal equations.
+static bool solve6(double a[6][6], double b[6], double out[6]) {
+    for (int col = 0; col < 6; col++) {
+        int piv = col;
+        for (int r = col + 1; r < 6; r++)
+            if (fabs(a[r][col]) > fabs(a[piv][col])) piv = r;
+        if (fabs(a[piv][col]) < 1e-9) return false;   // singular: too little coverage
+        if (piv != col) {
+            for (int c = 0; c < 6; c++) { double t = a[col][c]; a[col][c] = a[piv][c]; a[piv][c] = t; }
+            double t = b[col]; b[col] = b[piv]; b[piv] = t;
+        }
+        for (int r = col + 1; r < 6; r++) {
+            double f = a[r][col] / a[col][col];
+            if (f == 0.0) continue;
+            for (int c = col; c < 6; c++) a[r][c] -= f * a[col][c];
+            b[r] -= f * b[col];
+        }
+    }
+    for (int r = 5; r >= 0; r--) {
+        double v = b[r];
+        for (int c = r + 1; c < 6; c++) v -= a[r][c] * out[c];
+        out[r] = v / a[r][r];
+    }
+    return true;
+}
+
+// Returns true and fills centre/scale only if the fit is trustworthy.
+// *why is set on every path, because "rejected" alone cannot be acted on:
+// thin coverage wants another sweep, a bad residual wants the fallback, and
+// an implausible mean wants the sensor checked. Same reason bmm150_init's
+// single boolean cost three rebuilds to unpick.
+static bool fit_solve(float centre[3], float scale[3], float *residual_out,
+                      const char **why) {
+    *why = "ok";
+    *residual_out = -1.0f;
+    if (s_fit_n < 32) { *why = "too few points"; return false; }
+
+    double a[6][6], b[6], p[6];
+    for (int i = 0; i < 6; i++) {
+        b[i] = s_atb[i];
+        for (int j = 0; j < 6; j++) a[i][j] = s_ata[i][j];
+    }
+    if (!solve6(a, b, p)) { *why = "singular - coverage too thin"; return false; }
+
+    // An ellipsoid needs all three quadratic coefficients to share a sign, but
+    // NOT to be positive. Normalising the equation to "= 1" divides through by
+    // (1 - sum c_i^2 / r_i^2), which is negative whenever the origin lies
+    // outside the surface - and a hard-iron offset large enough to be worth
+    // correcting puts it there every time. Demanding positive coefficients
+    // rejects exactly the calibrations this code exists to handle.
+    // Mixed signs are the real failure: that is a hyperboloid, which is what
+    // least squares returns when the points do not wrap the surface.
+    bool all_pos = (p[0] > 0.0 && p[1] > 0.0 && p[2] > 0.0);
+    bool all_neg = (p[0] < 0.0 && p[1] < 0.0 && p[2] < 0.0);
+    if (!all_pos && !all_neg) {
+        *why = "hyperboloid - points do not wrap the surface";
+        return false;
+    }
+
+    double c[3], k = 1.0;
+    for (int i = 0; i < 3; i++) {
+        c[i] = -p[3 + i] / (2.0 * p[i]);
+        k   += p[i] * c[i] * c[i];
+    }
+
+    // k and the coefficients must agree in sign too, or the radii are
+    // imaginary - the same degenerate-fit case arriving by a different route.
+    double rad[3], mean = 0.0;
+    for (int i = 0; i < 3; i++) {
+        double r2 = k / p[i];
+        if (r2 <= 0.0) { *why = "imaginary radius"; return false; }
+        rad[i] = sqrt(r2);
+        mean += rad[i] / 3.0;
+    }
+    if (mean < 5.0 || mean > 200.0) {
+        *why = "implausible mean radius";
+        return false;
+    }
+
+    for (int i = 0; i < 3; i++) {
+        if (rad[i] < mean / 3.0 || rad[i] > mean * 3.0) {
+            *why = "one axis radius far from the others";
+            return false;
+        }
+        centre[i] = (float)c[i];
+        scale[i]  = (float)(mean / rad[i]);
+    }
+
+    // Score it: with a good fit every kept point lands on the unit sphere once
+    // centred and scaled. This is the number that decides whether to trust it.
+    double acc = 0.0;
+    for (int n = 0; n < s_fit_n; n++) {
+        double q = 0.0;
+        for (int i = 0; i < 3; i++) {
+            double v = ((double)s_fit_pt[n][i] - centre[i]) * scale[i] / mean;
+            q += v * v;
+        }
+        double e = sqrt(q) - 1.0;
+        acc += e * e;
+    }
+    *residual_out = (float)sqrt(acc / s_fit_n);
+    if (*residual_out > 0.15f) { *why = "residual too high"; return false; }
+    return true;
+}
+
+// Serialised form. The normal equations are what actually get refined - they
+// are a running sum, so a later sweep adds to them rather than replacing them,
+// and the fit improves with every calibration instead of starting over.
+// Storing only the finished offsets would make each calibration independent
+// and there would be nothing to refine.
+static const uint32_t CAL_MAGIC   = 0x43414C32;   // 'CAL2'
+static const uint16_t CAL_VERSION = 2;
+
+struct CalBlob {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t fit_n;
+    float    offset[3];
+    float    scale[3];
+    float    residual;
+    uint8_t  fitted;
+    uint8_t  pad[3];
+    double   ata[6][6];
+    double   atb[6];
+    float    pt[FIT_KEEP][3];
+};
+
+static bool s_cal_dirty = false;
+
+size_t compass_cal_blob_size() { return sizeof(CalBlob); }
+bool   compass_cal_dirty()     { return s_cal_dirty; }
+void   compass_cal_clear_dirty() { s_cal_dirty = false; }
+
+size_t compass_cal_export(void *dst, size_t cap) {
+    if (!s_calibrated || cap < sizeof(CalBlob)) return 0;
+    CalBlob *b = (CalBlob *)dst;
+    memset(b, 0, sizeof *b);
+    b->magic   = CAL_MAGIC;
+    b->version = CAL_VERSION;
+    b->fit_n   = (uint16_t)s_fit_n;
+    b->fitted  = s_fitted ? 1 : 0;
+    for (int i = 0; i < 3; i++) { b->offset[i] = s_offset[i]; b->scale[i] = s_scale[i]; }
+    memcpy(b->ata, s_ata, sizeof s_ata);
+    memcpy(b->atb, s_atb, sizeof s_atb);
+    memcpy(b->pt,  s_fit_pt, sizeof s_fit_pt);
+    return sizeof(CalBlob);
+}
+
+bool compass_cal_import(const void *src, size_t len) {
+    if (!s_ok || len != sizeof(CalBlob)) return false;
+    const CalBlob *b = (const CalBlob *)src;
+    if (b->magic != CAL_MAGIC || b->version != CAL_VERSION) return false;
+
+    // A stored calibration is only as good as the field it was taken in, and
+    // nothing on the card records where that was. Sanity-check rather than
+    // trust: a gain far from 1 or an offset larger than any plausible bias
+    // means the file is stale or corrupt, and a bad calibration loaded
+    // silently at boot is worse than none - it produces confident headings.
+    for (int i = 0; i < 3; i++) {
+        if (!(b->scale[i] > 0.2f && b->scale[i] < 5.0f))   return false;
+        if (!(fabsf(b->offset[i]) < 1000.0f))              return false;
+    }
+
+    for (int i = 0; i < 3; i++) { s_offset[i] = b->offset[i]; s_scale[i] = b->scale[i]; }
+    memcpy(s_ata, b->ata, sizeof s_ata);
+    memcpy(s_atb, b->atb, sizeof s_atb);
+    memcpy(s_fit_pt, b->pt, sizeof s_fit_pt);
+    s_fit_n      = b->fit_n > FIT_KEEP ? FIT_KEEP : b->fit_n;
+    s_fit_seen   = s_fit_n;
+    s_fitted     = b->fitted != 0;
+    s_calibrated = true;
+    s_cal_dirty  = false;
+
+    Serial.printf("compass: restored calibration, offsets %+.1f %+.1f %+.1f uT, "
+                  "gains %.2f %.2f %.2f (%s, %d stored points)\n",
+                  s_offset[0], s_offset[1], s_offset[2],
+                  s_scale[0], s_scale[1], s_scale[2],
+                  s_fitted ? "ellipsoid" : "minmax", s_fit_n);
+    return true;
+}
+
+// Refining keeps the accumulated normal equations and adds to them. Old data
+// is halved first so a sweep taken somewhere better outweighs one taken next
+// to a desk leg, without discarding the earlier coverage entirely - which is
+// the whole point, since no single tumble covers the sphere well.
+static void fit_decay(double factor) {
+    for (int i = 0; i < 6; i++) {
+        s_atb[i] *= factor;
+        for (int j = 0; j < 6; j++) s_ata[i][j] *= factor;
+    }
+}
+
+void compass_calibrate_start_refine() {
+    if (!s_ok) return;
+    if (!s_calibrated) { compass_calibrate_start(); return; }
+
+    // min/max restarts from scratch: its extremes are per-sweep by definition
+    // and carrying them over would report 100% coverage before the device has
+    // been moved at all.
+    for (int i = 0; i < 3; i++) {
+        s_cal_min[i] = 1e9f; s_cal_max[i] = -1e9f;
+        s_prev_offset[i] = s_offset[i];
+        s_prev_scale[i]  = s_scale[i];
+    }
+    s_prev_valid = true;
+    fit_decay(0.5);
+    s_cal_refine = true;
+    s_cal_on = true;
+    Serial.printf("compass: refining existing calibration (%d points carried "
+                  "over at half weight) - turn through every orientation\n",
+                  s_fit_n);
+}
+
 void compass_calibrate_start() {
     if (!s_ok) return;
     for (int i = 0; i < 3; i++) { s_cal_min[i] = 1e9f; s_cal_max[i] = -1e9f; }
+    fit_reset();
+    s_cal_refine = false;
     s_cal_on = true;
     Serial.println("compass: calibrating - turn the device slowly through "
                    "every orientation, including upside down");
@@ -526,6 +835,71 @@ int compass_calibrate_progress() {
 
 static void calibrate_finish() {
     s_cal_on = false;
+
+    // Try the ellipsoid first; keep min/max as the fallback rather than the
+    // replacement. The fit is better when it works and worse when it does not,
+    // so it has to earn its use on every calibration, not once.
+    float fc[3], fs[3], resid = 0.0f;
+    const char *why = "";
+    if (fit_solve(fc, fs, &resid, &why)) {
+        // A refine has to beat what it replaces, not merely converge. Residual
+        // alone does not catch this: a sweep taken in a distorted field fits
+        // its own ellipsoid tidily and still produces gains far from 1.
+        if (s_cal_refine && s_prev_valid) {
+            float now = gain_spread(fs), before = gain_spread(s_prev_scale);
+            if (now > 0.15f && now > before) {
+                Serial.printf("compass: refine rejected - gains %.2f %.2f %.2f "
+                              "spread %.0f%% vs %.0f%% before. That is a "
+                              "distorted field, not better coverage; keeping "
+                              "the previous calibration\n",
+                              fs[0], fs[1], fs[2], now * 100.0f, before * 100.0f);
+                for (int i = 0; i < 3; i++) {
+                    s_offset[i] = s_prev_offset[i];
+                    s_scale[i]  = s_prev_scale[i];
+                }
+                // Drop the contaminated samples rather than leaving them to
+                // poison the next refine as well.
+                fit_reset();
+                return;
+            }
+        }
+        for (int i = 0; i < 3; i++) { s_offset[i] = fc[i]; s_scale[i] = fs[i]; }
+        s_fitted     = true;
+        s_calibrated = true;
+        s_cal_dirty  = true;
+        Serial.printf("compass: ellipsoid fit from %d points, offsets "
+                      "%+.1f %+.1f %+.1f uT, gains %.2f %.2f %.2f, "
+                      "residual %.1f%%\n",
+                      s_fit_n, s_offset[0], s_offset[1], s_offset[2],
+                      s_scale[0], s_scale[1], s_scale[2], resid * 100.0f);
+        Serial.println("compass: |B| should now hold steady as you turn - if "
+                       "it still swings, the distortion is not axis-aligned");
+        return;
+    }
+
+    // A refine that does not converge must not demote a calibration that was
+    // already good. Falling through to min/max here would replace a working
+    // ellipsoid with a worse model built from one partial sweep.
+    if (s_cal_refine && s_calibrated) {
+        Serial.printf("compass: refine rejected (%s) - keeping the previous "
+                      "calibration\n", why);
+        return;
+    }
+
+    for (int i = 0; i < 3; i++) s_scale[i] = 1.0f;
+    s_fitted = false;
+    // The three sampled radii are printed alongside because they are what the
+    // fit and the min/max path disagree about, and seeing them is the fastest
+    // way to tell a missed axis from real distortion.
+    Serial.printf("compass: ellipsoid fit rejected (%s) from %d points%s",
+                  why, s_fit_n, "");
+    if (resid >= 0.0f) Serial.printf(", residual %.1f%%", resid * 100.0f);
+    Serial.printf("\n  raw ranges x %.1f..%.1f  y %.1f..%.1f  z %.1f..%.1f uT\n",
+                  s_cal_min[0], s_cal_max[0], s_cal_min[1], s_cal_max[1],
+                  s_cal_min[2], s_cal_max[2]);
+    Serial.println("compass: falling back to min/max, which cannot correct "
+                   "stretch");
+
     float rad[3], mean = 0.0f;
     for (int i = 0; i < 3; i++) {
         s_offset[i] = (s_cal_max[i] + s_cal_min[i]) / 2.0f;
@@ -534,6 +908,7 @@ static void calibrate_finish() {
     }
     s_calibrated = true;
 
+    s_cal_dirty = true;
     Serial.printf("compass: calibrated, offsets %+.1f %+.1f %+.1f uT, "
                   "mean radius %.1f uT\n",
                   s_offset[0], s_offset[1], s_offset[2], mean);
@@ -611,6 +986,12 @@ static float tilt_compensated_heading(float mx, float my, float mz,
     float roll  = atan2f(ay, az);
     float pitch = atan2f(-ax, sqrtf(ay * ay + az * az));
 
+    // Kept for the dial. A ball needs the same two angles the heading already
+    // computes, so publishing them here costs nothing and avoids a second,
+    // separately-wrong copy of the same trigonometry in the drawing code.
+    s_roll  = roll  * 180.0f / (float)M_PI;
+    s_pitch = pitch * 180.0f / (float)M_PI;
+
     float xh = mx * cosf(pitch) + mz * sinf(pitch);
     float yh = mx * sinf(roll) * sinf(pitch) + my * cosf(roll)
              - mz * sinf(roll) * cosf(pitch);
@@ -658,6 +1039,7 @@ void compass_update() {
             if (v[i] < s_cal_min[i]) s_cal_min[i] = v[i];
             if (v[i] > s_cal_max[i]) s_cal_max[i] = v[i];
         }
+        fit_accumulate(mx, my, mz);
         if (compass_calibrate_progress() >= 100) calibrate_finish();
         snprintf(s_status, sizeof s_status, "calibrating %d%%",
                  compass_calibrate_progress());
@@ -667,7 +1049,11 @@ void compass_update() {
         return;
     }
 
-    mx -= s_offset[0]; my -= s_offset[1]; mz -= s_offset[2];
+    // Centre, then scale. s_scale is all-ones unless an ellipsoid fit was
+    // accepted, so this is a no-op on the min/max path.
+    mx = (mx - s_offset[0]) * s_scale[0];
+    my = (my - s_offset[1]) * s_scale[1];
+    mz = (mz - s_offset[2]) * s_scale[2];
     s_field = sqrtf(mx * mx + my * my + mz * mz);
 
     // Accelerometer straight out of the data registers rather than through
@@ -684,15 +1070,42 @@ void compass_update() {
     float ay = (float)(int16_t)(raw[3] << 8 | raw[2]);
     float az = (float)(int16_t)(raw[5] << 8 | raw[4]);
 
-    s_heading = tilt_compensated_heading(mx, my, mz, ax, ay, az);
+    // Axis remap, magnetometer -> accelerometer frame.
+    //
+    // The BMM150 sits on the M135 module and the accelerometer is inside the
+    // BMI270 next to it; the two parts are not mounted in the same
+    // orientation, so tilt_compensated_heading was mixing axes that do not
+    // correspond. Measured, in a field confirmed clean with phones and other
+    // magnets well clear: flat, screen up, antenna connector true north reads
+    // 179 where 0 is expected; held at 45 degrees facing south reads 7-9
+    // where 180 is expected. A consistent 180 in two independent postures,
+    // on top of the 90 already known, gives (x, y) <- (-y, x).
+    //
+    // An earlier attempt used (y, -x), from a single reading of 91 taken with
+    // a phone beside the device. The two candidate remaps differ by exactly
+    // 180, and roughly 50 uT of contamination was enough to make the wrong
+    // one look right - hence two postures, and a clean field first.
+    //
+    // Deliberately after the offsets and gains rather than before. The stored
+    // calibration was fitted in the raw magnetometer frame, so remapping
+    // upstream of the correction would apply Y's hard-iron offset to X and
+    // silently invalidate every /compasscal.bin written so far.
+    float rx = -my;
+    float ry =  mx;
+    float rz =  mz;
+
+    s_heading = tilt_compensated_heading(rx, ry, rz, ax, ay, az);
 
     if (!s_calibrated)
         snprintf(s_status, sizeof s_status, "uncalibrated, |B| %.0f uT", s_field);
     else
-        snprintf(s_status, sizeof s_status, "|B| %.0f uT", s_field);
+        snprintf(s_status, sizeof s_status, "|B| %.0f uT%s", s_field,
+                 s_fitted ? "" : " (minmax)");
 }
 
 float compass_heading()  { return s_calibrated ? s_heading : -1.0f; }
+float compass_roll()     { return s_roll; }
+float compass_pitch()    { return s_pitch; }
 float compass_field_ut() { return s_field; }
 const char *compass_status() { return s_status; }
 

@@ -43,6 +43,7 @@
 #define COMPASS_H
 
 #include <stdint.h>
+#include <stddef.h>     // size_t, for the calibration blob accessors below
 
 // Was this build compiled with the Bosch drivers present? Compile-time; says
 // nothing about whether the hardware answered.
@@ -92,8 +93,33 @@ void compass_set_position(double lat, double lon);
 //
 // Tumble the device slowly through as many orientations as possible; the
 // offset is the centre of the sphere the samples trace out.
+// Device attitude in degrees, from the same accelerometer read the heading
+// uses. Roll is rotation about the screen's long axis, pitch about the short
+// one; both are zero with the screen face up. Meaningless when compass_ok()
+// is false.
+float compass_roll();
+float compass_pitch();
+
 void compass_calibrate_start();
+
+// Restart calibration keeping the accumulated fit, so a second sweep improves
+// on the first rather than replacing it. Falls back to a fresh start if
+// nothing has been calibrated yet.
+void compass_calibrate_start_refine();
 void compass_calibrate_cancel();
+
+// Opaque calibration blob for storage: compass.cpp owns the format, the
+// caller owns the file. export returns 0 when there is nothing worth saving.
+// import validates before applying and returns false on a stale or corrupt
+// blob, leaving the current calibration untouched.
+size_t compass_cal_blob_size();
+size_t compass_cal_export(void *dst, size_t cap);
+bool   compass_cal_import(const void *src, size_t len);
+
+// Set when a calibration completes and worth writing to the card; the caller
+// clears it once stored.
+bool   compass_cal_dirty();
+void   compass_cal_clear_dirty();
 bool compass_calibrating();
 
 // 0..100, how far through the calibration run. Progress is by coverage, not

@@ -403,13 +403,21 @@ enum { BTN_CACHE = 0, BTN_THEME, BTN_POI, BTN_PINS, BTN_SLEEP, BTN_COUNT };
 // The compass occupies the left end of the footer strip, where BTN_CACHE used
 // to start. Square and the same height as a button, so it shares the row's
 // vertical rhythm rather than introducing a second one to keep in sync.
-static const int COMPASS_D = BTN_H;
+// Twice the button height. The ball needs room to be read: at 54 px the card
+// could hold one letter and nothing else, which is a needle with extra steps.
+// buttonRect already takes this off the top of the footer row and divides the
+// remainder among the five buttons, so they shrink to suit with no other
+// change - and on a 1280-wide panel there is slack for it.
+static const int COMPASS_D = 110;
 
 static void compassRect(int *x, int *y, int *d) {
     if (!g_panelOk) { *x = *y = *d = 0; return; }
     *d = COMPASS_D;
     *x = BTN_M;
-    *y = M5.Display.height() - BTN_H - BTN_M;
+    // Bottom-aligned with the button row. Anchoring to COMPASS_D rather than
+    // BTN_H is what lets the dial be taller than a button: it grows upward
+    // over the map instead of off the bottom of the panel.
+    *y = M5.Display.height() - COMPASS_D - BTN_M;
 }
 
 static uint32_t g_confirmUntil = 0;      // armed state for the cache button
@@ -575,14 +583,93 @@ static void drawCompass(const GnssFix &fix) {
             return;
         }
 
-        g->drawString("N", cx, cy - r + 7);
+        // Only for the needle fallback: the ball draws its own moving N.
+        if (!useMag) g->drawString("N", cx, cy - r + 7);
 
-        // Screen angle: heading 0 is north, which is up, which is -90 in
-        // atan2 space - the same convention as the marker's direction line.
+        // Ball compass rather than a needle. A gimballed card shows heading,
+        // roll and pitch at once, where a needle shows only heading - and a
+        // needle 90 degrees out looks exactly like a correct one, which is
+        // most of why the frame question took so long to pin down. Here a
+        // wrong axis mapping is visible directly: the card tilts the wrong
+        // way, or the cardinals sit in the wrong order.
+        //
+        // Projection is the front hemisphere of a sphere seen from outside.
+        // A mark at bearing b sits at relative angle t = b - heading; it is
+        // on the near face when cos t > 0, and its horizontal position is
+        // r * sin t. The card is then rolled and pitched as a rigid band.
         if (useMag) {
-            float a = (mag - 90.0f) * 0.017453292f;
-            g->drawLine(cx, cy, cx + (int)((r - 7) * cosf(a)),
-                        cy + (int)((r - 7) * sinf(a)), live);
+            const float DEG = 0.017453292f;
+            float roll  = compass_roll()  * DEG;
+            float pitch = compass_pitch() * DEG;
+            float cr = cosf(roll), sr = sinf(roll);
+
+            // Pitch raises or lowers the band within the ball. Clamped so a
+            // device held vertically parks the card at the rim instead of
+            // sliding out of the circle and vanishing.
+            float band = sinf(pitch) * (float)(r - 6);
+            if (band >  (r - 8)) band =  (float)(r - 8);
+            if (band < -(r - 8)) band = -(float)(r - 8);
+
+            // Rotate a point on the unrolled band into screen space.
+            auto place = [&](float px, float py, int *ox, int *oy) {
+                *ox = cx + (int)(px * cr - py * sr);
+                *oy = cy + (int)(px * sr + py * cr);
+            };
+
+            // Horizon line across the visible width of the band.
+            {
+                float half = sqrtf(fmaxf(0.0f, (float)((r - 4) * (r - 4)) - band * band));
+                int x0, y0, x1, y1;
+                place(-half, band, &x0, &y0);
+                place( half, band, &x1, &y1);
+                g->drawLine(x0, y0, x1, y1, dim);
+            }
+
+            // Graduated card. At r = 52 there is room for 30-degree ticks and
+            // two or three cardinals without them colliding, which is the
+            // whole reason for the larger dial.
+            for (int b = 30; b < 360; b += 30) {
+                if (b % 90 == 0) continue;              // cardinals below
+                float t = ((float)b - mag) * DEG;
+                float ct = cosf(t);
+                if (ct <= 0.30f) continue;
+
+                float px = sinf(t) * (float)(r - 12);
+                int mx, my;
+                place(px, band, &mx, &my);
+                g->fillCircle(mx, my, 2, dim);
+            }
+
+            g->setTextDatum(middle_center);
+            g->setTextSize(2);
+            for (int b = 0; b < 360; b += 90) {
+                float t = ((float)b - mag) * DEG;
+                float ct = cosf(t);
+                if (ct <= 0.20f) continue;
+
+                float px = sinf(t) * (float)(r - 14);
+                int mx, my;
+                place(px, band, &mx, &my);
+
+                g->setTextColor(b == 0 ? live : TFT_WHITE);
+                g->drawString(b == 0   ? "N" : b == 90  ? "E"
+                            : b == 180 ? "S" : "W", mx, my);
+            }
+
+            // The number, because a card read against a lubber line is good
+            // for "roughly north" and bad for "is this 91 or 1". Fixed to the
+            // dial, not the card - it is a readout, not part of the ball.
+            g->setTextSize(1);
+            g->setTextColor(TFT_WHITE);
+            char hd[8];
+            snprintf(hd, sizeof hd, "%d", (int)(mag + 0.5f) % 360);
+            g->drawString(hd, cx, cy + r - 12);
+
+            // Fixed lubber line at the top - the reference the card is read
+            // against, and the only part that does not move with the device.
+            // Two pixels wide: one is invisible at this density.
+            g->drawLine(cx,     cy - r, cx,     cy - r + 7, live);
+            g->drawLine(cx + 1, cy - r, cx + 1, cy - r + 7, live);
         } else if (moving) {
             // Hollow: two ticks short of centre, so a travel-direction needle
             // reads differently at a glance from a facing one.
@@ -591,7 +678,10 @@ static void drawCompass(const GnssFix &fix) {
             g->drawLine(cx + (int)(5 * c), cy + (int)(5 * s),
                         cx + (int)((r - 7) * c), cy + (int)((r - 7) * s), dim);
         }
-        g->fillCircle(cx, cy, 3, dot);
+        // Only under the needle, which radiates from it. On the ball the
+        // centre is where the cardinal glyph lands when you face it squarely,
+        // and a dot there covers the one letter you most want to read.
+        if (!useMag) g->fillCircle(cx, cy, 3, dot);
     };
 
     if (g_compassCvOk) {
@@ -1038,8 +1128,13 @@ static void handleTouch(const GnssFix &fix) {
         int cx, cy, cd; compassRect(&cx, &cy, &cd);
         if (t.x >= cx - BTN_PAD_SIDE && t.x < cx + cd + BTN_PAD_SIDE &&
             t.y >= cy - BTN_PAD_TOP  && t.y < M5.Display.height()) {
-            if (compass_calibrating()) compass_calibrate_cancel();
-            else                       compass_calibrate_start();
+            // Tapping an already-calibrated compass refines it rather than
+            // throwing the accumulated sweep away - repeated tumbles converge
+            // instead of each one starting over. Delete /compasscal.bin to
+            // force a genuinely fresh start.
+            if (compass_calibrating())      compass_calibrate_cancel();
+            else if (compass_ok())          compass_calibrate_start_refine();
+            else                            compass_calibrate_start();
             g_confirmUntil = 0;
             return;
         }
@@ -1562,6 +1657,7 @@ static void aopRestore() {
 // Deliberately tiny and deliberately best-effort: no file, no clock or no fix
 // yet all fall back to what the code did before.
 static const char *LASTFIX_PATH = "/lastfix.bin";
+static const char *CAL_PATH     = "/compasscal.bin";
 struct LastFix {
     uint32_t magic;
     float    lat, lon;
@@ -1595,6 +1691,68 @@ static void lastFixSave(const GnssFix &fix) {
     if (now > 100000) lf.written_utc = (int64_t)now;
     f.write((const uint8_t *)&lf, sizeof lf);
     f.close();
+}
+
+// ---- compass calibration on the card -------------------------------------
+//
+// compass.cpp owns the format and hands over an opaque blob; this side just
+// writes bytes. Same tmp-and-rename dance as aopSave, for the same reason: an
+// interrupted write must not leave a file that is valid enough to load.
+static void calSave() {
+    size_t n = compass_cal_blob_size();
+    if (n == 0) return;
+
+    fs::FS *fs = storage_fs();
+    if (!fs) return;
+
+    uint8_t *buf = (uint8_t *)malloc(n);
+    if (!buf) return;
+    if (compass_cal_export(buf, n) != n) { free(buf); return; }
+
+    const char *tmp = "/compasscal.tmp";
+    File f = fs->open(tmp, FILE_WRITE);
+    if (!f) { free(buf); return; }
+    bool ok = f.write(buf, n) == n;
+    f.close();
+    free(buf);
+
+    if (ok) {
+        fs->remove(CAL_PATH);
+        ok = fs->rename(tmp, CAL_PATH);
+    } else {
+        fs->remove(tmp);
+    }
+    Serial.printf("compass: calibration %s to %s\n",
+                  ok ? "saved" : "NOT saved", CAL_PATH);
+}
+
+static void calLoad() {
+    size_t n = compass_cal_blob_size();
+    if (n == 0) return;
+
+    fs::FS *fs = storage_fs();
+    if (!fs || !fs->exists(CAL_PATH)) return;
+
+    File f = fs->open(CAL_PATH, FILE_READ);
+    if (!f) return;
+    if (f.size() != n) {
+        // A size mismatch means the struct changed between builds. Removing it
+        // is kinder than leaving a file that fails to load on every boot.
+        f.close();
+        fs->remove(CAL_PATH);
+        Serial.println("compass: stored calibration is from another build, removed");
+        return;
+    }
+
+    uint8_t *buf = (uint8_t *)malloc(n);
+    if (!buf) { f.close(); return; }
+    bool got = f.read(buf, n) == (int)n;
+    f.close();
+    if (got && !compass_cal_import(buf, n)) {
+        fs->remove(CAL_PATH);
+        Serial.println("compass: stored calibration failed its checks, removed");
+    }
+    free(buf);
 }
 
 // Pick the palette before anything is painted in it.
@@ -2965,6 +3123,10 @@ void setup() {
     // USB VBUS on 0x44. Optional in every sense: no module, no drivers, or a
     // dead sensor all leave the dial falling back to GNSS course.
     if (compass_begin()) {
+        // Card is already mounted several steps earlier, so a stored
+        // calibration is available before the first heading is ever drawn -
+        // no uncalibrated window on a device that has been calibrated before.
+        calLoad();
         bootStep("compass ready");
     } else if (compass_supported()) {
         bootStep("no compass (see log)");
@@ -3059,6 +3221,11 @@ void loop() {
 
     batteryPoll(false);                // 1 Hz internally
     compass_update();                  // 10 Hz internally, loop()'s task only
+
+    // Written from the loop rather than from inside calibrate_finish: that
+    // runs deep in compass_update and has no business touching the card, and
+    // the flag makes the write happen once, on the next pass, on this task.
+    if (compass_cal_dirty()) { compass_cal_clear_dirty(); calSave(); }
     handleTouch(fix);
 
     // True north correction. The map is drawn in true north and the sensor
