@@ -56,8 +56,7 @@ bool compass_supported() { return COMPASS_HAVE_BOSCH; }
 bool compass_begin() {
     Serial.println("compass: built without Bosch's BMI270/BMM150 drivers - "
                    "run ./tools/fetch_bosch_drivers.sh and rebuild");
-    Serial.println("compass: the dial will fall back to GNSS course, which "
-                   "only exists while moving");
+    Serial.println("compass: no magnetometer, so /maglog.csv will stay empty");
     return false;
 }
 bool  compass_ok()                  { return false; }
@@ -76,6 +75,7 @@ bool  compass_cal_dirty()              { return false; }
 void  compass_cal_clear_dirty()        { }
 void  compass_calibrate_cancel()    { }
 bool  compass_calibrating()         { return false; }
+bool  compass_sample(CompassSample *) { return false; }
 int   compass_calibrate_progress()  { return 0; }
 const char *compass_status()        { return "not built in"; }
 
@@ -123,6 +123,12 @@ static float s_declination = 0.0f;
 static float s_roll  = 0.0f;
 static float s_pitch = 0.0f;
 static char  s_status[64] = "not started";
+
+// The last complete reading, handed to maglog.cpp. Written at the end of
+// compass_update() and nowhere else, so a caller either gets a whole sample
+// from one pass or gets nothing - see the seq field.
+static CompassSample s_sample;
+static bool          s_sample_valid = false;
 
 // Hard-iron offset, in microtesla, subtracted from every reading. Zero until
 // calibrated, which is honest rather than useful: an uncalibrated heading on
@@ -1096,11 +1102,42 @@ void compass_update() {
 
     s_heading = tilt_compensated_heading(rx, ry, rz, ax, ay, az);
 
+    // Captured here rather than at the top: everything above can return early
+    // (a failed mag read, a failed accel read), and a sample that carries this
+    // pass's magnetometer beside the previous pass's accelerometer is worse
+    // than no sample at all.
+    s_sample.ms   = millis();
+    s_sample.seq++;
+    s_sample.raw[0] = (float)md.x;
+    s_sample.raw[1] = (float)md.y;
+    s_sample.raw[2] = (float)md.z;
+    s_sample.corrected[0] = rx;
+    s_sample.corrected[1] = ry;
+    s_sample.corrected[2] = rz;
+    s_sample.acc[0] = ax;
+    s_sample.acc[1] = ay;
+    s_sample.acc[2] = az;
+    s_sample.heading    = s_calibrated ? s_heading : -1.0f;
+    s_sample.field_ut   = s_field;
+    s_sample.roll       = s_roll;
+    s_sample.pitch      = s_pitch;
+    s_sample.calibrated = s_calibrated;
+    s_sample_valid = true;
+
     if (!s_calibrated)
         snprintf(s_status, sizeof s_status, "uncalibrated, |B| %.0f uT", s_field);
     else
         snprintf(s_status, sizeof s_status, "|B| %.0f uT%s", s_field,
                  s_fitted ? "" : " (minmax)");
+}
+
+bool compass_sample(CompassSample *out) {
+    if (!s_ok || !s_sample_valid || !out) return false;
+    // No lock: both this and compass_update() run on loop()'s task, which the
+    // owner check in compass_update() enforces. A mutex here would document a
+    // concurrency that is refused rather than handled.
+    *out = s_sample;
+    return true;
 }
 
 float compass_heading()  { return s_calibrated ? s_heading : -1.0f; }

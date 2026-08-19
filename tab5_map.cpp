@@ -46,6 +46,9 @@
 #include "style.h"
 #include "waypoints.h"
 #include "compass.h"
+#include "maglog.h"
+#include "wifiloc.h"
+#include "gpstrust.h"
 
 constexpr int      PIN_GNSS_TX = 7;    // module transmits here -> ESP32 RX
 constexpr int      PIN_GNSS_RX = 6;    // module listens here   -> ESP32 TX
@@ -214,6 +217,18 @@ static void flushIfIdle() {
     static uint32_t lastActivity = 0;
     static uint32_t lastPending = 0;
 
+    // The other two writers do not share the tile cache's gate, and putting
+    // them behind it was a bug: on a device with the planet archive on the
+    // card nothing is ever fetched, so tilecache_pending() is permanently
+    // zero, this function returns on the line below, and neither the
+    // magnetometer log nor the access point database was ever written from
+    // here. The log survived on its own 30 s timer; the database has no
+    // timer, so an entire session of learning was lost at every power-off -
+    // which is exactly what "wifiloc: no database yet" said on the boot
+    // after a drive that had learned 55 access points.
+    wifiloc_flush_if_due();
+    maglog_flush_if_due();
+
     uint32_t pending = tilecache_pending();
     if (pending != lastPending) { lastPending = pending; lastActivity = millis(); }
     if (!pending) return;
@@ -223,6 +238,8 @@ static void flushIfIdle() {
     if (millis() - lastActivity < 2000) return;  // let a burst finish
 
     tilecache_flush();
+    maglog_flush();
+    wifiloc_flush();
     lastPending = 0;
 }
 
@@ -233,6 +250,76 @@ static void flushIfIdle() {
 // invisible whole-screen tap target would do exactly that every time the
 // device was picked up.
 static const int PREFETCH_RADIUS = 7;
+
+// ---- GNSS measurement rate -------------------------------------------------
+// The receiver is the second largest continuous draw on this device after the
+// panel, and it costs the same whether the device is doing 100 km/h or sitting
+// on a desk. Slowing the solution rate when there is nothing to follow is the
+// cheapest saving available, and unlike any of the module's low-power modes it
+// gives up nothing: the receiver stays tracking, keeps its ephemeris and its
+// AOP predictions, and the next fix is a fix rather than a reacquisition.
+//
+// Three rates, chosen against what the map does with a fix rather than against
+// the receiver's capabilities:
+//
+//   FAST  vehicle speeds. The 'rule of thirds' sliding view shifts the grid
+//         several times a minute at these speeds, and each shift wants a
+//         current position to decide where to put it.
+//   WALK  walking pace. The marker moves about two metres between fixes at
+//         2 s, which is inside the receiver's own error.
+//   IDLE  stationary. Nothing on screen changes between fixes; the only
+//         reason to keep asking at all is so that starting to move is
+//         noticed within a few seconds.
+//
+// src: all three are judgements, unattributed - see PROVENANCE.md.
+static const uint16_t GNSS_RATE_FAST = 1000;
+static const uint16_t GNSS_RATE_WALK = 2000;
+static const uint16_t GNSS_RATE_IDLE = 5000;
+
+// Thresholds in km/h, with a gap between them: a single threshold makes
+// anything hovering near it flip on every fix, and each flip is a UBX message
+// the receiver has to process. Same reasoning as the zoom hysteresis above.
+static const double GNSS_MOVING_KMH = 12.0;   // above: FAST
+static const double GNSS_SLOW_KMH   = 4.0;    // above: WALK, below: IDLE
+
+// How long a speed band has to hold before the rate follows it, and the floor
+// between two changes. Both are deliberately long: pulling away from a stop
+// light should not have to survive a rate change mid-manoeuvre, and the cost
+// of being one band too fast for ten seconds is nil.
+static const uint32_t GNSS_RATE_SETTLE_MS = 10000;
+
+static void gnssRatePolicy(const GnssFix &fix) {
+    // No fix, no policy. A receiver that is still searching must be left at
+    // its fastest rate: the acquisition itself is what the power is being
+    // spent on, and slowing it down makes the search longer, not cheaper.
+    // Same for a 2D-only fix, where the speed field is not to be trusted.
+    uint16_t want;
+    if (!gnss_coarse(fix) || fix.mode != 3)     want = GNSS_RATE_FAST;
+    else if (fix.speedKmh >= GNSS_MOVING_KMH)   want = GNSS_RATE_FAST;
+    else if (fix.speedKmh >= GNSS_SLOW_KMH)     want = GNSS_RATE_WALK;
+    else                                        want = GNSS_RATE_IDLE;
+
+    // Prefetching walks the grid across a wide area and the world floor
+    // download runs for minutes; neither wants the position it is anchored to
+    // going stale underneath it.
+    if (map_prefetch_busy()) want = GNSS_RATE_FAST;
+
+    static uint16_t pending = 0;
+    static uint32_t pendingSince = 0;
+    static uint32_t lastChange = 0;
+
+    if (want == gnss_rate_ms()) { pending = 0; return; }
+
+    if (want != pending) { pending = want; pendingSince = millis(); return; }
+    if (millis() - pendingSince < GNSS_RATE_SETTLE_MS) return;
+    if (lastChange && millis() - lastChange < GNSS_RATE_SETTLE_MS) return;
+
+    lastChange = millis();
+    pending = 0;
+    gnss_set_rate_ms(want);
+    Serial.printf("gnss: rate -> %u ms (%.1f km/h, mode %d)\n",
+                  (unsigned)want, fix.speedKmh, fix.mode);
+}
 
 // ---- day / night -----------------------------------------------------------
 // There is no ambient light sensor on this board, so the palette is driven by
@@ -250,6 +337,13 @@ static ThemeMode g_themeMode = THEME_AUTO;
 // Declared here because applyTheme has to know: a brightness change must not
 // wake a screen that was deliberately turned off.
 static bool g_screenOff = false;
+
+// True while the map is being drawn from a Wi-Fi centroid estimate rather than
+// from the receiver. The status bar reads this rather than inspecting the fix
+// it is handed, because that fix has been deliberately dressed up to look
+// usable to the map engine and would otherwise print as a real 2D position.
+static bool  g_estimated = false;
+static float g_estimatedAcc = 0.0f;
 
 static SunSet g_sun;
 static bool   g_sunValid = false;
@@ -384,10 +478,8 @@ static const int UI_STATUS_H = 52;          // must match STATUS_H in mapengine
 
 static M5Canvas g_statusCv(&M5.Display);
 static M5Canvas g_btnCv(&M5.Display);
-static M5Canvas g_compassCv(&M5.Display);
 static bool     g_statusCvOk  = false;
 static bool     g_btnCvOk     = false;
-static bool     g_compassCvOk = false;
 
 // The touch target is taller than the drawn button. A 54 px outline is a
 // small thing to hit on a moving vehicle, and there is nothing else along
@@ -395,45 +487,41 @@ static bool     g_compassCvOk = false;
 // the map and downward to the screen edge.
 static const int BTN_PAD_TOP = 26, BTN_PAD_SIDE = 6;
 
-// Five across the bottom now. At 1280 px that is 244 px each, still a wide
-// target on a moving vehicle - and the touch zone extends past the drawn
-// outline in every direction (BTN_PAD_*), so the usable area is larger again.
-enum { BTN_CACHE = 0, BTN_THEME, BTN_POI, BTN_PINS, BTN_SLEEP, BTN_COUNT };
+// Six across the bottom. At 1280 px that is 199 px each - narrower than the
+// five-button row was, but the row got the compass dial's 110 px back when the
+// dial went, so the net change is small. The touch zone still extends past the
+// drawn outline in every direction (BTN_PAD_*), so the usable area is larger
+// again than the number suggests.
+//
+// The ball compass that used to sit at the left end is gone. It was answering
+// a question - "which way am I facing" - that the map, drawn north-up with a
+// marker on it, mostly already answers, and answering it took a 110 px circle,
+// a PSRAM sprite, a per-frame repaint and a projection. The magnetometer is
+// still read, and now goes to the card instead of the screen: see maglog.cpp.
+// BTN_MAG toggles that, BTN_CAL is what calibration moved to.
+enum { BTN_CACHE = 0, BTN_THEME, BTN_POI, BTN_PINS,
+       BTN_MAG, BTN_CAL, BTN_WIFI, BTN_HOME, BTN_SLEEP, BTN_COUNT };
 
-// The compass occupies the left end of the footer strip, where BTN_CACHE used
-// to start. Square and the same height as a button, so it shares the row's
-// vertical rhythm rather than introducing a second one to keep in sync.
-// Twice the button height. The ball needs room to be read: at 54 px the card
-// could hold one letter and nothing else, which is a needle with extra steps.
-// buttonRect already takes this off the top of the footer row and divides the
-// remainder among the five buttons, so they shrink to suit with no other
-// change - and on a 1280-wide panel there is slack for it.
-static const int COMPASS_D = 110;
-
-static void compassRect(int *x, int *y, int *d) {
-    if (!g_panelOk) { *x = *y = *d = 0; return; }
-    *d = COMPASS_D;
-    *x = BTN_M;
-    // Bottom-aligned with the button row. Anchoring to COMPASS_D rather than
-    // BTN_H is what lets the dial be taller than a button: it grows upward
-    // over the map instead of off the bottom of the panel.
-    *y = M5.Display.height() - COMPASS_D - BTN_M;
-}
+// Nine buttons at 1280 px is 116 px each, and at text size 2 the built-in
+// font is 12 px per character - so a label has room for about nine
+// characters before it runs into its own border. Every label below is
+// written to that budget, which is why several of them read as abbreviations
+// rather than as sentences. Nothing enforces it; a longer one is clipped by
+// the sprite rather than overflowing into the neighbouring button, so the
+// failure mode is a truncated word and not a corrupted row.
 
 static uint32_t g_confirmUntil = 0;      // armed state for the cache button
 static uint32_t g_lastTouchMs = 0;
 
 static void buttonRect(int i, int *x, int *y, int *w, int *h) {
     if (!g_panelOk) { *x = *y = *w = *h = 0; return; }
-    // The compass and its own right margin come off the top of the row, then
-    // the five buttons divide what is left. Taking it out here rather than
-    // shrinking each button by a fifth keeps buttonAt() and the canvas sizing
-    // honest without either needing to know the compass exists.
-    int lead  = COMPASS_D + BTN_M;
-    int total = M5.Display.width() - lead - BTN_M * (BTN_COUNT + 1);
+    // The whole width is the button row's now - the compass dial used to take
+    // COMPASS_D + BTN_M off the left end here, and removing that is the only
+    // change this function needed.
+    int total = M5.Display.width() - BTN_M * (BTN_COUNT + 1);
     *w = total / BTN_COUNT;
     *h = BTN_H;
-    *x = BTN_M + lead + i * (*w + BTN_M);
+    *x = BTN_M + i * (*w + BTN_M);
     *y = M5.Display.height() - BTN_H - BTN_M;
 }
 
@@ -479,16 +567,9 @@ static void uiCanvasesBegin() {
         g_btnCv.setColorDepth(16);
         g_btnCvOk = g_btnCv.createSprite(w, h);
     }
-    if (!g_compassCvOk) {
-        int x, y, d; compassRect(&x, &y, &d);
-        g_compassCv.setPsram(true);
-        g_compassCv.setColorDepth(16);
-        g_compassCvOk = g_compassCv.createSprite(d, d);
-    }
-    Serial.printf("ui: status canvas %s, button canvas %s, compass canvas %s\n",
+    Serial.printf("ui: status canvas %s, button canvas %s\n",
                   g_statusCvOk ? "ok" : "FAILED (will draw direct)",
-                  g_btnCvOk ? "ok" : "FAILED (will draw direct)",
-                  g_compassCvOk ? "ok" : "FAILED (will draw direct)");
+                  g_btnCvOk ? "ok" : "FAILED (will draw direct)");
 }
 
 static void drawButton(int i, const char *label, uint16_t bg) {
@@ -528,183 +609,9 @@ static void drawButton(int i, const char *label, uint16_t bg) {
     M5.Display.setTextDatum(top_left);
 }
 
-// The map does not rotate - north is up, the same as every tile in the
-// archive - so the ring and its N are fixed, and the needle is what moves.
-//
-// TWO SOURCES, DELIBERATELY DIFFERENT THINGS
-// The magnetometer measures where the device is *pointing* and works standing
-// still. GNSS course measures where it is *going* and only exists above
-// walking pace, because it is derived from successive fixes rather than
-// measured - a parked receiver leaves the course field empty, which parses to
-// zero, so an ungated needle would sit convincingly at north.
-//
-// They agree in a car and diverge on foot, which is a feature: the compass
-// answers "which way am I facing relative to these streets", and that is the
-// question you have while stationary and holding the thing.
-//
-// The magnetometer wins where available, since it is the better answer to
-// that question and it is available more of the time. Course is the fallback,
-// drawn hollow so the two are never confused for one another - a heading you
-// can turn on the spot and watch track is a different claim from one that
-// only updates while you travel.
-static void drawCompass(const GnssFix &fix) {
-    if (!g_panelOk) return;
-    if (g_screenOff) return;
-
-    int x, y, d; compassRect(&x, &y, &d);
-    int r = d / 2 - 3;
-
-    float mag    = compass_heading();          // negative when unavailable
-    bool  useMag = mag >= 0.0f;
-    bool  moving = gnss_coarse(fix) && fix.speedKmh > 3.0;
-    float course = (float)fix.course;
-    bool  calibrating = compass_calibrating();
-
-    uint16_t live = M5.Display.color565(30, 90, 220);
-    uint16_t dim  = M5.Display.color565(150, 150, 160);
-    uint16_t dot  = (useMag || gnss_coarse(fix)) ? live : dim;
-
-    auto paint = [&](lgfx::LovyanGFX *g, int cx, int cy) {
-        g->fillCircle(cx, cy, r, style_background());
-        g->drawCircle(cx, cy, r, TFT_WHITE);
-        g->setTextDatum(middle_center);
-        g->setTextColor(TFT_WHITE);
-        g->setTextSize(1);
-
-        if (calibrating) {
-            // No needle mid-calibration: the offsets are half-measured and
-            // anything drawn from them would be worse than nothing. The
-            // percentage is by coverage, so it advances when the device is
-            // turned rather than when time passes - which is also the
-            // instruction, without room for a sentence saying so.
-            char pc[8];
-            snprintf(pc, sizeof pc, "%d%%", compass_calibrate_progress());
-            g->drawString(pc, cx, cy);
-            return;
-        }
-
-        // Only for the needle fallback: the ball draws its own moving N.
-        if (!useMag) g->drawString("N", cx, cy - r + 7);
-
-        // Ball compass rather than a needle. A gimballed card shows heading,
-        // roll and pitch at once, where a needle shows only heading - and a
-        // needle 90 degrees out looks exactly like a correct one, which is
-        // most of why the frame question took so long to pin down. Here a
-        // wrong axis mapping is visible directly: the card tilts the wrong
-        // way, or the cardinals sit in the wrong order.
-        //
-        // Projection is the front hemisphere of a sphere seen from outside.
-        // A mark at bearing b sits at relative angle t = b - heading; it is
-        // on the near face when cos t > 0, and its horizontal position is
-        // r * sin t. The card is then rolled and pitched as a rigid band.
-        if (useMag) {
-            const float DEG = 0.017453292f;
-            float roll  = compass_roll()  * DEG;
-            float pitch = compass_pitch() * DEG;
-            float cr = cosf(roll), sr = sinf(roll);
-
-            // Pitch raises or lowers the band within the ball. Clamped so a
-            // device held vertically parks the card at the rim instead of
-            // sliding out of the circle and vanishing.
-            float band = sinf(pitch) * (float)(r - 6);
-            if (band >  (r - 8)) band =  (float)(r - 8);
-            if (band < -(r - 8)) band = -(float)(r - 8);
-
-            // Rotate a point on the unrolled band into screen space.
-            auto place = [&](float px, float py, int *ox, int *oy) {
-                *ox = cx + (int)(px * cr - py * sr);
-                *oy = cy + (int)(px * sr + py * cr);
-            };
-
-            // Horizon line across the visible width of the band.
-            {
-                float half = sqrtf(fmaxf(0.0f, (float)((r - 4) * (r - 4)) - band * band));
-                int x0, y0, x1, y1;
-                place(-half, band, &x0, &y0);
-                place( half, band, &x1, &y1);
-                g->drawLine(x0, y0, x1, y1, dim);
-            }
-
-            // Graduated card. At r = 52 there is room for 30-degree ticks and
-            // two or three cardinals without them colliding, which is the
-            // whole reason for the larger dial.
-            for (int b = 30; b < 360; b += 30) {
-                if (b % 90 == 0) continue;              // cardinals below
-                float t = ((float)b - mag) * DEG;
-                float ct = cosf(t);
-                if (ct <= 0.30f) continue;
-
-                float px = sinf(t) * (float)(r - 12);
-                int mx, my;
-                place(px, band, &mx, &my);
-                g->fillCircle(mx, my, 2, dim);
-            }
-
-            g->setTextDatum(middle_center);
-            g->setTextSize(2);
-            for (int b = 0; b < 360; b += 90) {
-                float t = ((float)b - mag) * DEG;
-                float ct = cosf(t);
-                if (ct <= 0.20f) continue;
-
-                float px = sinf(t) * (float)(r - 14);
-                int mx, my;
-                place(px, band, &mx, &my);
-
-                g->setTextColor(b == 0 ? live : TFT_WHITE);
-                g->drawString(b == 0   ? "N" : b == 90  ? "E"
-                            : b == 180 ? "S" : "W", mx, my);
-            }
-
-            // The number, because a card read against a lubber line is good
-            // for "roughly north" and bad for "is this 91 or 1". Fixed to the
-            // dial, not the card - it is a readout, not part of the ball.
-            g->setTextSize(1);
-            g->setTextColor(TFT_WHITE);
-            char hd[8];
-            snprintf(hd, sizeof hd, "%d", (int)(mag + 0.5f) % 360);
-            g->drawString(hd, cx, cy + r - 12);
-
-            // Fixed lubber line at the top - the reference the card is read
-            // against, and the only part that does not move with the device.
-            // Two pixels wide: one is invisible at this density.
-            g->drawLine(cx,     cy - r, cx,     cy - r + 7, live);
-            g->drawLine(cx + 1, cy - r, cx + 1, cy - r + 7, live);
-        } else if (moving) {
-            // Hollow: two ticks short of centre, so a travel-direction needle
-            // reads differently at a glance from a facing one.
-            float a = (course - 90.0f) * 0.017453292f;
-            float c = cosf(a), s = sinf(a);
-            g->drawLine(cx + (int)(5 * c), cy + (int)(5 * s),
-                        cx + (int)((r - 7) * c), cy + (int)((r - 7) * s), dim);
-        }
-        // Only under the needle, which radiates from it. On the ball the
-        // centre is where the cardinal glyph lands when you face it squarely,
-        // and a dot there covers the one letter you most want to read.
-        if (!useMag) g->fillCircle(cx, cy, 3, dot);
-    };
-
-    if (g_compassCvOk) {
-        // Colour-keyed for the same reason drawButton is: the sprite is
-        // square and the compass is round, so the corners belong to whatever
-        // painted the footer, not to us. The key only has to be absent from
-        // this sprite - which is white, grey, blue and the map background.
-        const uint16_t KEY = 0xF81F;            // magenta, unused here
-        g_compassCv.fillSprite(KEY);
-        paint(&g_compassCv, d / 2, d / 2);
-        g_compassCv.pushSprite(x, y, KEY);
-        return;
-    }
-
-    paint(&M5.Display, x + d / 2, y + d / 2);
-    M5.Display.setTextDatum(top_left);
-}
-
 static void drawFooter(const GnssFix &fix) {
     if (!g_panelOk) return;   // no display attached
     if (g_screenOff) return;
-
-    drawCompass(fix);
 
     bool armed = (millis() < g_confirmUntil);
     bool busy  = map_prefetch_busy();
@@ -724,11 +631,11 @@ static void drawFooter(const GnssFix &fix) {
     bool held = !busy && held_memo;
 
     char label[40];
-    if (busy)       snprintf(label, sizeof label, "caching %d%%", map_prefetch_progress());
+    if (busy)       snprintf(label, sizeof label, "cache %d%%", map_prefetch_progress());
     else if (held)  snprintf(label, sizeof label, "offline");
-    else if (armed) snprintf(label, sizeof label, "tap to confirm");
-    else if (!net)  snprintf(label, sizeof label, "set up wifi");
-    else            snprintf(label, sizeof label, "cache %d km",
+    else if (armed) snprintf(label, sizeof label, "confirm?");
+    else if (!net)  snprintf(label, sizeof label, "wifi set");
+    else            snprintf(label, sizeof label, "cache%dk",
                              (int)(((2 * PREFETCH_RADIUS + 1) * 40075.0
                                     * 0.74 / (1 << DATA_ZOOM_OF(Z_FLOOR)))));
     drawButton(BTN_CACHE, label,
@@ -743,7 +650,7 @@ static void drawFooter(const GnssFix &fix) {
     // screen looks the way it does.
     const char *tl = g_themeMode == THEME_DAY   ? "day"
                    : g_themeMode == THEME_NIGHT ? "night"
-                   : (map_is_dark() ? "auto - night" : "auto - day");
+                   : (map_is_dark() ? "auto:nite" : "auto:day");
     drawButton(BTN_THEME, tl,
                g_themeMode == THEME_AUTO ? M5.Display.color565(60, 90, 60)
                                          : M5.Display.color565(70, 70, 90));
@@ -751,7 +658,7 @@ static void drawFooter(const GnssFix &fix) {
     // Labels are an overlay, so this is genuinely instant - there is no
     // "re-rendering" state to show, unlike the theme button.
     bool lab = map_labels_on();
-    drawButton(BTN_POI, lab ? "labels on" : "labels off",
+    drawButton(BTN_POI, lab ? "labels" : "no labels",
                lab ? M5.Display.color565(60, 80, 110)
                    : M5.Display.color565(70, 70, 70));
 
@@ -774,9 +681,78 @@ static void drawFooter(const GnssFix &fix) {
                           : M5.Display.color565(70, 70, 70));
     }
 
+    // The magnetometer button is a logging control, not a heading readout.
+    // It shows the row count rather than a state word, because "on" says the
+    // switch is set and the count says data is actually landing on the card -
+    // which is the thing that goes wrong silently.
+    {
+        char ml[40];
+        if (!compass_ok())            snprintf(ml, sizeof ml, "no mag");
+        else if (!maglog_available()) snprintf(ml, sizeof ml, "mag: -");
+        else if (!maglog_enabled())   snprintf(ml, sizeof ml, "mag off");
+        else snprintf(ml, sizeof ml, "mag %lu", (unsigned long)maglog_rows());
+        drawButton(BTN_MAG, ml,
+                   (compass_ok() && maglog_enabled())
+                       ? M5.Display.color565(60, 80, 110)
+                       : M5.Display.color565(70, 70, 70));
+    }
+
+    // Calibration used to live on the dial. It still has to be a deliberate
+    // act rather than something automatic - it needs the device turned through
+    // every orientation, which nothing can ask for on its own behalf, and a
+    // half-finished sweep biases every reading afterwards - so it keeps its
+    // own control now that there is no dial to tap.
+    {
+        char cl[40];
+        if (!compass_ok())               snprintf(cl, sizeof cl, "no mag");
+        else if (compass_calibrating())  snprintf(cl, sizeof cl, "cal %d%%",
+                                                  compass_calibrate_progress());
+        else snprintf(cl, sizeof cl, "%s", compass_status());
+        drawButton(BTN_CAL, cl,
+                   compass_calibrating() ? TFT_ORANGE
+                                         : M5.Display.color565(70, 70, 70));
+    }
+
+    // The access point count, which is the only honest progress indicator this
+    // feature has: the database is useless below a few hundred records and
+    // there is nothing else on the device that says how far along it is. It
+    // counts total records rather than usable ones - a record needs three
+    // observations before an estimate will touch it - because the total is
+    // what grows visibly on a drive and the distinction belongs in the log
+    // line, not on a 116 px button.
+    //
+    // Lit amber while an estimate is actually driving the map, which is the
+    // one moment the number stops being trivia.
+    {
+        char wl[40];
+        if (!wifiloc_available())    snprintf(wl, sizeof wl, "wifi: -");
+        else if (!wifiloc_enabled()) snprintf(wl, sizeof wl, "wifi off");
+        else if (g_estimated)        snprintf(wl, sizeof wl, "~%d AP", wifiloc_used());
+        else snprintf(wl, sizeof wl, "wifi %lu", (unsigned long)wifiloc_entries());
+        drawButton(BTN_WIFI, wl,
+                   g_estimated ? M5.Display.color565(150, 100, 20)
+                   : wifiloc_enabled() ? M5.Display.color565(60, 80, 110)
+                                       : M5.Display.color565(70, 70, 70));
+    }
+
+    // Lit only while the view is somewhere the device is not. A panned view
+    // that nobody remembers panning is the failure this button exists for, so
+    // it is coloured to be noticed from across a dashboard rather than to
+    // blend into the row.
+    {
+        bool panned = map_panning();
+        drawButton(BTN_HOME, panned ? "recentre" : "centred",
+                   panned ? M5.Display.color565(150, 60, 30)
+                          : M5.Display.color565(70, 70, 70));
+    }
+
     drawButton(BTN_SLEEP, "screen off", M5.Display.color565(70, 70, 70));
 }
 
+// Panning is dropped when the screen goes off. Waking to a map of somewhere
+// the device is not - with no memory of having panned there, possibly hours
+// later - is the one way this feature can actively mislead, and the cost of
+// preventing it is one recentre nobody asked for.
 static void screenOff() {
     if (!g_panelOk) return;   // no display attached
     // Draw the wake target before the backlight goes down, so it is clear
@@ -791,6 +767,7 @@ static void screenOff() {
     M5.Display.setTextDatum(top_left);
     delay(700);
 
+    map_pan_reset();
     g_screenOff = true;
     map_set_visible(false);
     M5.Display.setBrightness(0);
@@ -1115,26 +1092,41 @@ static void handleTouch(const GnssFix &fix) {
     // otherwise a row landing on a footer button would trigger both.
     if (pinPanelTouch(t.x, t.y, fix)) return;
 
-    // The compass dial is its own control: tap to calibrate, tap again to
-    // stop. Tested before buttonAt() because the two regions do not overlap
-    // but the button hit zones are padded outward (BTN_PAD_SIDE) and would
-    // otherwise reach across.
+    // Pan by thirds: a tap on the map steps the view one third of a screen
+    // towards wherever it landed.
     //
-    // Calibration has to be a deliberate act rather than something automatic:
-    // it needs the device turned through every orientation, which nothing can
-    // ask for on its own behalf, and a half-finished sweep produces an offset
-    // that biases every heading afterwards.
-    if (compass_ok()) {
-        int cx, cy, cd; compassRect(&cx, &cy, &cd);
-        if (t.x >= cx - BTN_PAD_SIDE && t.x < cx + cd + BTN_PAD_SIDE &&
-            t.y >= cy - BTN_PAD_TOP  && t.y < M5.Display.height()) {
-            // Tapping an already-calibrated compass refines it rather than
-            // throwing the accumulated sweep away - repeated tumbles converge
-            // instead of each one starting over. Delete /compasscal.bin to
-            // force a genuinely fresh start.
-            if (compass_calibrating())      compass_calibrate_cancel();
-            else if (compass_ok())          compass_calibrate_start_refine();
-            else                            compass_calibrate_start();
+    // Discrete taps rather than a drag. A drag would have to be tracked across
+    // frames, throttled so the renderer is not handed tiles faster than it can
+    // serve them, and given something to draw in the meantime - and on a
+    // moving vehicle a nine-square tap target is easier to hit than a gesture
+    // is to perform. The screen is divided the same way the follow band is,
+    // so the middle square is a deliberate no-op: it is the region the marker
+    // normally occupies, and it is also the wake zone, so nothing about a tap
+    // there should move the map out from under it.
+    //
+    // Tested before buttonAt() would matter but after the pin panel, and
+    // bounded above the footer's padded hit zone so an overshot button press
+    // pans nothing.
+    {
+        int W = M5.Display.width();
+        int mapTop = UI_STATUS_H;
+        int mapBot = M5.Display.height() - BTN_H - BTN_M - BTN_PAD_TOP;
+        if (t.y >= mapTop && t.y < mapBot) {
+            int col = (t.x * 3) / W;
+            int row = ((t.y - mapTop) * 3) / (mapBot - mapTop);
+            // Clamps against a touch controller reporting a coordinate at
+            // or past the panel edge, which would index a fourth column or
+            // row that does not exist.
+            if (col < 0) col = 0;
+            if (col > 2) col = 2;
+            if (row < 0) row = 0;
+            if (row > 2) row = 2;
+            int dx = col - 1, dy = row - 1;
+            if (dx || dy) {
+                if (!map_pan_step(dx, dy))
+                    Serial.println("pan: nothing to pan - no fix has centred "
+                                   "the grid yet");
+            }
             g_confirmUntil = 0;
             return;
         }
@@ -1155,6 +1147,51 @@ static void handleTouch(const GnssFix &fix) {
 
     case BTN_POI:
         map_set_labels(!map_labels_on());
+        break;
+
+    case BTN_WIFI:
+        if (!wifiloc_available()) {
+            Serial.println("wifiloc: unavailable - no PSRAM table was "
+                           "allocated, see the boot log");
+            break;
+        }
+        // Toggling off keeps the database and stops both learning and
+        // locating. Worth having as a control rather than a rebuild: a scan
+        // interrupts the association, so somebody downloading tiles over a
+        // marginal link has a reason to stop this for a while.
+        wifiloc_set_enabled(!wifiloc_enabled());
+        break;
+
+    case BTN_HOME:
+        // Harmless when already following, and deliberately still live: it is
+        // the control you reach for when you are not sure whether the map is
+        // showing you or somewhere you left it.
+        map_pan_reset();
+        break;
+
+    case BTN_MAG:
+        if (!maglog_available()) {
+            Serial.println("maglog: nothing to log to - no filesystem mounted");
+            break;
+        }
+        maglog_set_enabled(!maglog_enabled());
+        break;
+
+    case BTN_CAL:
+        if (!compass_ok()) break;
+        // Tapping an already-calibrated compass refines it rather than
+        // throwing the accumulated sweep away - repeated tumbles converge
+        // instead of each one starting over. Delete /compasscal.bin to force
+        // a genuinely fresh start.
+        //
+        // The log is stopped for the duration either way: compass_update()
+        // publishes no sample while calibrating, so maglog_poll() would find
+        // nothing new and write nothing, but flushing here means the rows
+        // taken before the sweep are on the card before the device starts
+        // being waved about.
+        maglog_flush();
+        if (compass_calibrating()) compass_calibrate_cancel();
+        else                       compass_calibrate_start_refine();
         break;
 
     case BTN_THEME:
@@ -1209,6 +1246,8 @@ static void handlePowerButton() {
     if (M5.BtnPWR.wasPressed() || M5.BtnPWR.wasClicked()) {
         Serial.println("power: button activity, flushing cache");
         tilecache_flush();
+        maglog_flush();
+        wifiloc_flush();
     }
 }
 
@@ -2534,12 +2573,34 @@ static void drawStatus(const GnssFix &fix) {
 
     bool have = (fix.status == 'A');
     char statusLine1[STATUS_LINE_MAX];
-    if (have) {
+    if (g_estimated) {
+        // Named for what it is. A coordinate with no qualifier reads as a fix,
+        // and this one can be a hundred metres out and will not improve by
+        // waiting - the user needs to know to distrust the marker rather than
+        // to assume the receiver is still settling.
         snprintf(statusLine1, sizeof statusLine1,
-                 "%.5f %.5f  z%u  %.0f km/h  %s HDOP %.1f",
+                 "%.5f %.5f  z%u  WIFI ESTIMATE ~%.0f m from %d APs  no GNSS",
+                 fix.lat, fix.lon, map_zoom(),
+                 g_estimatedAcc, wifiloc_used());
+    } else if (have) {
+        // The trust note is appended rather than replacing anything: the
+        // position is still the thing being read, and the checks are a
+        // qualifier on it, not a substitute for it.
+        const char *tn = gpstrust_text();
+        snprintf(statusLine1, sizeof statusLine1,
+                 "%.5f %.5f  z%u  %.0f km/h  %s HDOP %.1f%s%s",
                  fix.lat, fix.lon, map_zoom(), fix.speedKmh,
                  fix.mode == 3 ? "3D" : fix.mode == 2 ? "2D" : "--",
-                 fix.hdop);
+                 fix.hdop,
+                 tn[0] ? "   CHECK: " : "", tn);
+    } else if (!map_marker_valid()) {
+        // The map is drawn from the last known position and there is nothing
+        // on it. Without this the bar reads "acquiring" over a perfectly
+        // detailed map of somewhere, which invites the map itself to be read
+        // as the answer.
+        snprintf(statusLine1, sizeof statusLine1,
+                 "last known area - no position yet   sats %d  %lu sent",
+                 fix.sats, (unsigned long)gnss_sentences());
     } else {
         snprintf(statusLine1, sizeof statusLine1,
                  "acquiring - open sky, 30-90s cold start   sats %d  %lu sent",
@@ -2599,9 +2660,21 @@ static void drawStatus(const GnssFix &fix) {
     strncpy(last, combined, sizeof last - 1);
     lastDraw = millis();
 
-    const uint16_t barBg = have
-        ? (map_is_dark() ? M5.Display.color565(10, 40, 20) : TFT_DARKGREEN)
-        : 0x6000;
+    // Amber for an estimate: neither the green of a fix nor the red of
+    // nothing, because it is neither. The bar colour is the part of this read
+    // at a glance, so it has to differ - a green bar over a hundred-metre
+    // guess is the one outcome worth avoiding here.
+    // Trust outranks the fix colour. A green bar over a position that failed
+    // two independent consistency checks is the single most misleading thing
+    // this display could do, so the verdict takes the background and the fix
+    // state takes what is left.
+    TrustLevel tl = gpstrust_level();
+    const uint16_t barBg =
+          (have && tl == TRUST_BAD) ? M5.Display.color565(120, 20, 20)
+        : (have && tl == TRUST_ODD) ? M5.Display.color565(90, 60, 0)
+        : g_estimated               ? M5.Display.color565(90, 60, 0)
+        : have ? (map_is_dark() ? M5.Display.color565(10, 40, 20) : TFT_DARKGREEN)
+               : 0x6000;
 
     // Compose the whole bar, then push it in one write. Drawing the fill and
     // the text straight to the panel makes the bare fill briefly visible,
@@ -3087,6 +3160,10 @@ void setup() {
     // Both are best-effort: a receiver that does not answer leaves this
     // exactly where it started, a normal cold start.
     delay(200);                       // let the module finish talking after reset
+    // The history the consistency checks compare against is meaningless
+    // across a receiver restart: the first fix after one can legitimately be
+    // anywhere the device has moved since.
+    gpstrust_reset();
     gnss_enable_aop();
     aopRestore();
 
@@ -3132,6 +3209,17 @@ void setup() {
         bootStep("no compass (see log)");
     }
 
+    // The magnetometer log, off the same card. After compass_begin() so the
+    // button label can say "no mag" rather than "no card" when the sensor is
+    // the thing that is missing, and after the card is mounted so a first row
+    // has somewhere to go.
+    maglog_begin();
+
+    // The Wi-Fi centroid database. After the radio attempt above, so a failed
+    // C6 link is already logged and this does not look like the thing that
+    // failed, and after the card so the database has somewhere to persist.
+    wifiloc_begin();
+
     // The saved-point list, off the same card. Read here rather than lazily:
     // the first map_draw asks for it, and that runs on the UI task while the
     // render worker already has the archive open.
@@ -3145,6 +3233,18 @@ void setup() {
     // Decide day or night before bootEnd() paints anything in it. After
     // map_begin, because map_set_dark() reaches into the tile grid.
     themeBoot();
+
+    // Draw the remembered area while the receiver searches. The palette is
+    // already decided by this point, so the map comes up in the right colours
+    // rather than being painted twice - and map_seed_position() has to run
+    // after map_begin() in any case, since it centres the grid.
+    //
+    // No marker: see map_seed_position(). What is on screen is "here is where
+    // you were", not "here is where you are".
+    {
+        double slat, slon;
+        if (lastFixLoad(&slat, &slon)) map_seed_position(slat, slon);
+    }
 
     bootStepBusy("waiting for GPS fix");
     delay(600);
@@ -3234,9 +3334,50 @@ void loop() {
     // the streets under it. Recomputed only when the position has moved far
     // enough to matter.
     if (gnss_coarse(fix)) compass_set_position(fix.lat, fix.lon);
+    gnssRatePolicy(fix);
+    maglog_poll(fix);
+    wifiloc_poll(fix);
+    // After wifiloc_poll, so the cross-check inside sees this second's
+    // estimate rather than the previous one.
+    gpstrust_update(fix);
+
+    // What the map is shown, which is not always what the receiver said.
+    //
+    // `fix` stays exactly as the receiver reported it and is what the log, the
+    // rate policy, the assistance maintenance and the last-position save all
+    // continue to see. `view` is a copy that may carry a Wi-Fi estimate
+    // instead, and it is what the engine and the UI are given.
+    //
+    // The estimate is dressed as a 2D fix on purpose. gnss_coarse() must pass
+    // or the engine will not centre the grid at all; gnss_fine() must fail or
+    // the fine zoom gate, the waypoint precision and lastFixSave would all
+    // treat a hundred-metre guess as a survey point. mode 2 does both. The
+    // spread is put in HDOP so the one number the rest of the code already
+    // uses to mean "how much to trust this" carries something meaningful,
+    // scaled to the same rough range a real HDOP occupies.
+    GnssFix view = fix;
+    g_estimated = false;
+    if (!gnss_coarse(fix)) {
+        double elat, elon; float eacc; uint32_t eage;
+        if (wifiloc_position(&elat, &elon, &eacc, &eage)) {
+            view.lat = elat;
+            view.lon = elon;
+            view.status = 'A';
+            view.mode = 2;
+            view.hdop = eacc / 20.0;      // ~100 m spread reads as HDOP 5
+            if (view.hdop < 3.0) view.hdop = 3.0;
+            // Speed and course belong to the receiver and it has not got any.
+            // Leaving the previous values would drive the zoom hysteresis and
+            // the rate policy from a heading nobody measured.
+            view.speedKmh = 0;
+            view.course = 0;
+            g_estimated = true;
+            g_estimatedAcc = eacc;
+        }
+    }
     handlePowerButton();
     flushIfIdle();
-    applyTheme(fix);
+    applyTheme(view);
 
     // Remember where we are, for the next boot's palette. Ten minutes is
     // frequent enough that the position is never far wrong and rare enough
@@ -3256,8 +3397,8 @@ void loop() {
     if (g_screenOff && M5.Display.getBrightness() != 0)
         M5.Display.setBrightness(0);
 
-    map_update(fix);
-    pickZoom(fix);
+    map_update(view);
+    pickZoom(view);
     aopMaintain(fix);
     ttffReport(fix);
 
@@ -3327,10 +3468,19 @@ void loop() {
             // moved), and it is easier to grep for on its own.
             if (compass_ok()) {
                 float h = compass_heading();
-                Serial.printf("compass: %s, %.0f deg %s, |B| %.1f uT\n",
+                // compass_status() already ends in the field magnitude, so this
+            // does not repeat it.
+            Serial.printf("compass: %s, %.0f deg %s  "
+                              "log %s %lu rows %u KB  gnss %u ms  "
+                              "wifi %lu APs\n",
                               compass_status(),
                               h < 0 ? 0.0f : h, compass_label(h),
-                              compass_field_ut());
+                              !maglog_available() ? "unavailable"
+                                                  : maglog_enabled() ? "on" : "off",
+                              (unsigned long)maglog_rows(),
+                              (unsigned)(maglog_bytes() / 1024),
+                              (unsigned)gnss_rate_ms(),
+                              (unsigned long)wifiloc_entries());
             }
         }
     }
@@ -3346,10 +3496,10 @@ void loop() {
         // simpler than clipping around it, and costs nothing: the panel is a
         // deliberate, short-lived interaction, and pinPanelClose() forces the
         // repaint on the way out.
-        if (!g_pinPanel) map_draw(fix);
-        drawStatus(fix);
-        drawFooter(fix);
-        drawPinPanel(fix);
+        if (!g_pinPanel) map_draw(view);
+        drawStatus(view);
+        drawFooter(view);
+        drawPinPanel(view);
     }
 
     vTaskDelay(pdMS_TO_TICKS(5));

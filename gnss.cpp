@@ -381,6 +381,40 @@ void gnss_get(GnssFix *out) {
     }
 }
 
+// ---- measurement rate ------------------------------------------------------
+// UBX-CFG-RATE is six bytes: measRate (ms between measurements), navRate
+// (measurements per solution) and timeRef. navRate stays at 1 - raising it
+// instead would keep the receiver measuring at full rate and only report less
+// often, which saves the UART and nothing else, and the UART is not what
+// costs power here.
+//
+// src: u-blox M8 receiver description & protocol specification (UBX-13003221),
+//      UBX-CFG-RATE (0x06 0x08). timeRef 1 = GPS time; unchanged from the
+//      module default, restated because the message has no partial form.
+#define UBX_ID_RATE   0x08
+
+static uint16_t g_rate_ms = 1000;
+
+bool gnss_set_rate_ms(uint16_t ms) {
+    // The floor is the module's own: below 100 ms an M8 in a multi-GNSS
+    // configuration cannot keep up and silently clamps. The ceiling is where
+    // the fix is too old to draw a map from - at 10 s and 100 km/h the marker
+    // is a quarter of a kilometre behind the vehicle.
+    if (ms < 200)   ms = 200;
+    if (ms > 10000) ms = 10000;
+
+    uint8_t payload[6] = {
+        (uint8_t)(ms & 0xFF), (uint8_t)(ms >> 8),
+        0x01, 0x00,                    // navRate: one solution per measurement
+        0x01, 0x00,                    // timeRef: GPS
+    };
+    ubx_send(UBX_CLS_CFG, UBX_ID_RATE, payload, sizeof payload);
+    g_rate_ms = ms;
+    return true;
+}
+
+uint16_t gnss_rate_ms() { return g_rate_ms; }
+
 uint32_t gnss_sentences()    { return g_sentences; }
 uint32_t gnss_pps_count()    { return g_ppsCount; }
 uint32_t gnss_pps_interval() { return g_ppsInterval; }

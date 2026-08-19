@@ -254,6 +254,27 @@ static double g_marker_wx = 0, g_marker_wy = 0;
 static double g_view_wx = 0, g_view_wy = 0;
 static bool   g_view_set = false;
 
+// ---- pan -------------------------------------------------------------------
+// The follow logic tracks an anchor, not the marker. Normally the two are the
+// same point and nothing about the behaviour changes; while panning, the
+// anchor is a synthetic position the user has stepped around and the marker
+// carries on reporting where the device actually is.
+//
+// Splitting them is what lets pan reuse view_follow(), grid_drift() and the
+// shift path unchanged. The alternative - a second set of view mathematics
+// driven by touch - would have to be kept in agreement with the first one
+// forever, and the two would drift apart the first time either was tuned.
+static double g_anchor_wx = 0, g_anchor_wy = 0;
+static bool   g_panning = false;
+
+// The grid can be centred somewhere before the device knows where it is - see
+// map_seed_position(). The map is then perfectly drawable and the marker is
+// not: there is no measured position to put one at, and a marker sitting on a
+// remembered position from a previous session is a claim, not a placeholder.
+// It would be indistinguishable from a live one and wrong by however far the
+// device has travelled since.
+static bool g_marker_valid = false;
+
 // ---- rendering one tile ----------------------------------------------------
 static const char *g_want_layer = nullptr;
 static int rl_layer(void *ctx, const mvt_layer_t *l) {
@@ -1065,8 +1086,8 @@ static void view_follow() {
     double byLo = by, byHi = visH - by;
 
     if (!g_view_set) {
-        g_view_wx = g_marker_wx - (SW / 2.0) / SUBTILE_PX;
-        g_view_wy = g_marker_wy - (visH / 2.0) / SUBTILE_PX;
+        g_view_wx = g_anchor_wx - (SW / 2.0) / SUBTILE_PX;
+        g_view_wy = g_anchor_wy - (visH / 2.0) / SUBTILE_PX;
         g_view_set = true;
         return;
     }
@@ -1088,13 +1109,13 @@ static void view_follow() {
     // Stepping across also puts a third of a screen of new map ahead of the
     // direction of travel, and leaves the marker a third from either line so
     // it takes real movement rather than noise to trigger the next step.
-    double loX = g_marker_wx - bxHi / SUBTILE_PX;
-    double hiX = g_marker_wx - bxLo / SUBTILE_PX;
+    double loX = g_anchor_wx - bxHi / SUBTILE_PX;
+    double hiX = g_anchor_wx - bxLo / SUBTILE_PX;
     if (g_view_wx < loX) g_view_wx = hiX;     // crossed the far line, step over
     if (g_view_wx > hiX) g_view_wx = loX;
 
-    double loY = g_marker_wy - byHi / SUBTILE_PX;
-    double hiY = g_marker_wy - byLo / SUBTILE_PX;
+    double loY = g_anchor_wy - byHi / SUBTILE_PX;
+    double hiY = g_anchor_wy - byLo / SUBTILE_PX;
     if (g_view_wy < loY) g_view_wy = hiY;
     if (g_view_wy > hiY) g_view_wy = loY;
 
@@ -1131,8 +1152,20 @@ static void enqueue(render_job_t *jobs, int n) {
     }
 }
 
-static void recentre(const GnssFix &fix) {
-    merc_pt_t p = merc_from_ll(fix.lat, fix.lon, g_zoom);
+// Rebuild the grid around a world point. Split out of recentre(fix) so the
+// pan path can use it: panning has an anchor but no fix to derive one from,
+// and converting the anchor back to lat/lon just to convert it forward again
+// would be two projections and a rounding error for nothing.
+static void recentre_at(double wx, double wy) {
+    // Field-by-field rather than a brace list: merc_pt_t carries a zoom
+    // member as well as the coordinates, and a two-element brace list leaves
+    // it uninitialised - which -Wmissing-field-initializers is right to flag.
+    // The caller's coordinates are always at g_zoom, since that is the only
+    // zoom the anchor and the marker are ever expressed in.
+    merc_pt_t p;
+    p.x = wx;
+    p.y = wy;
+    p.z = g_zoom;
     // Anchor by origin, which centres the canvas on the marker for odd and
     // even grids alike - an even grid has no middle tile to sit inside.
     tile_id_t c = { g_zoom, grid_origin_for(p.x), grid_origin_for(p.y) };
@@ -1148,6 +1181,11 @@ static void recentre(const GnssFix &fix) {
     // A fresh grid means the previous view may sit outside it entirely.
     g_view_set = false;
     g_stats.shifts++;
+}
+
+static void recentre(const GnssFix &fix) {
+    merc_pt_t p = merc_from_ll(fix.lat, fix.lon, g_zoom);
+    recentre_at(p.x, p.y);
 }
 
 // Ask the worker for whichever place blocks the marker has moved out of.
@@ -1260,10 +1298,33 @@ void map_update(const GnssFix &fix) {
     tile_id_t centre = g_grid.origin;
     xSemaphoreGive(g_glock);
 
-    if (!g_centred) { recentre(fix); return; }
+    if (!g_centred) {
+        // The marker is set here as well as below, or the first fix of an
+        // unseeded boot would centre the grid and draw nothing on it until
+        // the second one arrives - which at the idle GNSS rate is five
+        // seconds of a map that looks like the seeded state.
+        g_marker_wx = p.x;
+        g_marker_wy = p.y;
+        g_marker_valid = true;
+        recentre(fix);
+        return;
+    }
 
     g_marker_wx = p.x;
     g_marker_wy = p.y;
+    g_marker_valid = true;
+
+    // A panned view ignores the fix for everything except the marker. The
+    // position keeps updating, the pins keep moving, and the map stays where
+    // it was put - which is the whole point of having panned.
+    //
+    // Place names are left alone too: they describe where the anchor is, and
+    // the anchor has not moved. Updating them from the fix would put the name
+    // of somewhere off-screen at the top of a map of somewhere else.
+    if (g_panning) return;
+
+    g_anchor_wx = p.x;
+    g_anchor_wy = p.y;
     view_follow();
     ensure_place_blocks(p.x, p.y);
     update_place_names(p.x, p.y);
@@ -1940,7 +2001,7 @@ void map_draw(const GnssFix &fix) {
 
     draw_target_guide(fix, mx, my);
     M5.Display.setClipRect(0, visTop, SW, visBot - visTop);
-    draw_marker(fix, mx, my);
+    if (g_marker_valid) draw_marker(fix, mx, my);
     M5.Display.clearClipRect();
 
     last_cx = canvas_x; last_cy = canvas_y;
@@ -2241,6 +2302,125 @@ int  map_prefetch_progress() { return g_pf_progress; }
 bool map_prefetch_busy()     { return g_pf_busy; }
 
 uint8_t map_zoom() { return g_zoom; }
+// ---- pan -------------------------------------------------------------------
+// One step is one band width, which at MARKER_BAND 0.33 is one third of the
+// visible area - the same distance the view jumps when the marker crosses a
+// band edge, and the reason this is "pan by thirds" rather than a free drag.
+//
+// A free drag would need gesture tracking, a coalescing rule to stop the
+// renderer being handed tiles faster than it can serve them, and a decision
+// about what to draw during the drag. A discrete step needs none of that: it
+// produces exactly one view move and exactly the set of jobs a real movement
+// of that size would have produced, and it is a better control on a moving
+// vehicle than a drag is anyway.
+bool map_pan_step(int dx, int dy) {
+    if (g_headless || !g_centred) return false;
+    if (!dx && !dy) return false;
+
+    const int SW = M5.Display.width(), SH = M5.Display.height();
+    const double visH = (SH - FOOTER_H) - STATUS_H;
+
+    // Anchor starts wherever the marker is, so the first step after following
+    // moves relative to the device rather than to some stale point.
+    if (!g_panning) {
+        g_anchor_wx = g_marker_wx;
+        g_anchor_wy = g_marker_wy;
+        g_panning = true;
+    }
+
+    g_anchor_wx += (double)dx * (SW   * MARKER_BAND) / SUBTILE_PX;
+    g_anchor_wy += (double)dy * (visH * MARKER_BAND) / SUBTILE_PX;
+
+    // From here it is exactly the fix path: let the band logic move the view,
+    // then ask the grid whether that put the anchor on a different tile.
+    view_follow();
+    ensure_place_blocks(g_anchor_wx, g_anchor_wy);
+    update_place_names(g_anchor_wx, g_anchor_wy);
+
+    xSemaphoreTake(g_glock, portMAX_DELAY);
+    tile_id_t centre = g_grid.origin;
+    int dxt, dyt;
+    grid_drift(&g_grid, g_anchor_wx, g_anchor_wy, &dxt, &dyt);
+    xSemaphoreGive(g_glock);
+
+    if (dxt || dyt) {
+        // Same one-tile test the fix path uses. A step is a third of a screen
+        // and a screen is under a tile wide at these zooms, so this normally
+        // shifts by one - but a step taken right at a corner can cross in both
+        // axes, and the recentre path handles that without a second case here.
+        double mid = (double)GRID_N / 2.0;
+        double rx = g_anchor_wx - ((double)centre.x + mid);
+        double ry = g_anchor_wy - ((double)centre.y + mid);
+        if (rx < -1.5 || rx > 1.5 || ry < -1.5 || ry > 1.5) {
+            recentre_at(g_anchor_wx, g_anchor_wy);
+            view_follow();
+        } else {
+            render_job_t jobs[GRID_COUNT];
+            xSemaphoreTake(g_glock, portMAX_DELAY);
+            int n = grid_shift(&g_grid, dxt, dyt, jobs, GRID_COUNT);
+            tile_id_t nc = g_grid.origin;
+            xSemaphoreGive(g_glock);
+            ensure_coarse(nc);
+            enqueue(jobs, n);
+            g_stats.shifts++;
+        }
+    }
+
+    map_invalidate();
+    return true;
+}
+
+void map_pan_reset() {
+    if (!g_panning) return;
+    g_panning = false;
+    g_anchor_wx = g_marker_wx;
+    g_anchor_wy = g_marker_wy;
+
+    // Force the grid back around the marker rather than waiting for the next
+    // fix to drift it there: a pan of several tiles would otherwise take the
+    // jump test in map_update() to notice, and that test only runs when a fix
+    // arrives - which at the idle GNSS rate can be five seconds away.
+    if (g_centred) {
+        recentre_at(g_marker_wx, g_marker_wy);
+        view_follow();
+        ensure_place_blocks(g_marker_wx, g_marker_wy);
+        update_place_names(g_marker_wx, g_marker_wy);
+    }
+    map_invalidate();
+}
+
+bool map_panning() { return g_panning; }
+
+void map_seed_position(double lat, double lon) {
+    // Only before a real fix. Once the marker is live this would drag the map
+    // back to last session's position, which is the opposite of what a seed
+    // is for.
+    if (g_centred || g_marker_valid) return;
+
+    merc_pt_t p = merc_from_ll(lat, lon, g_zoom);
+    g_anchor_wx = p.x;
+    g_anchor_wy = p.y;
+
+    // The marker coordinates are set too, and deliberately not marked valid.
+    // draw_marker is skipped while g_marker_valid is false, but the pin
+    // overlay and the place-name lookup both work off world coordinates and
+    // are useful immediately - a saved point near home should be visible on a
+    // map of home before the receiver has finished searching.
+    g_marker_wx = p.x;
+    g_marker_wy = p.y;
+
+    recentre_at(p.x, p.y);
+    view_follow();
+    ensure_place_blocks(p.x, p.y);
+    update_place_names(p.x, p.y);
+    map_invalidate();
+    Serial.printf("map: seeded at %.4f,%.4f from the last known position - "
+                  "drawing, but no marker until something measures one\n",
+                  lat, lon);
+}
+
+bool map_marker_valid() { return g_marker_valid; }
+
 bool map_has_fix_position() { return g_centred; }
 
 void map_stats(MapStats *out) {

@@ -76,6 +76,55 @@ void map_draw(const GnssFix &fix);
 // Force a full re-render, e.g. after a zoom change.
 void map_set_zoom(uint8_t zoom, const GnssFix &fix);
 
+// ---- panning ---------------------------------------------------------------
+// Move the view one band width - one third of the visible area - in the given
+// direction. dx and dy are each -1, 0 or +1, in screen terms: dx +1 is east,
+// dy +1 is south.
+//
+// This is deliberately the same operation the follow logic performs when the
+// marker leaves the band, applied to a synthetic anchor instead of the fix.
+// The consequences are identical to having walked a third of a screen that
+// way: the grid shifts when the anchor crosses a tile, the coarse overview is
+// refreshed, and the same jobs are enqueued. Nothing here knows it is being
+// driven by a finger rather than by movement, which is why there is no second
+// code path to keep in step with the first.
+//
+// The marker keeps tracking the real fix throughout and simply leaves the
+// screen when the view is panned away from it. That is the honest rendering:
+// the map is showing somewhere the device is not.
+//
+// Returns false when there is nothing to pan (no fix has ever centred the
+// grid, or headless).
+bool map_pan_step(int dx, int dy);
+
+// Back to following the fix. The next map_update() recentres.
+void map_pan_reset();
+
+// True while the view is somewhere other than where the device is. The footer
+// uses this to light the recentre control, and it is worth surfacing rather
+// than inferring: a panned view that nobody remembers panning is the failure
+// mode this whole feature has.
+bool map_panning();
+
+// ---- boot seeding ----------------------------------------------------------
+// Centre the grid on a remembered position so there is a map on screen during
+// the thirty to ninety seconds a cold start takes, rather than a background
+// colour and a status line.
+//
+// Explicitly does NOT place a marker. The remembered position is where the
+// device was when it was last switched off, which may be a different city; a
+// marker there would be indistinguishable from a live one and wrong by the
+// whole distance travelled since. The marker appears when the receiver
+// produces a fix, or when the Wi-Fi centroids produce an estimate - either
+// way, when something has actually measured a position.
+//
+// Ignored once a real position has arrived, so it is safe to call late.
+void map_seed_position(double lat, double lon);
+
+// False until a measured position has been seen this session. The status bar
+// uses it to explain why a perfectly good map has nothing on it.
+bool map_marker_valid();
+
 // Pull every tile within `radius` tiles of the current position into the
 // cache, at both working zooms, without rendering any of them. Runs in its
 // own task and returns immediately.

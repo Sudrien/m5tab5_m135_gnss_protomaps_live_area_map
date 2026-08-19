@@ -74,6 +74,32 @@ float compass_heading();
 // hold roughly constant as the device turns.
 float compass_field_ut();
 
+// A single synchronised reading, for the log. Everything here comes from the
+// same pass of compass_update(), which matters: pairing a magnetometer vector
+// with an accelerometer vector read a moment later is how a tilt-compensated
+// heading acquires an error that only shows up while the device is moving -
+// which is exactly the condition being modelled.
+//
+// Both the raw and the corrected magnetometer vectors are carried. The raw one
+// is what lets a fit be redone offline against different calibration
+// parameters without collecting another drive; the corrected one is what the
+// heading in this same struct was actually computed from.
+struct CompassSample {
+    uint32_t ms;              // millis() when the sample was taken
+    uint32_t seq;             // increments once per accepted sample
+    float    raw[3];          // magnetometer, uncorrected, sensor frame
+    float    corrected[3];    // offset and gain applied, accelerometer frame
+    float    acc[3];          // accelerometer, raw counts, same instant
+    float    heading;         // degrees, -1 when uncalibrated
+    float    field_ut;
+    float    roll, pitch;     // degrees
+    bool     calibrated;
+};
+
+// Copy the most recent sample. False when the compass is down, is calibrating,
+// or has not produced one yet. Call from the same task as compass_update().
+bool compass_sample(CompassSample *out);
+
 // Sixteen-point label for a heading: "N", "NNE", ... Returns "--" for a
 // negative (unavailable) heading.
 const char *compass_label(float deg);

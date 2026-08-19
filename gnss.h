@@ -45,6 +45,23 @@ bool gnss_start(int rx_pin, int tx_pin, uint32_t baud, int pps_pin,
 
 void gnss_get(GnssFix *out);
 
+// ---- measurement rate ------------------------------------------------------
+// The receiver's own solution rate, in milliseconds between fixes. Slowing it
+// is the one power saving available here that costs nothing else: the module
+// stays hot, keeps its ephemeris and its AOP predictions, and reacquires
+// instantly - unlike a backup or standby mode, which trades a real fix for a
+// cold-ish start every time the device moves again.
+//
+// Fire-and-forget: UBX-CFG-RATE is sent and not waited on, because the ACK
+// arrives interleaved with NMEA on the same wire and the reader task is the
+// only thing draining it. A dropped message means the rate stays where it was,
+// which is the status quo rather than a failure - and the policy that calls
+// this re-asserts it.
+bool     gnss_set_rate_ms(uint16_t ms);
+
+// What was last asked for, not what the receiver confirmed. See above.
+uint16_t gnss_rate_ms();
+
 uint32_t gnss_sentences();
 uint32_t gnss_pps_count();
 uint32_t gnss_pps_interval();
