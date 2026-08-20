@@ -62,6 +62,37 @@ static const int WIFILOC_MIN_APS = 3;
 static const uint32_t WIFILOC_LEARN_MS = 20000;
 static const double   WIFILOC_LEARN_M  = 40.0;
 
+// Speed ceiling for learning.
+//
+// A scan is not an instant. It dwells on each of the 2.4 GHz channels in turn
+// and takes on the order of a second to complete, and every AP heard anywhere
+// in that second is folded in against the single fix that happened to be
+// current. The observation is therefore smeared along the track by roughly
+// speed x scan duration, whatever the receiver says the position was.
+//
+// That smear is not merely noise in the centroid, which would dilute as 1/n.
+// It also widens min_lat/max_lat/min_lon/max_lon, and those are monotonic -
+// they never shrink - and they are what the mobility test reads. `mobile` is
+// sticky and deliberately one-way. So a fixed AP beside a fast road can
+// accumulate smeared extent across passes until it crosses WIFILOC_MOBILE_M
+// and is excluded permanently: the survey spends radio time making itself
+// worse, at exactly the roadside locations where an entry is hardest to
+// replace.
+//
+// 12 km/h is a little over 3 m/s, so a one-second scan smears well under the
+// 40 m granularity WIFILOC_LEARN_M already accepts - the smear stays smaller
+// than the spacing, which is the condition for it not to dominate. The value
+// is GNSS_MOVING_KMH from tab5_map.cpp's rate policy, which is set at the
+// same place for the same reason; it is restated rather than shared because
+// the two modules do not otherwise know about each other.
+//
+// Locating is deliberately not gated. It runs when there is no fix at all, so
+// there is no speed to test, and an estimate that is only approximately right
+// is the entire point of the fallback.
+//
+// src: 12.0 matches GNSS_MOVING_KMH, itself a judgement - see PROVENANCE.md.
+static const double WIFILOC_LEARN_MAX_KMH = 12.0;
+
 // Locating: how long without a fix before this starts trying, and how often to
 // retry. The delay matters - a momentary RMC dropout under a bridge should not
 // switch the map onto a Wi-Fi estimate and back again.
@@ -108,6 +139,13 @@ static int      s_est_used = 0;
 enum ScanWhy { SCAN_NONE = 0, SCAN_LEARN, SCAN_LOCATE };
 static ScanWhy  s_scanWhy = SCAN_NONE;
 static uint32_t s_scanStart = 0;
+// Where the device was when the learning scan was started, and whether that
+// is meaningful. The gate below runs at scan start, but learn() is reached a
+// second or more later on a subsequent poll, with whatever fix is current
+// then - so without this the scan that straddles a tunnel mouth is folded in
+// against an endpoint, and a fix lost mid-scan is folded in against nothing.
+static double   s_scanLat = 0, s_scanLon = 0;
+static bool     s_scanPos = false;
 static uint32_t s_lastLearn = 0, s_lastLocate = 0;
 static double   s_lastLearnLat = 0, s_lastLearnLon = 0;
 static bool     s_haveLearnPos = false;
@@ -496,8 +534,30 @@ void wifiloc_poll(const GnssFix &fix) {
             s_scanWhy = SCAN_NONE;
             return;
         }
-        if (s_scanWhy == SCAN_LEARN) learn(fix, n);
-        else                         locate(n);
+        if (s_scanWhy == SCAN_LEARN) {
+            // The scan is only usable if the fix was good when it started,
+            // is still good now, and the two agree to within what the
+            // elapsed time and the speed ceiling can account for. Anything
+            // else is discarded whole: the sums learn() folds into are not
+            // reversible, so a doubtful observation cannot be taken back.
+            double moved = 1e9;
+            if (s_scanPos && gnss_fine(fix)) {
+                double dx = lon_m(fix.lon - s_scanLon, fix.lat);
+                double dy = lat_m(fix.lat - s_scanLat);
+                moved = sqrt(dx * dx + dy * dy);
+            }
+            double allow = WIFILOC_LEARN_MAX_KMH / 3.6
+                         * (double)(millis() - s_scanStart) / 1000.0 + 10.0;
+            if (moved <= allow) {
+                learn(fix, n);
+            } else {
+                Serial.println("wifiloc: fix moved or was lost during the "
+                               "scan - discarding it");
+            }
+            s_scanPos = false;
+        } else {
+            locate(n);
+        }
         WiFi.scanDelete();
         s_scanWhy = SCAN_NONE;
         return;
@@ -519,6 +579,11 @@ void wifiloc_poll(const GnssFix &fix) {
         // later, when there is nothing to check it against.
         if (millis() - s_lastLearn < WIFILOC_LEARN_MS) return;
 
+        // Too fast to learn anything that will not smear. Not an error and
+        // not worth logging every twenty seconds - a motorway leg simply
+        // contributes nothing, which is the correct outcome.
+        if (fix.speedKmh > WIFILOC_LEARN_MAX_KMH) return;
+
         if (s_haveLearnPos) {
             double dx = lon_m(fix.lon - s_lastLearnLon, fix.lat);
             double dy = lat_m(fix.lat - s_lastLearnLat);
@@ -532,6 +597,9 @@ void wifiloc_poll(const GnssFix &fix) {
         s_lastLearnLat = fix.lat;
         s_lastLearnLon = fix.lon;
         s_haveLearnPos = true;
+        s_scanLat = fix.lat;
+        s_scanLon = fix.lon;
+        s_scanPos = true;
         return;
     }
 
