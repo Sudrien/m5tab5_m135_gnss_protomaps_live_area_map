@@ -787,33 +787,33 @@ static void screenOff() {
     M5.Display.setBrightness(0);
     M5.Display.fillScreen(TFT_BLACK);
 
-    // Backlight off is not display off. setBrightness(0) darkens the LED
-    // string and leaves the MIPI-DSI panel controller running, still being
-    // refreshed line by line out of the same framebuffer - the picture is
-    // invisible and the panel is still doing all the work of drawing it.
+    // Deliberately NOT M5.Display.sleep() here. It looks like the obvious
+    // next step past setBrightness(0) - the backlight is dark but the
+    // MIPI-DSI controller is still refreshing an invisible frame out of the
+    // framebuffer - and sleep() does put a stop to that. It was tried.
     //
-    // sleep() puts the controller itself into its low-power state. Ordered
-    // after the black fill deliberately: the panel retains whatever was last
-    // written, so sleeping over the map would leave that image to reappear
-    // for an instant on wake.
+    // It also took touch down with it, with no way back except a power
+    // cycle. Per DISPLAY_IDF_NOTES.md, LCD_RST and TP_RST are one reset pair
+    // on this board, held and released together, not two independent lines -
+    // the panel and the touch controller are one module, not a panel with a
+    // touch peripheral bolted on. Whatever sleep()/wakeup() do to the DSI
+    // side of that pair is not guaranteed to leave the touch side answering,
+    // and screenOff()'s only exit is a touch in the wake zone below. If that
+    // exit is gone, so is the device, until it's unplugged and back.
     //
-    // Kept separate from the brightness call rather than folded into it,
-    // because applyTheme() also drives brightness and must not be able to
-    // wake the controller as a side effect of a day/night transition.
-    M5.Display.sleep();
-
+    // setBrightness(0) is most of the available saving anyway - the panel
+    // redrawing black costs little next to the LED string actually being
+    // lit. A deeper sleep is worth revisiting, but it needs a wake source
+    // that doesn't live behind the same reset pair as the thing being put to
+    // sleep - a timer or a physical button, not touch.
+    //
     // GNSS is untouched, so the position stays current. Tile fetching
     // continues and rasterising does not - see map_set_visible().
-    Serial.println("screen: off (GPS continues, panel asleep)");
+    Serial.println("screen: off (GPS and rendering continue)");
 }
 
 static void screenOn() {
     if (!g_panelOk) return;   // no display attached
-
-    // Before anything is drawn, or the writes land in a controller that is
-    // not listening and the first frame is lost.
-    M5.Display.wakeup();
-
     g_screenOff = false;
     map_set_visible(true);
     // g_brightness may have been updated by a theme change while asleep, so
