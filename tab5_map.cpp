@@ -117,8 +117,20 @@ static void wifiSetPins() {
 // distinguishes "no companion chip" from "wrong password" - two failures that
 // otherwise look identical from the application side.
 static bool wifiRadioUp() {
+    // DEBUG: WiFi.mode() is where esp_hosted actually brings the transport up,
+    // and it prints nothing until it is well underway. If the missing eleven
+    // seconds are here, this is what shows it.
+    uint32_t dbg = millis();
     wifiSetPins();
-    if (!WiFi.mode(WIFI_STA)) { Serial.println("wifi: WiFi.mode(STA) failed"); return false; }
+    Serial.printf("dbg:   +%lu ms wifiSetPins\n",
+                  (unsigned long)(millis() - dbg)); dbg = millis();
+
+    bool modeOk = WiFi.mode(WIFI_STA);
+    Serial.printf("dbg:   +%lu ms WiFi.mode(STA) -> %s\n",
+                  (unsigned long)(millis() - dbg), modeOk ? "ok" : "FAILED");
+    dbg = millis();
+
+    if (!modeOk) { Serial.println("wifi: WiFi.mode(STA) failed"); return false; }
     delay(200);
 
     String mac = WiFi.macAddress();
@@ -129,7 +141,10 @@ static bool wifiRadioUp() {
         Serial.println("      and that the C6 still has its SDIO WiFi firmware.");
         return false;
     }
+    dbg = millis();
     int n = WiFi.scanNetworks();
+    Serial.printf("dbg:   +%lu ms WiFi.scanNetworks\n",
+                  (unsigned long)(millis() - dbg));
     Serial.printf("wifi: scan found %d network%s\n", n, n == 1 ? "" : "s");
     for (int i = 0; i < n && i < 8; i++)
         // WiFiScan::RSSI(uint8_t) returns int32_t - 'long' on RISC-V - while
@@ -3235,6 +3250,8 @@ void setup() {
     // the network or the sky. A device that does not knows the opposite,
     // without having spent forty seconds on a radio to find out.
     {
+        Serial.printf("dbg: archive check starting at %lu ms uptime\n",
+                      (unsigned long)millis());
         bootStepBusy("checking the map archive");
         map_world_check_start();
         uint32_t t0 = millis();
@@ -3302,6 +3319,9 @@ void setup() {
     // map_begin, because map_set_dark() reaches into the tile grid.
     themeBoot();
 
+    Serial.printf("dbg: sensors and theme done at %lu ms uptime\n",
+                  (unsigned long)millis());
+
     // Draw the remembered area while the receiver searches. The palette is
     // already decided by this point, so the map comes up in the right colours
     // rather than being painted twice - and map_seed_position() has to run
@@ -3351,21 +3371,39 @@ void setup() {
             map_draw(f);
             drawStatus(f);
         }
-        Serial.printf("boot: first picture after %lu ms%s\n",
+        Serial.printf("boot: first picture after %lu ms%s (uptime %lu ms)\n",
                       (unsigned long)(millis() - t0),
-                      map_has_picture() ? "" : " (gave up waiting)");
+                      map_has_picture() ? "" : " (gave up waiting)",
+                      (unsigned long)millis());
     }
 
 
 
     // ---- radio, now that the map is up ------------------------------------
     // Everything from here needs the C6, and none of it is needed to draw.
+    // DEBUG: bracket every step from the end of the boot wait to the first
+    // line esp_hosted prints, because eleven seconds go missing in there and
+    // nothing currently logs between them. Each stamp is relative to the
+    // previous one, so the gap names itself.
+    uint32_t dbg = millis();
+    Serial.printf("dbg: boot wait done at %lu ms uptime\n", (unsigned long)dbg);
+
     bootStepBusy("starting wifi radio");
+    Serial.printf("dbg: +%lu ms bootStepBusy drew\n",
+                  (unsigned long)(millis() - dbg)); dbg = millis();
+
     // The renderer and SDIO enumeration both want the buses, and only one of
     // them is on a deadline. Measured: card init takes 47 ms with the worker
     // idle and 4779 ms with it running. The tiles can wait four seconds.
     map_worker_pause();
+    Serial.printf("dbg: +%lu ms map_worker_pause returned\n",
+                  (unsigned long)(millis() - dbg)); dbg = millis();
+
     bool radio = wifiRadioUp();
+    Serial.printf("dbg: +%lu ms wifiRadioUp returned (%s)\n",
+                  (unsigned long)(millis() - dbg), radio ? "up" : "failed");
+    dbg = millis();
+
     map_worker_resume();
     if (radio) bootStep("wifi radio ready"); else bootStepFail("wifi radio unavailable");
 

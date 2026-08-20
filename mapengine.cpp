@@ -1621,8 +1621,21 @@ void map_worker_pause() {
     // point is to let it finish rather than to stop it mid-read.
     uint32_t t0 = millis();
     while (!g_paused && millis() - t0 < 8000) vTaskDelay(pdMS_TO_TICKS(20));
-    if (!g_paused)
-        Serial.println("map: worker did not park in time - continuing anyway");
+
+    // DEBUG. There are eleven seconds unaccounted for between the boot screen
+    // handing over and ESP-Hosted printing its first line, and this call sits
+    // in the middle of them. Four tiles at ~2.5 s each were queued by the
+    // recentre just before it, so the park should cost at most one of them.
+    //
+    // Near zero: the time is inside WiFi.mode(WIFI_STA) before esp_hosted
+    // logs anything, and this is the wrong place to be looking.
+    // Around 2.5 s: correct and expected - look elsewhere for the other nine.
+    // Near 8 s: the park is waiting on more than the job in flight, and the
+    // check needs to sit inside the render loop rather than only at the top.
+    Serial.printf("map: worker parked in %lu ms (queue %u)%s\n",
+                  (unsigned long)(millis() - t0),
+                  (unsigned)uxQueueMessagesWaiting(g_jobs),
+                  g_paused ? "" : " - TIMED OUT, continuing anyway");
 }
 
 void map_worker_resume() {
