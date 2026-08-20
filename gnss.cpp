@@ -12,6 +12,20 @@ static SemaphoreHandle_t g_lock = nullptr;
 static GnssFix g_pub;                 // published copy, guarded by g_lock
 static uint32_t g_sentences = 0;
 
+// When the receiver first reported each quality, stamped in the parser rather
+// than observed by a reader.
+//
+// These used to be taken as millis() at the moment loop() happened to notice
+// the fix, which is only the same number while loop() is turning freely. It is
+// not during startup: with the radio brought up behind the first render,
+// setup() can occupy forty seconds, and a fix arriving in the middle of that
+// was reported at the instant setup ended. The give-away was the 2D and 3D
+// times printing identically, having both been noticed on the same first pass.
+//
+// A stamp taken where the sentence is parsed cannot drift like that, whatever
+// the rest of the system is doing.
+static volatile uint32_t g_firstCoarseMs = 0, g_firstFineMs = 0;
+
 // PPS is edge-counted in an ISR. Polling misses pulses, because the render
 // path can occupy far longer than the pulse width.
 static volatile uint32_t g_ppsCount = 0, g_ppsLast = 0, g_ppsInterval = 0;
@@ -203,6 +217,15 @@ static void gnss_task(void *arg) {
                 pos = 0;
                 // Publish the whole struct at once so a reader never sees a
                 // fix half-updated across sentences.
+                // Stamped here, on the task that parsed it. gnss_fine() reads
+                // fields set by three different sentences, so this tests the
+                // assembled fix after each one rather than assuming RMC is
+                // the last to arrive.
+                if (!g_firstCoarseMs && gnss_coarse(local))
+                    g_firstCoarseMs = millis();
+                if (!g_firstFineMs && gnss_fine(local))
+                    g_firstFineMs = millis();
+
                 if (xSemaphoreTake(g_lock, portMAX_DELAY) == pdTRUE) {
                     g_pub = local;
                     xSemaphoreGive(g_lock);
@@ -414,6 +437,9 @@ bool gnss_set_rate_ms(uint16_t ms) {
 }
 
 uint16_t gnss_rate_ms() { return g_rate_ms; }
+
+uint32_t gnss_first_coarse_ms() { return g_firstCoarseMs; }
+uint32_t gnss_first_fine_ms()   { return g_firstFineMs; }
 
 uint32_t gnss_sentences()    { return g_sentences; }
 uint32_t gnss_pps_count()    { return g_ppsCount; }

@@ -45,6 +45,16 @@ bool gnss_start(int rx_pin, int tx_pin, uint32_t baud, int pps_pin,
 
 void gnss_get(GnssFix *out);
 
+// millis() when the receiver first reported a valid fix, and first reported
+// one good enough for gnss_fine(). Zero until it has.
+//
+// Stamped in the parser, not by whoever reads the fix. That distinction is
+// the whole point: a reader running on a task that is busy elsewhere reports
+// when it looked, not when the receiver answered, and during startup those
+// can be tens of seconds apart.
+uint32_t gnss_first_coarse_ms();
+uint32_t gnss_first_fine_ms();
+
 // ---- measurement rate ------------------------------------------------------
 // The receiver's own solution rate, in milliseconds between fixes. Slowing it
 // is the one power saving available here that costs nothing else: the module

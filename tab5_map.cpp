@@ -1992,8 +1992,10 @@ static void ttffReport(const GnssFix &fix) {
 
     if (!anyDone && gnss_coarse(fix)) {
         anyDone = true;
+        // gnss_first_coarse_ms(), not millis(): this runs from loop(), and
+        // loop() does not turn during setup(). See gnss.h.
         Serial.printf("gnss: first fix after %.1f s (%s), %d sats\n",
-                      (millis() - t0) / 1000.0,
+                      (gnss_first_coarse_ms() - t0) / 1000.0,
                       g_aopRestored
                         ? (g_aopAgeHours >= 0
                              ? "assisted" : "assisted, age unknown")
@@ -2003,7 +2005,7 @@ static void ttffReport(const GnssFix &fix) {
     if (anyDone && !fineDone && gnss_fine(fix)) {
         fineDone = true;
         Serial.printf("gnss: 3D fix hdop %.2f after %.1f s\n",
-                      fix.hdop, (millis() - t0) / 1000.0);
+                      fix.hdop, (gnss_first_fine_ms() - t0) / 1000.0);
     }
 }
 
