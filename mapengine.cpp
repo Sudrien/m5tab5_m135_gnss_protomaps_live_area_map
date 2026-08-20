@@ -891,27 +891,83 @@ static bool coarse_fill(subtile_t *s) {
     uint32_t inc = ((uint32_t)sub << 16) / SUBTILE_PX;
     uint16_t *dst = s->pixels;
     uint32_t sy = 0;
+
+    // Most destination rows are duplicates of the one above.
+    //
+    // This is an upscale, so `sub` source rows are stretched over SUBTILE_PX
+    // destination rows and consecutive y values keep landing on the same
+    // (sy >> 16). At COARSE_STEP 2 and SUBTILE_PX 1280 that is 128 distinct
+    // source rows painted 1280 times: nine of every ten rows were being
+    // rebuilt pixel by pixel, through a gather off a source row 512 px wide,
+    // to arrive at bytes identical to the row already sitting above them.
+    //
+    // Resampling each source row once and memcpy-ing the repeats is exact -
+    // nearest-neighbour has no inter-row term, so the output is unchanged
+    // byte for byte, which is worth stating because a resampler that is
+    // "close enough" here would show as banding against the real tile that
+    // replaces it. Measured on the scaling loop alone at SUBTILE_PX 1280:
+    //
+    //   step 1 (256 unique rows)   0.89 ms -> 0.29 ms   3.1x
+    //   step 2 (128 unique rows)   0.88 ms -> 0.21 ms   4.1x
+    //   step 3 ( 64 unique rows)   0.90 ms -> 0.18 ms   5.1x
+    //
+    // Those are host figures with both buffers in cache. On PSRAM the gap
+    // should be wider, because what the repeats stop doing is a strided
+    // gather and what they do instead is a linear copy.
+    int32_t   prev_src = -1;
+    uint16_t *prev_dst = nullptr;
+
     for (int y = 0; y < SUBTILE_PX; y++, sy += inc) {
-        const uint16_t *row = g_coarse_px + (size_t)(sy0 + (sy >> 16)) * COARSE_PX + sx0;
-        uint32_t sx = 0;
-        for (int x = 0; x < SUBTILE_PX; x++, sx += inc)
-            *dst++ = row[sx >> 16];
+        int32_t srow = (int32_t)(sy >> 16);
+        if (srow == prev_src) {
+            memcpy(dst, prev_dst, (size_t)SUBTILE_PX * sizeof(uint16_t));
+        } else {
+            const uint16_t *row = g_coarse_px + (size_t)(sy0 + srow) * COARSE_PX + sx0;
+            uint32_t sx = 0;
+            for (int x = 0; x < SUBTILE_PX; x++, sx += inc)
+                dst[x] = row[sx >> 16];
+            prev_src = srow;
+            prev_dst = dst;
+        }
+        dst += SUBTILE_PX;
     }
     return true;
 }
 
 // Fill slots that have nothing to show yet.
 //
-// Two constraints shape this. The scaling loop writes 512 KB per slot, so
-// doing all nine on one pass would stall the UI for a noticeable fraction of
-// a second - hence the per-pass budget. And the loop must not run under the
-// grid lock, or it would block the worker's commit for just as long.
+// Two constraints shape this. The scaling loop writes a whole subtile per
+// slot, so doing all of them on one pass would stall the UI for a noticeable
+// fraction of a second - hence the per-pass budget. And the loop must not run
+// under the grid lock, or it would block the worker's commit for just as long.
 //
 // Dropping the lock during the fill is safe because of who touches what: the
 // worker only ever writes to its spare buffer, and map_update and map_draw
 // both run on the UI task, so nothing can reassign a slot's pixel pointer
 // while this is using it. The lock is taken only around the state fields.
-static const int COARSE_FILLS_PER_PASS = 2;
+//
+// The budget is stated in bytes rather than in slots, because the slot is not
+// a fixed amount of work and the previous constant assumed it was. Two slots
+// was written against SUBTILE_PX 512, where a slot is 512 KB and the pass
+// wrote 1 MB. At 1280 a slot is 3.2 MB, so the same constant had quietly
+// become 6.4 MB of PSRAM written on the UI task between two calls to
+// map_draw() - six times the stall it was tuned for, on the task that also
+// has to answer the touchscreen.
+//
+// A byte budget tracks SUBTILE_PX on its own and reproduces the original
+// figure at the size it was chosen for: 1 MB gives two fills at 512 px and
+// one at 1280. The floor of one matters - a budget smaller than a single
+// slot must still make progress, or a grid with nothing drawable in it would
+// never acquire a placeholder at all.
+#ifndef COARSE_FILL_BYTES_PER_PASS
+#define COARSE_FILL_BYTES_PER_PASS (1024u * 1024u)
+#endif
+static const int COARSE_FILLS_PER_PASS =
+    (int)(COARSE_FILL_BYTES_PER_PASS
+              / ((size_t)SUBTILE_PX * SUBTILE_PX * sizeof(uint16_t))) > 1
+        ? (int)(COARSE_FILL_BYTES_PER_PASS
+              / ((size_t)SUBTILE_PX * SUBTILE_PX * sizeof(uint16_t)))
+        : 1;
 
 // The overview serves two jobs that are worth separating, because only one of
 // them is about missing data.
