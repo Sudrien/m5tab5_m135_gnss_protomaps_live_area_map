@@ -1329,6 +1329,10 @@ static void bootEnd() {
     // that far. A second fillScreen would wipe a map that is already up.
     if (!g_bootActive) return;
     g_bootActive = false;
+    // The world check is the last thing on the boot screen and the boot
+    // screen is about to be painted over, so its half-megabyte goes back to
+    // the heap here rather than being held for the run.
+    map_world_check_free();
     M5.Display.fillScreen(style_background());
 }
 
@@ -3214,6 +3218,50 @@ void setup() {
         char m[64];
         snprintf(m, sizeof m, "map ready, %dpx tiles, z%d+", SUBTILE_PX, Z_FLOOR);
         bootStep(m);
+    }
+
+    // Prove the archive end to end before the radio is touched.
+    //
+    // map_begin() above only proves the header parsed - the file could still
+    // be truncated, the directory could be unreadable, the tiles could be
+    // something other than gzipped MVT. Rendering z0/0/0 exercises all of it
+    // against the one tile any complete archive must contain, and it is the
+    // cheapest tile in the file.
+    //
+    // The point of doing it *here* is what it rules out. A device that draws
+    // the world knows its card is good, so anything that goes wrong later is
+    // the network or the sky. A device that does not knows the opposite,
+    // without having spent forty seconds on a radio to find out.
+    {
+        bootStepBusy("checking the map archive");
+        map_world_check_start();
+        uint32_t t0 = millis();
+        while (map_world_check_state() == TILE_PENDING && millis() - t0 < 15000)
+            delay(50);
+
+        tile_state_t w = map_world_check_state();
+        if (w == TILE_READY) {
+            char m[64];
+            snprintf(m, sizeof m, "archive readable (world in %lu ms)",
+                     (unsigned long)(millis() - t0));
+            bootStep(m);
+            // Centred on the boot screen, above the list, at a size that
+            // reads as a globe rather than a thumbnail.
+            if (g_panelOk) {
+                int side = M5.Display.height() / 3;
+                map_world_check_draw(M5.Display.width() / 2,
+                                     M5.Display.height() / 3, side);
+            }
+        } else if (w == TILE_NODATA) {
+            bootStepFail("archive has no z0 tile - is it complete?");
+        } else if (w == TILE_PENDING) {
+            bootStepFail("archive check timed out - card may be slow");
+        } else {
+            bootStepFail("archive unreadable - check the card");
+        }
+        // Whatever the answer, carry on. A missing z0 does not stop the tiles
+        // the user actually travels over from drawing, and refusing to boot
+        // on it would turn a diagnostic into an outage.
     }
     // The magnetometer, for a heading that exists while standing still.
     //

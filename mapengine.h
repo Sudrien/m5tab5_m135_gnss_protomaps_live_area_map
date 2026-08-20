@@ -127,6 +127,22 @@ void map_seed_position(double lat, double lon);
 bool map_has_anchor();
 bool map_has_picture();
 
+// ---- world check -----------------------------------------------------------
+// Render z0/0/0 - the whole earth in one tile - as an end-to-end proof that
+// the archive on the card is readable, before anything touches the radio.
+//
+// map_begin() succeeding only proves the header parsed. This exercises the
+// whole path against the one tile any complete archive must contain, so a
+// failure here is unambiguously the card and not the network.
+//
+// Start it, poll the state (TILE_PENDING until the worker answers, then
+// TILE_READY, TILE_NODATA or TILE_ERROR), optionally draw it centred at
+// (cx, cy) at `size` pixels, then free the buffer.
+void         map_world_check_start();
+tile_state_t map_world_check_state();
+bool         map_world_check_draw(int cx, int cy, int size);
+void         map_world_check_free();
+
 // False until a measured position has been seen this session. The status bar
 // uses it to explain why a perfectly good map has nothing on it.
 bool map_marker_valid();

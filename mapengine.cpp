@@ -522,6 +522,29 @@ static tile_state_t render_tile(tile_id_t id, uint16_t *px, int size, int split)
 #endif
 static const uint8_t PLACE_SLOT = 0xFD;    // sentinel job slot
 
+// ---- world check -----------------------------------------------------------
+// z0/0/0: the whole earth in one tile, rendered once at boot as an end-to-end
+// proof that the archive is readable.
+//
+// Every other "map ready" signal is partial. map_begin() opening the file
+// proves the header parsed and nothing more; the first grid tile proves one
+// leaf of one directory at one zoom. This exercises the entire path - open,
+// root directory, tile entry, gzip inflate, MVT decode, rasterise - against
+// the one tile that is guaranteed present in any complete archive, and does
+// it before the radio is touched. So a device that draws the world knows its
+// card is good, and a device that does not knows the problem is the card
+// rather than the network it has not yet tried.
+//
+// z0 is also the cheapest tile in the file: a handful of coastline polygons,
+// no buildings, no labels worth the name.
+static const uint8_t WORLD_SLOT = 0xFC;    // sentinel job slot
+
+// Rendered into its own buffer rather than the overview's, because the
+// overview is requested moments later for a completely different tile and one
+// would overwrite the other. Freed as soon as the boot screen is done with it.
+static uint16_t *g_world_px = nullptr;
+static volatile tile_state_t g_world_state = TILE_PENDING;
+
 // Nine z12 tiles of a dense metro carry a lot of named points, and unlike the
 // per-subtile sets these are searched rather than drawn, so the cap only has
 // to be generous enough not to lose the one nearest you.
@@ -687,6 +710,23 @@ static void worker_task(void *arg) {
             // from a truncated list.
             if (ok && scratch->n >= PLACE_INDEX_MAX)
                 Serial.println("map: place index is full - raise PLACE_INDEX_MAX");
+            continue;
+        }
+
+        if (job.slot == WORLD_SLOT) {
+            uint64_t t0 = esp_timer_get_time();
+            // No labels: this is a legibility test for the archive, not for
+            // the reader, and place names at z0 are a dozen continents.
+            w_label_dst = nullptr;
+            tile_state_t res = g_world_px
+                ? render_tile(job.id, g_world_px, COARSE_PX, 0)
+                : TILE_ERROR;
+            g_world_state = res;
+            Serial.printf("map: world tile z0 %s in %lu ms\n",
+                          res == TILE_READY  ? "rendered" :
+                          res == TILE_NODATA ? "MISSING from the archive"
+                                             : "FAILED to decode",
+                          (unsigned long)((esp_timer_get_time() - t0) / 1000));
             continue;
         }
 
@@ -1472,6 +1512,54 @@ bool map_place_text(char *out, size_t cap) {
 //
 // setup() uses this to decide when the map has appeared, so the slow parts of
 // bring-up can be ordered behind it rather than in front of it.
+// ---- world check, public side ----------------------------------------------
+void map_world_check_start() {
+    if (g_world_px) return;                    // already running or done
+    g_world_px = (uint16_t *)ps_malloc((size_t)COARSE_PX * COARSE_PX * 2);
+    if (!g_world_px) {
+        Serial.println("map: no PSRAM for the world check - skipping it");
+        g_world_state = TILE_ERROR;
+        return;
+    }
+    g_world_state = TILE_PENDING;
+
+    render_job_t j;
+    j.id = (tile_id_t){ 0, 0, 0 };
+    j.slot = WORLD_SLOT;
+    j.generation = 0;                          // no grid slot, nothing to stale
+    // To the front: this is the answer the boot screen is waiting on, and a
+    // palette switch may already have queued a screenful of work behind it.
+    xQueueSendToFront(g_jobs, &j, 0);
+}
+
+tile_state_t map_world_check_state() { return g_world_state; }
+
+bool map_world_check_draw(int cx, int cy, int size) {
+    if (g_headless || !g_world_px) return false;
+    if (g_world_state != TILE_READY) return false;
+    if (size > COARSE_PX) size = COARSE_PX;
+
+    // Nearest-neighbour down to whatever the caller asked for. This is on
+    // screen for a couple of seconds during boot; a resampling pass over it
+    // would cost more than it could possibly buy.
+    const uint32_t step = ((uint32_t)COARSE_PX << 16) / (uint32_t)size;
+    static uint16_t row[COARSE_PX];
+    for (int y = 0; y < size; y++) {
+        const uint16_t *src = g_world_px
+                            + (size_t)((y * step) >> 16) * COARSE_PX;
+        uint32_t sx = 0;
+        for (int x = 0; x < size; x++, sx += step) row[x] = src[sx >> 16];
+        M5.Display.pushImage(cx - size / 2, cy - size / 2 + y, size, 1, row);
+    }
+    return true;
+}
+
+void map_world_check_free() {
+    if (!g_world_px) return;
+    free(g_world_px);
+    g_world_px = nullptr;
+}
+
 bool map_has_picture() {
     if (!g_centred) return false;
     bool any = false;
