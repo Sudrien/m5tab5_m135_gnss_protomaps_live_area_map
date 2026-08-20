@@ -3786,7 +3786,37 @@ void loop() {
         drawPinPanel(view);
     }
 
-    vTaskDelay(pdMS_TO_TICKS(5));
+    // Loop cadence.
+    //
+    // 5 ms - about 200 Hz - is what a screen being composited at 15 fps wants:
+    // it keeps touch latency below one frame and gives map_draw() a fresh
+    // chance to notice a tile commit. With the screen off none of that is
+    // being asked for. The panel is dark, map_set_visible(false) has already
+    // stopped the renderer drawing, and drawStatus() and drawFooter() both
+    // return at their first line - so the pass reduces to polling things that
+    // poll themselves.
+    //
+    // It is not free even so. Every pass is an M5.update(), which is an I2C
+    // transaction to the touch controller, plus a fix copied under a mutex and
+    // a walk of the poll functions. At 200 Hz, for hours, with nothing on
+    // screen, that is the second-largest thing the device does while asleep
+    // after the receiver.
+    //
+    // 50 ms is chosen against the one thing that still has to work: the wake
+    // tap. screenOff() draws a target in the middle ninth and inWakeZone()
+    // wants a deliberate flat-handed press there, which lasts far longer than
+    // a 20 Hz sample can miss - and the same 50 ms is still inside the 100 ms
+    // gate compass_update() applies internally, so the magnetometer log keeps
+    // its cadence rather than thinning out. Everything else in the pass -
+    // batteryPoll at 1 Hz, gnssRatePolicy, ntpPolicy, maglog_poll,
+    // wifiloc_poll - already rate-limits itself well below 20 Hz.
+    //
+    // What deliberately does not change: GNSS runs in its own task, the render
+    // worker keeps fetching tile bytes into the card cache, and the watchdog
+    // is fed at the top of every pass with 30 s of headroom against a 20 Hz
+    // rate. Driving through a town with the display asleep still ends with the
+    // corridor cached, which is the property screenOff() was built around.
+    vTaskDelay(pdMS_TO_TICKS(g_screenOff ? 50 : 5));
 }
 
 #endif  // MAP_M5_SMOKE_TEST
