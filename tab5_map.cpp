@@ -623,9 +623,75 @@ static void drawButton(int i, const char *label, uint16_t bg) {
     M5.Display.setTextDatum(top_left);
 }
 
+// ---- footer repaint gate ---------------------------------------------------
+// The footer used to recompose and push all nine buttons on every pass, at
+// 15 Hz, for a row whose content changes on the order of once a minute.
+//
+// That is not the cheap operation the call site makes it look like. Each
+// button is a fillSprite, a fillRoundRect, a drawRoundRect, a drawString and
+// then a *colour-keyed* pushSprite - and the key is what costs: the sprite
+// cannot go out as one block transfer, because every pixel has to be tested
+// against KEY to decide whether it is written at all. Nine buttons of
+// 116x54 is about 56k of those decisions per pass, 845k per second, to put
+// back a row of pixels that were already correct.
+//
+// So the buttons are composed into a table first and pushed only where the
+// table differs from what is on the panel. A single button changing - the
+// prefetch percentage ticking, the wifi count moving - now costs one
+// pushSprite rather than nine.
+//
+// The 2 s heartbeat is the same belt-and-braces drawStatus() uses, and is
+// here for the same reason: the footer shares the bottom of the panel with
+// everything that calls fillScreen() - screenOff, screenOn, pinPanelClose,
+// confirmFormat, the boot screens, the portal - and a cache that trusted
+// itself completely would show a blank strip until the content happened to
+// change. Bounding the staleness at two seconds is worth far more than the
+// last 3% of the saving, and unlike an explicit invalidate() it cannot fall
+// out of step with a fillScreen added later.
+struct FooterBtn {
+    char     label[40];   // matches the widest call-site buffer below
+    uint16_t bg;
+};
+static FooterBtn g_btnWant[BTN_COUNT];
+static FooterBtn g_btnShown[BTN_COUNT];
+static bool      g_btnShownValid = false;
+static uint32_t  g_btnLastDraw   = 0;
+
+// Compose one button into the table. Same signature as drawButton() so the
+// call sites below read unchanged.
+static void setButton(int i, const char *label, uint16_t bg) {
+    if (i < 0 || i >= BTN_COUNT) return;
+    snprintf(g_btnWant[i].label, sizeof g_btnWant[i].label, "%s", label);
+    g_btnWant[i].bg = bg;
+}
+
+static void flushButtons() {
+    // Past the heartbeat everything is redrawn, whether or not it changed.
+    bool all = !g_btnShownValid || (millis() - g_btnLastDraw > 2000);
+
+    bool any = false;
+    for (int i = 0; i < BTN_COUNT; i++) {
+        if (!all &&
+            g_btnWant[i].bg == g_btnShown[i].bg &&
+            strcmp(g_btnWant[i].label, g_btnShown[i].label) == 0) continue;
+        drawButton(i, g_btnWant[i].label, g_btnWant[i].bg);
+        g_btnShown[i] = g_btnWant[i];
+        any = true;
+    }
+    if (all || any) {
+        g_btnLastDraw   = millis();
+        g_btnShownValid = true;
+    }
+}
+
 static void drawFooter(const GnssFix &fix) {
     if (!g_panelOk) return;   // no display attached
-    if (g_screenOff) return;
+    // Forgetting here rather than in screenOff() is what makes waking
+    // immediate: the screen going off is always followed by a fillScreen and
+    // then by this early return, so clearing the cache on the way out means
+    // the first pass after screenOn() redraws the row at once instead of
+    // waiting out the heartbeat with a blank strip at the bottom.
+    if (g_screenOff) { g_btnShownValid = false; return; }
 
     bool armed = (millis() < g_confirmUntil);
     bool busy  = map_prefetch_busy();
@@ -652,7 +718,7 @@ static void drawFooter(const GnssFix &fix) {
     else            snprintf(label, sizeof label, "cache%dk",
                              (int)(((2 * PREFETCH_RADIUS + 1) * 40075.0
                                     * 0.74 / (1 << DATA_ZOOM_OF(Z_FLOOR)))));
-    drawButton(BTN_CACHE, label,
+    setButton(BTN_CACHE, label,
                busy  ? TFT_DARKGREY :
                held  ? M5.Display.color565(30, 90, 50) :
                armed ? TFT_ORANGE   :
@@ -665,14 +731,14 @@ static void drawFooter(const GnssFix &fix) {
     const char *tl = g_themeMode == THEME_DAY   ? "day"
                    : g_themeMode == THEME_NIGHT ? "night"
                    : (map_is_dark() ? "auto:nite" : "auto:day");
-    drawButton(BTN_THEME, tl,
+    setButton(BTN_THEME, tl,
                g_themeMode == THEME_AUTO ? M5.Display.color565(60, 90, 60)
                                          : M5.Display.color565(70, 70, 90));
 
     // Labels are an overlay, so this is genuinely instant - there is no
     // "re-rendering" state to show, unlike the theme button.
     bool lab = map_labels_on();
-    drawButton(BTN_POI, lab ? "labels" : "no labels",
+    setButton(BTN_POI, lab ? "labels" : "no labels",
                lab ? M5.Display.color565(60, 80, 110)
                    : M5.Display.color565(70, 70, 70));
 
@@ -690,7 +756,7 @@ static void drawFooter(const GnssFix &fix) {
         } else {
             snprintf(pl, sizeof pl, "pins (%d)", wp_count());
         }
-        drawButton(BTN_PINS, pl,
+        setButton(BTN_PINS, pl,
                    t >= 0 ? M5.Display.color565(150, 60, 30)
                           : M5.Display.color565(70, 70, 70));
     }
@@ -705,7 +771,7 @@ static void drawFooter(const GnssFix &fix) {
         else if (!maglog_available()) snprintf(ml, sizeof ml, "mag: -");
         else if (!maglog_enabled())   snprintf(ml, sizeof ml, "mag off");
         else snprintf(ml, sizeof ml, "mag %lu", (unsigned long)maglog_rows());
-        drawButton(BTN_MAG, ml,
+        setButton(BTN_MAG, ml,
                    (compass_ok() && maglog_enabled())
                        ? M5.Display.color565(60, 80, 110)
                        : M5.Display.color565(70, 70, 70));
@@ -722,7 +788,7 @@ static void drawFooter(const GnssFix &fix) {
         else if (compass_calibrating())  snprintf(cl, sizeof cl, "cal %d%%",
                                                   compass_calibrate_progress());
         else snprintf(cl, sizeof cl, "%s", compass_status());
-        drawButton(BTN_CAL, cl,
+        setButton(BTN_CAL, cl,
                    compass_calibrating() ? TFT_ORANGE
                                          : M5.Display.color565(70, 70, 70));
     }
@@ -743,7 +809,7 @@ static void drawFooter(const GnssFix &fix) {
         else if (!wifiloc_enabled()) snprintf(wl, sizeof wl, "wifi off");
         else if (g_estimated)        snprintf(wl, sizeof wl, "~%d AP", wifiloc_used());
         else snprintf(wl, sizeof wl, "wifi %lu", (unsigned long)wifiloc_entries());
-        drawButton(BTN_WIFI, wl,
+        setButton(BTN_WIFI, wl,
                    g_estimated ? M5.Display.color565(150, 100, 20)
                    : wifiloc_enabled() ? M5.Display.color565(60, 80, 110)
                                        : M5.Display.color565(70, 70, 70));
@@ -755,12 +821,14 @@ static void drawFooter(const GnssFix &fix) {
     // blend into the row.
     {
         bool panned = map_panning();
-        drawButton(BTN_HOME, panned ? "recentre" : "centred",
+        setButton(BTN_HOME, panned ? "recentre" : "centred",
                    panned ? M5.Display.color565(150, 60, 30)
                           : M5.Display.color565(70, 70, 70));
     }
 
-    drawButton(BTN_SLEEP, "screen off", M5.Display.color565(70, 70, 70));
+    setButton(BTN_SLEEP, "screen off", M5.Display.color565(70, 70, 70));
+
+    flushButtons();
 }
 
 // Panning is dropped when the screen goes off. Waking to a map of somewhere
@@ -899,6 +967,7 @@ static void pinPanelClose() {
     // trap the wifi portal leaves behind on the cache button.
     M5.Display.fillScreen(style_background());
     map_invalidate();
+    g_btnShownValid = false;      // ...and the footer cache believes otherwise
 }
 
 static void drawPinPanel(const GnssFix &fix) {
@@ -1258,6 +1327,7 @@ static void handleTouch(const GnssFix &fix) {
             // until something else happens to move.
             M5.Display.fillScreen(style_background());
             map_invalidate();
+            g_btnShownValid = false;
             break;
         }
         if (millis() < g_confirmUntil) {
