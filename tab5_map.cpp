@@ -1325,6 +1325,10 @@ static void bootStepBusy(const char *msg)      { bootStepEx(msg, true, true); }
 
 static void bootEnd() {
     if (!g_panelOk) return;   // no display attached
+    // Idempotent: setup() now hands the screen over as soon as the map has
+    // something to show, and again at the end for the paths that never got
+    // that far. A second fillScreen would wipe a map that is already up.
+    if (!g_bootActive) return;
     g_bootActive = false;
     M5.Display.fillScreen(style_background());
 }
@@ -3115,56 +3119,12 @@ void setup() {
 
     // WiFi is optional: the map runs entirely offline from the local archive.
     // Setup is only forced when asked for, or when there is nothing stored.
+    // The touch window stays here, at the front: it is the user's two seconds
+    // and it must not move behind thirty seconds of other work.
     wifistore_diag();
 
     bootStepBusy("touch now to force wifi setup");
     bool forced = wantsSetup();
-
-    bootStepBusy("starting wifi radio");
-    bool radio = wifiRadioUp();
-    if (radio) bootStep("wifi radio ready"); else bootStepFail("wifi radio unavailable");
-
-    if (!radio) {
-        Serial.println("wifi: radio unavailable, continuing offline");
-    } else if (forced || !wifistore_exists()) {
-        Serial.println(forced ? "wifi: setup forced by touch"
-                              : "wifi: no stored credential, starting portal");
-        if (g_panelOk) M5.Display.fillScreen(TFT_BLACK);
-        if (!portal_run(300000))
-            Serial.println("wifi: portal exited without saving");
-    } else {
-        bootStepBusy("connecting to wifi");
-        if (connectWifi(12000)) {
-            char m[64];
-            snprintf(m, sizeof m, "wifi %s", WiFi.localIP().toString().c_str());
-            bootStep(m);
-        } else {
-            // A stored credential that does not connect is usually a network
-            // that is out of range, not a wrong password - and this device is
-            // built to work without one: the world floor is on the card and
-            // the tile cache is thousands of tiles deep.
-            //
-            // Forcing the setup portal here made an offline boot impossible.
-            // It took over the screen for five minutes to ask a question the
-            // user had already answered, when the right behaviour was to carry
-            // on and draw the map. The portal is still one button away, and
-            // the "set up wifi" label appears on it whenever there is no
-            // connection.
-            //
-            // A credential that is genuinely wrong still reaches the portal;
-            // it just costs a deliberate tap rather than every boot out of
-            // range.
-            bootStepFail("wifi unreachable - continuing offline");
-            Serial.println("wifi: stored network not reachable, staying offline "
-                           "(cached tiles still draw; use the button to set up wifi)");
-        }
-    }
-    // No fillScreen here. This used to clear the boot list into the map
-    // background colour halfway through startup - a flat near-white field with
-    // the remaining boot lines drawn onto black strips, held for the thirty
-    // seconds it takes to get a fix, then flipped to the night palette in one
-    // step. The boot screen stays black until bootEnd(), which now paints the
-    // background once, in the colour themeBoot() has already chosen.
 
     // GNSS first, and at high priority: the FIFO overflows if the drain is
     // starved, and the renderer will happily saturate its core.
@@ -3205,14 +3165,6 @@ void setup() {
         snprintf(m, sizeof m, "map ready, %dpx tiles, z%d+", SUBTILE_PX, Z_FLOOR);
         bootStep(m);
     }
-    // Kick off the world floor if it has never been stored. It runs in the
-    // background and survives being interrupted, so there is no reason to
-    // hold up startup for it.
-    if (WiFi.status() == WL_CONNECTED && !netsource_world_ready()) {
-        bootStep("storing world floor in background");
-        map_world_floor_start();
-    }
-
     // The magnetometer, for a heading that exists while standing still.
     //
     // After M5.begin() and not before: bringing it up means driving EXT_5V on
@@ -3235,11 +3187,6 @@ void setup() {
     // the thing that is missing, and after the card is mounted so a first row
     // has somewhere to go.
     maglog_begin();
-
-    // The Wi-Fi centroid database. After the radio attempt above, so a failed
-    // C6 link is already logged and this does not look like the thing that
-    // failed, and after the card so the database has somewhere to persist.
-    wifiloc_begin();
 
     // The saved-point list, off the same card. Read here rather than lazily:
     // the first map_draw asks for it, and that runs on the UI task while the
@@ -3267,8 +3214,110 @@ void setup() {
         if (lastFixLoad(&slat, &slon)) map_seed_position(slat, slon);
     }
 
+    // Wait for the map to appear before touching the radio.
+    //
+    // This is the whole point of the ordering above. Bringing the C6 up costs
+    // about five seconds and a scan another three, and joining a network
+    // another eleven; none of it is needed to draw a map that is already on
+    // the card. Doing it first meant the screen sat on a boot list for twenty
+    // seconds while the one thing the device exists to show was waiting behind
+    // a network it does not require.
+    //
+    // Bounded, and two ways. A device with no remembered position has nothing
+    // to render, so there is nothing to wait for - map_has_anchor() says so
+    // and this returns at once. And a first render is slow: the overview alone
+    // has been measured at over five seconds on this part, so the deadline is
+    // generous rather than tight, and expiring it is not a failure. Either way
+    // the radio work below still happens.
+    if (map_has_anchor()) {
+        bootStep("drawing the last known area");
+
+        // The boot list has served its purpose; hand the screen over now so
+        // the map appears as it is rendered rather than after the wait.
+        bootEnd();
+
+        uint32_t t0 = millis();
+        while (!map_has_picture() && millis() - t0 < 12000) {
+            M5.update();
+            GnssFix f; gnss_get(&f);
+            map_draw(f);
+            drawStatus(f);
+            delay(50);
+        }
+        // One pass after the picture lands, so the first frame is on the
+        // panel before the radio work below starts competing for the bus.
+        {
+            GnssFix f; gnss_get(&f);
+            map_draw(f);
+            drawStatus(f);
+        }
+        Serial.printf("boot: first picture after %lu ms%s\n",
+                      (unsigned long)(millis() - t0),
+                      map_has_picture() ? "" : " (gave up waiting)");
+    }
+
+
+
+    // ---- radio, now that the map is up ------------------------------------
+    // Everything from here needs the C6, and none of it is needed to draw.
+    bootStepBusy("starting wifi radio");
+    bool radio = wifiRadioUp();
+    if (radio) bootStep("wifi radio ready"); else bootStepFail("wifi radio unavailable");
+
+    if (!radio) {
+        Serial.println("wifi: radio unavailable, continuing offline");
+    } else if (forced || !wifistore_exists()) {
+        Serial.println(forced ? "wifi: setup forced by touch"
+                              : "wifi: no stored credential, starting portal");
+        if (g_panelOk) M5.Display.fillScreen(TFT_BLACK);
+        if (!portal_run(300000))
+            Serial.println("wifi: portal exited without saving");
+        // The portal painted over whatever was there, including a map that
+        // may already have been drawn above.
+        if (g_panelOk) M5.Display.fillScreen(style_background());
+        map_invalidate();
+    } else {
+        bootStepBusy("connecting to wifi");
+        if (connectWifi(12000)) {
+            char m[64];
+            snprintf(m, sizeof m, "wifi %s", WiFi.localIP().toString().c_str());
+            bootStep(m);
+        } else {
+            // A stored credential that does not connect is usually a network
+            // that is out of range, not a wrong password - and this device is
+            // built to work without one: the world floor is on the card and
+            // the tile cache is thousands of tiles deep.
+            //
+            // Forcing the setup portal here made an offline boot impossible.
+            // It took over the screen for five minutes to ask a question the
+            // user had already answered, when the right behaviour was to carry
+            // on and draw the map. The portal is still one button away, and
+            // the "set up wifi" label appears on it whenever there is no
+            // connection.
+            //
+            // A credential that is genuinely wrong still reaches the portal;
+            // it just costs a deliberate tap rather than every boot out of
+            // range.
+            bootStepFail("wifi unreachable - continuing offline");
+            Serial.println("wifi: stored network not reachable, staying offline "
+                           "(cached tiles still draw; use the button to set up wifi)");
+        }
+    }
+
+    // The Wi-Fi centroid database. After the radio attempt above, so a failed
+    // C6 link is already logged and this does not look like the thing that
+    // failed, and after the card so the database has somewhere to persist.
+    wifiloc_begin();
+
+    // Kick off the world floor if it has never been stored. It runs in the
+    // background and survives being interrupted, so there is no reason to
+    // hold up startup for it.
+    if (WiFi.status() == WL_CONNECTED && !netsource_world_ready()) {
+        bootStep("storing world floor in background");
+        map_world_floor_start();
+    }
+
     bootStepBusy("waiting for GPS fix");
-    delay(600);
 
     bootEnd();
     // 30 s: far longer than any legitimate operation in loop(), so this only

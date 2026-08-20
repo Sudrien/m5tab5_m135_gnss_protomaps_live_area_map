@@ -1463,6 +1463,30 @@ bool map_place_text(char *out, size_t cap) {
     return out[0] != 0;
 }
 
+// Is there anything on screen worth looking at yet?
+//
+// True once at least one grid slot holds pixels - a real render, or the
+// overview upscaled into it, which is what the user sees first and what makes
+// the wait for the rest tolerable. False when the grid has never been centred,
+// since then there is nothing to draw and nothing to wait for.
+//
+// setup() uses this to decide when the map has appeared, so the slow parts of
+// bring-up can be ordered behind it rather than in front of it.
+bool map_has_picture() {
+    if (!g_centred) return false;
+    bool any = false;
+    xSemaphoreTake(g_glock, portMAX_DELAY);
+    for (int i = 0; i < GRID_COUNT && !any; i++)
+        any = tile_drawable(g_grid.slots[i].state);
+    xSemaphoreGive(g_glock);
+    return any;
+}
+
+// True once the grid has an anchor, from a fix or from map_seed_position().
+// Without one there is nothing to render and waiting for a picture would
+// wait forever.
+bool map_has_anchor() { return g_centred; }
+
 void map_set_visible(bool visible) {
     bool was = g_visible;
     g_visible = visible;

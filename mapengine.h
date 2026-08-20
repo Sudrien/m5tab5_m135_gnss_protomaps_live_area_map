@@ -121,6 +121,12 @@ bool map_panning();
 // Ignored once a real position has arrived, so it is safe to call late.
 void map_seed_position(double lat, double lon);
 
+// Whether the grid has an anchor at all, and whether anything drawable has
+// landed in it yet. setup() orders the slow parts of bring-up behind the
+// second of these; see the comments there.
+bool map_has_anchor();
+bool map_has_picture();
+
 // False until a measured position has been seen this session. The status bar
 // uses it to explain why a perfectly good map has nothing on it.
 bool map_marker_valid();
