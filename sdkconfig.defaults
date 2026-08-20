@@ -130,7 +130,47 @@ CONFIG_TINYUSB_VENDOR_RX_BUFSIZE=512
 CONFIG_TINYUSB_VENDOR_TX_BUFSIZE=512
 CONFIG_TINYUSB_NCM_ENABLED=y
 CONFIG_TINYUSB_DEBUG_LEVEL=0
-CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+# ---- optimisation (deviation from the reference) ---------------------------
+# The reference sets OPTIMIZATION_SIZE, which is -Os for the whole firmware -
+# IDF, M5GFX, and this project's rasteriser alike. That is the wrong trade
+# here: the app partition is 3 MB (partitions.csv) and nothing has come near
+# it, while render_tile() is the single largest latency on the device at
+# roughly 1400 ms per 1280 px subtile.
+#
+# Measured on the rasteriser hot paths in isolation - one full-tile earth
+# polygon, 3000 buildings, 2500 stroked polylines at 1280 px, 8 reps:
+#
+#     -Os   clear 0.72 ms   polys 7.00 ms   roads 26.3 ms   total 34.5 ms
+#     -O2   clear 0.47 ms   polys 5.49 ms   roads 25.6 ms   total 31.5 ms
+#     -O3   clear 0.24 ms   polys 4.74 ms   roads 24.0 ms   total 29.0 ms
+#
+# Those are x86-64 numbers and so are a floor, not the expected result: they
+# were taken on an out-of-order core that hides much of what -Os gives up.
+# The P4 is in-order RV32, where inlining and unrolling are worth more, so
+# the gap on device should be wider. The `roads` column barely moves either
+# way because it is bounded by PSRAM traffic rather than by instruction
+# count - `polys`, at 22% faster, is the part that is actually CPU-bound and
+# the better guide to what the change buys.
+#
+# PERF is -O2. -O3 was not chosen globally: it is another 8% on the same
+# benchmark, but it applies to every component including ones this project
+# never profiled, and the extra size is spent on code that is not hot. If it
+# turns out to be wanted, the place for it is per-source in main/CMakeLists,
+# on raster.c / mvt.c / inflate.c only.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# Assertions stay ON, deliberately.
+#
+# Turning them off is the obvious companion to the above and it is declined
+# here: this firmware runs unattended in a vehicle, and the failures worth
+# catching on it - a heap corruption from the USB MSC transfer path, a
+# FreeRTOS invariant broken by the two-task grid handover - are exactly the
+# ones an assert converts from silent wrong behaviour into a core dump at
+# the point of the fault. The coredump partition exists for that.
+#
+# They are also not on the hot path. The rasteriser and the MVT decoder
+# contain no asserts of their own; what LEVEL=2 costs is inside IDF's heap
+# and FreeRTOS, which render_tile() calls once per tile, not once per pixel.
 CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_ENABLE=y
 CONFIG_COMPILER_ASSERT_NDEBUG_EVALUATE=y
 CONFIG_COMPILER_FLOAT_LIB_FROM_RVFPLIB=y
@@ -138,8 +178,26 @@ CONFIG_COMPILER_OPTIMIZATION_ASSERTION_LEVEL=2
 CONFIG_COMPILER_HIDE_PATHS_MACROS=y
 CONFIG_COMPILER_CXX_EXCEPTIONS=y
 CONFIG_COMPILER_CXX_EXCEPTIONS_EMG_POOL_SIZE=0
-CONFIG_COMPILER_STACK_CHECK_MODE_NORM=y
-CONFIG_COMPILER_STACK_CHECK=y
+
+# Stack protector off (deviation from the reference).
+#
+# -fstack-protector emits a canary load, store and compare in every function
+# holding a local array. In this project that is fill_quad(), which has three
+# of them - slo[], shi[] and eslope[4] - and which is called once per road
+# segment, thousands of times per tile. It is the most frequently entered
+# function in the firmware and the one place the per-call overhead is
+# actually visible.
+#
+# What it protects against is a local buffer overrun, and the arrays it would
+# be guarding here are fixed-size, indexed by loop counters bounded by
+# RS_SUBSAMPLES and by 4. The genuinely variable-length buffers in this
+# project - w_tile, w_mvt, w_pts, the coverage row - are all heap and so were
+# never covered by this in the first place; the bounds checks that do protect
+# them are written out explicitly in raster.c and mvt.c.
+#
+# To put it back while chasing a suspected overrun:
+#   idf.py -DCONFIG_COMPILER_STACK_CHECK_MODE_NORM=y build
+CONFIG_COMPILER_STACK_CHECK_MODE_NONE=y
 CONFIG_COMPILER_WARN_WRITE_STRINGS=y
 CONFIG_COMPILER_DISABLE_DEFAULT_ERRORS=y
 CONFIG_COMPILER_RT_LIB_GCCLIB=y
@@ -999,14 +1057,26 @@ CONFIG_LOG_BOOTLOADER_LEVEL_ERROR=y
 CONFIG_LOG_BOOTLOADER_LEVEL=1
 CONFIG_FLASHMODE_QIO=y
 CONFIG_MONITOR_BAUD=115200
-CONFIG_OPTIMIZATION_LEVEL_RELEASE=y
-CONFIG_COMPILER_OPTIMIZATION_LEVEL_RELEASE=y
-CONFIG_OPTIMIZATION_ASSERTIONS_ENABLED=y
-CONFIG_OPTIMIZATION_ASSERTION_LEVEL=2
-CONFIG_CXX_EXCEPTIONS=y
-CONFIG_CXX_EXCEPTIONS_EMG_POOL_SIZE=0
-CONFIG_STACK_CHECK_NORM=y
-CONFIG_STACK_CHECK=y
+# The two optimisation aliases that used to sit here are gone, and their
+# absence is the point of the change above rather than tidying up after it.
+#
+# This block is IDF v4 spellings kept for compatibility, and Kconfig resolves
+# them through components/.../sdkconfig.rename to the modern names:
+#
+#   CONFIG_OPTIMIZATION_LEVEL_RELEASE          -> COMPILER_OPTIMIZATION_SIZE
+#   CONFIG_COMPILER_OPTIMIZATION_LEVEL_RELEASE -> COMPILER_OPTIMIZATION_SIZE
+#   CONFIG_STACK_CHECK_NORM                    -> COMPILER_STACK_CHECK_MODE_NORM
+#
+# They are the same three settings this file already states near the top, in
+# their current spelling, and they appear *after* it. Setting PERF up there
+# and leaving these here would have resolved back to SIZE and to the stack
+# protector, silently, with the build reporting success and -Os still on
+# every object - which is a change that looks applied, measures as though it
+# was not, and gives nothing to grep for.
+#
+# The assertion and exception aliases are dropped with them for the same
+# reason: they are duplicates of lines already present above, and a second
+# copy of a setting is only ever a way for the two to disagree later.
 CONFIG_WARN_WRITE_STRINGS=y
 CONFIG_ESP32_APPTRACE_DEST_NONE=y
 CONFIG_ESP32_APPTRACE_LOCK_ENABLE=y
