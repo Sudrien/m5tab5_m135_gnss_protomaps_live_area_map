@@ -308,6 +308,23 @@ static int rl_part(void *ctx, const mvt_part_t *part) {
 
 // `split` is how many levels below id.z the data is taken from. The tile id
 // stays in display-zoom space; only the fetch and the source rectangle move.
+// The fetch half of render_tile(), without the drawing half.
+//
+// Deliberately a separate small function rather than a flag threaded through
+// render_tile: the two share only the quadrant arithmetic, and a render_tile
+// that sometimes did not render would have to be read very carefully at every
+// call site to know which it was doing.
+static tile_state_t prefetch_tile_bytes(tile_id_t id) {
+    uint8_t  dz = (uint8_t)(id.z - SUBTILE_SPLIT);
+    uint32_t dx = (uint32_t)(id.x >> SUBTILE_SPLIT);
+    uint32_t dy = (uint32_t)(id.y >> SUBTILE_SPLIT);
+
+    uint32_t got = TILE_CAP;
+    bool from_net = false;
+    if (!netsource_get(dz, dx, dy, w_tile, &got, &from_net)) return TILE_NODATA;
+    return got ? TILE_PENDING : TILE_NODATA;
+}
+
 static tile_state_t render_tile(tile_id_t id, uint16_t *px, int size, int split) {
     // One data tile covers 2^split subtiles per axis, so the id's low bits
     // select which quadrant of it this subtile shows.
@@ -628,6 +645,12 @@ static bool load_place_block(tile_id_t centre, PlaceIndex *out, uint32_t want) {
 }
 
 // ---- render worker ---------------------------------------------------------
+// Whether the screen is showing the map. Read by the compositor, which skips
+// drawing, and by the worker below, which skips rasterising. Declared here
+// rather than down with the compositing code because the worker needs it
+// first.
+static bool g_visible = true;
+
 static void worker_task(void *arg) {
     (void)arg;
     render_job_t job;
@@ -697,6 +720,34 @@ static void worker_task(void *arg) {
         uint32_t gen_now = g_grid.generation;
         xSemaphoreGive(g_glock);
         if (job.generation != gen_now) { g_stats.dropped++; continue; }
+
+        // Screen off: fetch the tile but do not draw it.
+        //
+        // These are two different things and only one of them is expensive.
+        // netsource_get() is what makes a tile *available* - it writes the
+        // MVT bytes into the cache on the card, and it is the half that
+        // cannot be repeated later, because the network it needed may be
+        // gone by the time anyone looks at the screen. Drive through a town
+        // with the display asleep and the corridor still ends up cached.
+        //
+        // Everything after it - inflate to as much as 192 KB, decode, and
+        // rasterise a million pixels - produces only pixels, and pixels are
+        // recomputable from the bytes just stored. That is the several
+        // hundred milliseconds per tile, and it is spent drawing something
+        // nobody can see.
+        //
+        // The slot keeps its id and generation and stays PENDING, which is
+        // honest: tile_drawable() is false for it, so nothing downstream will
+        // try to blit a buffer that was never filled. map_set_visible(true)
+        // re-queues these.
+        if (!g_visible) {
+            tile_state_t got = prefetch_tile_bytes(job.id);
+            xSemaphoreTake(g_glock, portMAX_DELAY);
+            grid_commit(&g_grid, &job, got == TILE_NODATA ? TILE_NODATA
+                                                          : TILE_PENDING);
+            xSemaphoreGive(g_glock);
+            continue;
+        }
 
         // Render into the spare buffer, never into the slot: the slot may be
         // showing a coarse placeholder that the UI task is blitting right now.
@@ -1362,7 +1413,7 @@ void map_set_zoom(uint8_t zoom, const GnssFix &fix) {
 }
 
 // ---- compositing -----------------------------------------------------------
-static bool g_visible = true;
+// g_visible is declared far above, next to the worker that also reads it.
 static bool g_force_redraw = true;
 
 // Anything that changes the image without changing the grid or the marker -
@@ -1413,8 +1464,55 @@ bool map_place_text(char *out, size_t cap) {
 }
 
 void map_set_visible(bool visible) {
+    bool was = g_visible;
     g_visible = visible;
-    if (visible) g_force_redraw = true;
+    if (!visible) return;
+
+    g_force_redraw = true;
+    if (was) return;
+
+    // Anything the worker fetched but did not draw while the screen was off
+    // is holding a slot with a correct id and no pixels. g_force_redraw only
+    // forces a repaint, not a re-render, so without this those slots would
+    // stay blank until the grid happened to shift far enough to touch them.
+    //
+    // Centre-first, matching grid_shift's ordering, so the tiles under the
+    // marker come back before the corners. The bytes are already on the card
+    // by now, so this is a local decode rather than a fetch - which is the
+    // point of having fetched them.
+    render_job_t jobs[GRID_COUNT];
+    int n = 0;
+
+    xSemaphoreTake(g_glock, portMAX_DELAY);
+    const int mid = GRID_N / 2;
+    for (int ring = 0; ring <= GRID_N && n < GRID_COUNT; ring++) {
+        for (int r = 0; r < GRID_N && n < GRID_COUNT; r++) {
+            for (int c = 0; c < GRID_N && n < GRID_COUNT; c++) {
+                int dr = r - mid; if (dr < 0) dr = -dr;
+                int dc = c - mid; if (dc < 0) dc = -dc;
+                int d = dr > dc ? dr : dc;
+                if (d != ring) continue;
+                int i = r * GRID_N + c;
+                if (tile_drawable(g_grid.slots[i].state)) continue;
+                jobs[n].id = g_grid.slots[i].id;
+                jobs[n].slot = (uint8_t)i;
+                jobs[n].generation = g_grid.slots[i].generation;
+                n++;
+            }
+        }
+    }
+    tile_id_t origin = g_grid.origin;
+    xSemaphoreGive(g_glock);
+
+    if (!n) return;
+
+    // The overview may have been dropped too, and it is what fills a slot
+    // while its real render is queued - without it the wake is blank rather
+    // than approximate.
+    ensure_coarse(origin);
+    enqueue(jobs, n);
+    Serial.printf("map: screen on, re-rendering %d slot%s from cache\n",
+                  n, n == 1 ? "" : "s");
 }
 
 void map_set_dark(bool dark) {

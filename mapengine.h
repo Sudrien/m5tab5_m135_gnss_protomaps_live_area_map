@@ -157,6 +157,16 @@ bool map_is_dark();
 
 // Suppress drawing entirely, for screen-off. The renderer and GNSS keep
 // running, so waking is instant and the position stays current.
+// Tell the engine whether the map is on screen.
+//
+// False does not stop the render worker: it stops it *drawing*. Tiles are
+// still fetched into the cache on the card, because that is the half that
+// depends on a network which may be gone later, while the pixels can always
+// be recomputed from bytes already stored. Slots fetched this way keep their
+// id and stay PENDING.
+//
+// True re-queues every slot that has no pixels, so the map comes back from
+// local cache rather than waiting for the grid to shift.
 void map_set_visible(bool visible);
 
 // Force the next map_draw to repaint. Needed after anything that alters the
