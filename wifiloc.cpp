@@ -12,11 +12,19 @@
 #include "storage.h"
 #include "mapengine.h"
 
-static const char *WIFILOC_PATH = "/wifiloc.db";
+static const char *WIFILOC_PATH = "/wifiloc.csv";
 
-// src: chosen. ASCII "WLC1", same reasoning as LASTFIX_MAGIC and AOP_MAGIC -
-// a file whose first four bytes are junk must be rejected rather than parsed.
-static const uint32_t WIFILOC_MAGIC = 0x574C4331u;
+// The binary predecessor. Its records keyed on a hash of the BSSID, and a
+// hash cannot be turned back into an address, so there is nothing to migrate -
+// the survey has to be rebuilt. Named here only so startup can say that
+// rather than leaving an orphan file with no explanation.
+static const char *WIFILOC_OLD_PATH = "/wifiloc.db";
+
+// First line of the file, verbatim. Serves the purpose the magic number did:
+// a file whose first line is not this one is not ours and must be refused
+// rather than parsed.
+static const char *WIFILOC_HEADER =
+    "bssid,obs,lat,lon,min_lat,max_lat,min_lon,max_lon,best_rssi,mobile";
 
 // 16384 records at 48 bytes is 768 KB of PSRAM, and 16384 access points is a
 // lot of travel - several hundred kilometres of ordinary urban driving. The
@@ -70,7 +78,7 @@ static const uint32_t WIFILOC_STALE_MS  = 60000;
 static const int8_t WIFILOC_MIN_RSSI = -88;
 
 struct ApRec {
-    uint64_t id;                 // hash of the BSSID; never the BSSID itself
+    uint64_t id;                 // the BSSID itself, big-endian in the low 48 bits
     uint32_t n;                  // observations folded in
     double   sum_lat, sum_lon;   // running sums, divided on read
     float    min_lat, max_lat;   // extent, for the mobility test
@@ -123,15 +131,29 @@ static const uint32_t WIFILOC_WRITE_DIRTY = 400;
 // WiFi.scanComplete() then returns "running" forever.
 static const uint32_t WIFILOC_SCAN_TIMEOUT_MS = 15000;
 
-// FNV-1a over the six address bytes. Not a security hash and not claimed as
-// one: the address space is 2^48 and an attacker with the file could brute
-// force it. It is here so the file is not a directly usable list of networks,
-// which is a meaningful difference in what a lost card discloses, not a
-// guarantee about what could be recovered from one.
-static uint64_t bssid_hash(const uint8_t *b) {
-    uint64_t h = 1469598103934665603ULL;
-    for (int i = 0; i < 6; i++) { h ^= b[i]; h *= 1099511628211ULL; }
-    return h;
+// The six address bytes packed big-endian into the low 48 bits of a uint64_t,
+// so the existing linear find() and the ApRec layout are unchanged.
+//
+// This used to be an FNV-1a hash, on the reasoning that a lost card should not
+// yield a directly usable list of networks. That reasoning did not survive
+// looking at the rest of the volume: /maglog.csv is a plaintext per-second
+// track log with lat, lon and UTC, /waypoints.bin holds named saved places,
+// and /wifi.bin holds the credential for the home network. Obscuring the AP
+// table while those sit beside it protected nothing that was not already
+// disclosed, and it cost the one thing the raw address is needed for -
+// comparing the top five bytes, which is how co-located virtual BSSIDs on a
+// single radio are recognised.
+//
+// Anyone who cares about the disclosure should delete the files or encrypt
+// the volume; per-file obfuscation was the wrong layer for it.
+static uint64_t bssid_pack(const uint8_t *b) {
+    uint64_t v = 0;
+    for (int i = 0; i < 6; i++) v = (v << 8) | b[i];
+    return v;
+}
+
+static void bssid_unpack(uint64_t v, uint8_t *b) {
+    for (int i = 5; i >= 0; i--) { b[i] = (uint8_t)(v & 0xFF); v >>= 8; }
 }
 
 // Metres per degree, good enough for the spread tests at any latitude the
@@ -172,32 +194,85 @@ void wifiloc_begin() {
         return;
     }
     if (!fs->exists(WIFILOC_PATH)) {
-        Serial.println("wifiloc: no database yet, starting empty");
+        if (fs->exists(WIFILOC_OLD_PATH))
+            Serial.printf("wifiloc: %s is the old hashed format and cannot be "
+                          "converted - delete it; the survey rebuilds itself\n",
+                          WIFILOC_OLD_PATH);
+        else
+            Serial.println("wifiloc: no database yet, starting empty");
         return;
     }
 
     File f = fs->open(WIFILOC_PATH, FILE_READ);
     if (!f) { Serial.println("wifiloc: cannot open the database"); return; }
 
-    uint32_t hdr[2] = { 0, 0 };
-    if (f.read((uint8_t *)hdr, sizeof hdr) != (int)sizeof hdr ||
-        hdr[0] != WIFILOC_MAGIC) {
+    // Read a line into `line`, returning false at end of file. Lines longer
+    // than the buffer are truncated and the remainder skipped, so one damaged
+    // line costs one record rather than desynchronising every record after it.
+    char line[192];
+    auto readLine = [&f, &line]() -> bool {
+        int n = 0;
+        if (!f.available()) return false;
+        while (f.available()) {
+            int c = f.read();
+            if (c < 0 || c == '\n') break;
+            if (c == '\r') continue;
+            if (n < (int)sizeof(line) - 1) line[n++] = (char)c;
+        }
+        line[n] = 0;
+        return true;
+    };
+
+    if (!readLine() || strncmp(line, WIFILOC_HEADER, strlen(WIFILOC_HEADER)) != 0) {
         f.close();
-        Serial.println("wifiloc: database header is not ours, ignoring it");
+        Serial.println("wifiloc: header line is not ours, ignoring the file");
         return;
     }
-    uint32_t n = hdr[1] > WIFILOC_MAX ? WIFILOC_MAX : hdr[1];
-    int got = f.read((uint8_t *)s_tab, sizeof(ApRec) * n);
+
+    uint32_t bad = 0;
+    while (s_count < WIFILOC_MAX && readLine()) {
+        if (!line[0]) continue;
+
+        unsigned b[6];
+        unsigned long obs;
+        double lat, lon, mnla, mxla, mnlo, mxlo;
+        int rssi, mob;
+
+        // %n at the end is not used; the field count is the whole check. A
+        // row that does not yield all sixteen values is not a record.
+        if (sscanf(line, "%2x:%2x:%2x:%2x:%2x:%2x,%lu,%lf,%lf,%lf,%lf,%lf,%lf,%d,%d",
+                   &b[0], &b[1], &b[2], &b[3], &b[4], &b[5], &obs,
+                   &lat, &lon, &mnla, &mxla, &mnlo, &mxlo, &rssi, &mob) != 15) {
+            bad++;
+            continue;
+        }
+        if (!obs) { bad++; continue; }
+
+        uint8_t addr[6];
+        for (int i = 0; i < 6; i++) addr[i] = (uint8_t)b[i];
+
+        ApRec *r = &s_tab[s_count++];
+        memset(r, 0, sizeof *r);
+        r->id = bssid_pack(addr);
+        r->n  = (uint32_t)obs;
+        // The file carries the mean, because a mean is the readable form and
+        // a running sum of ten thousand latitudes is not. The sum is what the
+        // arithmetic needs, so it is reconstructed here; the round trip costs
+        // less than the last decimal of a fix.
+        r->sum_lat = lat * (double)obs;
+        r->sum_lon = lon * (double)obs;
+        r->min_lat = (float)mnla; r->max_lat = (float)mxla;
+        r->min_lon = (float)mnlo; r->max_lon = (float)mxlo;
+        r->best_rssi = (int8_t)rssi;
+        r->mobile = mob ? 1 : 0;
+    }
     f.close();
 
-    // A short read means a truncated file - an interrupted write, most likely.
-    // Keeping whatever whole records arrived is right: every record is
-    // self-contained, so a partial file is a smaller database rather than a
-    // corrupt one.
-    s_count = (got > 0) ? (uint32_t)(got / (int)sizeof(ApRec)) : 0;
     Serial.printf("wifiloc: %lu access points loaded%s\n",
                   (unsigned long)s_count,
-                  (uint32_t)(got / (int)sizeof(ApRec)) != n ? " (file was short)" : "");
+                  bad ? " (some rows were unreadable and skipped)" : "");
+    if (bad) Serial.printf("wifiloc: %lu bad row%s\n",
+                           (unsigned long)bad, bad == 1 ? "" : "s");
 }
 
 bool wifiloc_available() { return s_available; }
@@ -238,11 +313,30 @@ void wifiloc_flush() {
     File f = fs->open(tmp, FILE_WRITE);
     if (!f) { Serial.println("wifiloc: cannot write the database"); return; }
 
-    uint32_t hdr[2] = { WIFILOC_MAGIC, s_count };
-    bool ok = f.write((const uint8_t *)hdr, sizeof hdr) == sizeof hdr;
-    if (ok && s_count)
-        ok = f.write((const uint8_t *)s_tab, sizeof(ApRec) * s_count)
-             == sizeof(ApRec) * s_count;
+    bool ok = f.println(WIFILOC_HEADER) > 0;
+
+    // Seven decimal places is about a centimetre, which is far finer than
+    // anything upstream of it - the point is that a round trip through the
+    // file changes nothing a later fold would notice, not that the position
+    // is known that well.
+    char row[192];
+    for (uint32_t i = 0; ok && i < s_count; i++) {
+        const ApRec *r = &s_tab[i];
+        if (!r->n) continue;
+        uint8_t b[6];
+        bssid_unpack(r->id, b);
+        int n = snprintf(row, sizeof row,
+                         "%02x:%02x:%02x:%02x:%02x:%02x,%lu,"
+                         "%.7f,%.7f,%.7f,%.7f,%.7f,%.7f,%d,%d",
+                         b[0], b[1], b[2], b[3], b[4], b[5],
+                         (unsigned long)r->n,
+                         r->sum_lat / r->n, r->sum_lon / r->n,
+                         (double)r->min_lat, (double)r->max_lat,
+                         (double)r->min_lon, (double)r->max_lon,
+                         (int)r->best_rssi, (int)r->mobile);
+        if (n < 0 || n >= (int)sizeof row) { ok = false; break; }
+        ok = f.println(row) > 0;
+    }
     f.close();
     if (!ok) { fs->remove(tmp); Serial.println("wifiloc: write failed"); return; }
 
@@ -260,7 +354,7 @@ static void learn(const GnssFix &fix, int n) {
         if (WiFi.RSSI(i) < WIFILOC_MIN_RSSI) continue;
         uint8_t *b = WiFi.BSSID(i);
         if (!b) continue;
-        uint64_t id = bssid_hash(b);
+        uint64_t id = bssid_pack(b);
 
         ApRec *r = find(id);
         if (!r) {
@@ -324,7 +418,7 @@ static void locate(int n) {
         uint8_t *b = WiFi.BSSID(i);
         if (!b) continue;
 
-        ApRec *r = find(bssid_hash(b));
+        ApRec *r = find(bssid_pack(b));
         if (!r || r->mobile || r->n < WIFILOC_MIN_OBS) continue;
 
         // Received power, linear. This is the whole weighting model: an AP

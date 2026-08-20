@@ -31,13 +31,25 @@
 // that are themselves biased onto the same roads, the shared bias partly
 // cancels in an average and does not cancel in a circle intersection.
 //
-// PRIVACY
-// BSSIDs are never stored. Each is reduced to a 64-bit hash on the way in, and
-// only the hash is written to the card. Matching works identically on hashes,
-// so nothing is lost - but the file cannot be turned back into a list of which
-// networks exist at which addresses, which is what a raw survey would be. The
-// positions in it are still a record of where the device has been; that part
-// is inherent, and the file is deletable.
+// THE FILE
+// /wifiloc.csv, plain text, one header line and one row per access point:
+//
+//   bssid,obs,lat,lon,min_lat,max_lat,min_lon,max_lon,best_rssi,mobile
+//
+// lat/lon are the centroid; the file carries the mean and the observation
+// count, and the running sums the arithmetic uses are reconstructed on load.
+//
+// BSSIDs are stored as they are heard. An earlier version hashed them, on the
+// reasoning that a lost card should not yield a usable list of networks - but
+// /maglog.csv beside it is a plaintext per-second track log with lat, lon and
+// UTC, /waypoints.bin holds named places, and /wifi.bin holds the credential
+// for the home network. The hash protected nothing the volume did not already
+// disclose, and it made the top five address bytes unavailable, which is what
+// distinguishes several virtual BSSIDs on one radio from several real APs.
+//
+// So: everything on this card is a record of where the device has been, and
+// this file is no different. If that matters, encrypt the volume or delete
+// the files; obfuscating one of them was the wrong layer for it.
 
 #ifndef WIFILOC_H
 #define WIFILOC_H
