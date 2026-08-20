@@ -174,11 +174,10 @@ static bool connectWifi(uint32_t timeout_ms) {
     if (WiFi.status() == WL_CONNECTED) {
         Serial.printf("wifi: connected, IP %s, RSSI %d dBm\n",
                       WiFi.localIP().toString().c_str(), WiFi.RSSI());
-        // Only the date matters, so no timezone is configured - everything
-        // downstream works in UTC. The sync is asynchronous; netsource polls
-        // for completion rather than blocking here.
-        configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-        Serial.println("wifi: SNTP requested");
+        // SNTP is deliberately NOT requested here. See ntpPolicy(): the
+        // receiver carries UTC itself, so the network clock is a fallback for
+        // when it has not produced one, not something to ask for on every
+        // join.
         return true;
     }
     Serial.printf("wifi: join failed, status %d\n", (int)WiFi.status());
@@ -1236,8 +1235,8 @@ static void handleTouch(const GnssFix &fix) {
             Serial.println("wifi: opening setup portal from button");
             wifiSetPins();
             portal_run(300000);
-            if (WiFi.status() == WL_CONNECTED)
-                configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+            // No configTime here either - ntpPolicy() owns that decision and
+            // will ask on the next loop if the receiver still has no date.
             // The portal painted over everything. Without this the engine
             // sees an unchanged view, unchanged tiles and an unchanged
             // marker, skips the repaint, and leaves a lit but empty screen
@@ -1663,6 +1662,57 @@ static uint32_t g_aopSavedAt = 0;
 static bool     g_aopRestored = false;   // assistance was pushed this boot
 static double   g_aopAgeHours = -1.0;    // age of what was pushed, -1 unknown
 static uint32_t g_gnssStartMs = 0;       // when the receiver got power
+
+// ---- network time ----------------------------------------------------------
+// SNTP is a fallback, not the default.
+//
+// Everything downstream needs a UTC date and nothing else: netsource uses it
+// for build discovery, and the sun calculation needs the day of the year. The
+// receiver supplies exactly that in every RMC sentence, for free, with no
+// network - and this device is built to work with no network at all.
+//
+// Asking for it on every join was harmless but wrong-headed: it spends a DNS
+// lookup and a round trip on something a receiver already searching will
+// answer by itself, and it means an offline boot silently behaves differently
+// from an online one for reasons unrelated to the map.
+//
+// So the request is deferred until both sources have had a fair chance, and
+// then made only if the receiver has not answered. "A fair chance" is measured
+// from g_gnssStartMs - when the receiver got power, which is what TTFF is also
+// measured from - rather than from boot; the grace is longer than an assisted
+// fix takes and
+// shorter than an unassisted cold start, which is the window where the network
+// is genuinely the faster answer.
+//
+// src: 45 s is a judgement, unattributed - see PROVENANCE.md. An assisted
+// first fix was measured at 27 s on this unit; a cold one can take minutes.
+static const uint32_t NTP_GRACE_MS = 45000;
+
+static bool g_ntpDecided = false;
+
+static void ntpPolicy(const GnssFix &fix) {
+    if (g_ntpDecided) return;
+
+    // The receiver got there first. Nothing further is needed - and saying so
+    // matters, because otherwise the absence of an SNTP line in the log looks
+    // like a failure rather than a decision.
+    if (fix.status == 'A' && fix.date[0]) {
+        g_ntpDecided = true;
+        Serial.println("time: UTC from GNSS, SNTP not needed");
+        return;
+    }
+
+    if (!g_gnssStartMs || millis() - g_gnssStartMs < NTP_GRACE_MS) return;
+
+    // Grace expired with no date from the sky. If there is a network, ask it.
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    g_ntpDecided = true;
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+    Serial.printf("time: no GNSS date after %lu s - requesting SNTP\n",
+                  (unsigned long)(NTP_GRACE_MS / 1000));
+}
+
 
 static void aopRestore() {
     fs::FS *fs = storage_fs();
@@ -3405,6 +3455,7 @@ void loop() {
     // enough to matter.
     if (gnss_coarse(fix)) compass_set_position(fix.lat, fix.lon);
     gnssRatePolicy(fix);
+    ntpPolicy(fix);
     maglog_poll(fix);
     wifiloc_poll(fix);
     // After wifiloc_poll, so the cross-check inside sees this second's
