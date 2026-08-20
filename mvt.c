@@ -316,8 +316,26 @@ static mvt_err_t decode_layer(mvt_decoder_t *d, const uint8_t *buf,
     layer.version = 1;
     layer.index   = index;
 
-    // Pass 1: header scalars. Protobuf permits any field order, so the name
-    // and extent may follow the features; scan the whole layer first.
+    // Pass 0: the name, and not one byte further than finding it needs.
+    //
+    // The filter is the whole reason this pass exists separately. render_tile()
+    // calls mvt_decode() once per entry in DRAW_ORDER - seven times over the
+    // same tile - because MVT stores layers alphabetically and that is not
+    // cartographic order. Six of those seven passes reject any given layer.
+    //
+    // Finding out that a layer is unwanted used to cost a walk of the layer's
+    // entire body, because the header scan below ran first and rd_skip()s past
+    // every feature to be sure the name was not sitting after them. On a tile
+    // with seven layers that is 49 whole-layer walks to draw seven, and on the
+    // dense layers - buildings, roads - a walk is two varints per feature over
+    // several thousand features, read from PSRAM.
+    //
+    // Splitting the name out lets a rejection cost only as much as reaching
+    // the name. Protobuf permits any field order and this makes no assumption
+    // about it: if the name really does follow the features the loop below
+    // walks just as far as the old one did, so the worst case is unchanged and
+    // the common one - every writer in practice emits field 1 first - is a
+    // couple of varints.
     {
         rd_t r = { buf, s, e, 0 };
         uint32_t f, wt;
@@ -327,7 +345,36 @@ static mvt_err_t decode_layer(mvt_decoder_t *d, const uint8_t *buf,
                 if (!rd_bytes(&r, &ns, &ne)) return MVT_EFORMAT;
                 layer.name = (const char *)buf + ns;
                 layer.name_len = ne - ns;
-            } else if (f == 5 && wt == WT_VARINT) {
+                break;
+            }
+            if (!rd_skip(&r, wt)) return MVT_EFORMAT;
+            if (r.bad) return MVT_EFORMAT;
+        }
+        // A layer with no name at all is left with name_len 0, which no
+        // filter matches - the same outcome as before, reached sooner.
+    }
+
+    if (d->layer_cb && !d->layer_cb(d->ctx, &layer)) return MVT_OK;
+    d->stat_layers++;
+
+    // Pass 1: the header scalars, for a layer that is actually being drawn.
+    //
+    // Only extent is load-bearing - rs_part() projects through it - and it can
+    // legally appear after the features, so this one does have to scan the
+    // whole layer. It is now paid once per drawn layer instead of once per
+    // (layer, DRAW_ORDER entry) pair.
+    //
+    // One behaviour change worth stating: a malformed field inside a layer
+    // nothing asked for no longer fails the decode. It used to, because this
+    // scan ran before the filter. Not reading a rejected layer is safe - the
+    // top-level walk in mvt_decode() already bounded its byte range through
+    // rd_bytes() - and a tile whose 'pois' layer is corrupt now draws its
+    // roads and buildings rather than coming back TILE_ERROR wholesale.
+    {
+        rd_t r = { buf, s, e, 0 };
+        uint32_t f, wt;
+        while (rd_key(&r, &f, &wt)) {
+            if (f == 5 && wt == WT_VARINT) {
                 layer.extent = (uint32_t)rd_varint(&r);
             } else if (f == 15 && wt == WT_VARINT) {
                 layer.version = (uint32_t)rd_varint(&r);
@@ -338,9 +385,6 @@ static mvt_err_t decode_layer(mvt_decoder_t *d, const uint8_t *buf,
         }
         if (layer.extent == 0) return MVT_EFORMAT;
     }
-
-    if (d->layer_cb && !d->layer_cb(d->ctx, &layer)) return MVT_OK;
-    d->stat_layers++;
 
     // Pass 2: find the index of the styling key.
     const char *skey = d->style_key ? d->style_key : "kind";
