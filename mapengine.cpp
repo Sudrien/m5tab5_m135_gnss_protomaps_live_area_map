@@ -539,9 +539,11 @@ static const uint8_t PLACE_SLOT = 0xFD;    // sentinel job slot
 // no buildings, no labels worth the name.
 static const uint8_t WORLD_SLOT = 0xFC;    // sentinel job slot
 
-// The render worker, kept so it can be held off the buses briefly. See
-// map_worker_pause().
-static TaskHandle_t g_worker = nullptr;
+// The render worker, kept so it can be held off the buses briefly, and the
+// two flags it parks on. See map_worker_pause().
+static TaskHandle_t  g_worker    = nullptr;
+static volatile bool g_pause_req = false;
+static volatile bool g_paused    = false;
 
 // Rendered into its own buffer rather than the overview's, because the
 // overview is requested moments later for a completely different tile and one
@@ -682,7 +684,17 @@ static void worker_task(void *arg) {
     (void)arg;
     render_job_t job;
     for (;;) {
-        if (xQueueReceive(g_jobs, &job, portMAX_DELAY) != pdTRUE) continue;
+        // Park here and nowhere else. Nothing is held at this point - no
+        // archive read is open, no grid lock is taken, no job is in flight -
+        // which is exactly what makes it safe to stop, and what vTaskSuspend
+        // could not guarantee from outside.
+        if (g_pause_req) {
+            g_paused = true;
+            while (g_pause_req) vTaskDelay(pdMS_TO_TICKS(20));
+            g_paused = false;
+        }
+
+        if (xQueueReceive(g_jobs, &job, pdMS_TO_TICKS(250)) != pdTRUE) continue;
 
         // The overview tile is rendered by the same worker, into its own
         // buffer. Nothing reads it while it is being drawn except the coarse
@@ -1588,16 +1600,33 @@ bool map_has_anchor() { return g_centred; }
 // measured at 47 ms with the worker idle and 4779 ms with it running - the
 // same enumeration, a hundred times slower, for tiles that were in no hurry.
 //
-// Suspension rather than a priority drop, because the contention is for the
-// buses rather than for the core; a lower-priority task still holds the SD
-// bus for the length of a read. The queue is untouched, so nothing is lost -
-// the work resumes where it stopped.
+// COOPERATIVE, AND IT HAS TO BE
+// This was vTaskSuspend() once, and that deadlocked the device every time.
+// Slot 0 (the card) and slot 1 (the co-processor) are the same sdmmc host
+// driver with one set of internal locks - the boot log says as much, with
+// "SDMMC host already initialized, skipping init flow" - so a worker
+// suspended in the middle of a read holds that lock and never gives it back.
+// Enumeration then waits on it forever and startup stops dead at
+// "Queues: Tx[20] Rx[20]".
+//
+// So the worker is asked to stand down and parks itself between jobs, where
+// it holds nothing. The queue is untouched and the in-flight tile is allowed
+// to finish; the caller waits for the acknowledgement, with a timeout, and
+// proceeds regardless if it does not come. Worst case is the contention this
+// was trying to avoid, which is a slow boot rather than no boot.
 void map_worker_pause() {
-    if (g_worker) vTaskSuspend(g_worker);
+    if (!g_worker || g_pause_req) return;
+    g_pause_req = true;
+    // A tile in flight can take several seconds on this part, and the whole
+    // point is to let it finish rather than to stop it mid-read.
+    uint32_t t0 = millis();
+    while (!g_paused && millis() - t0 < 8000) vTaskDelay(pdMS_TO_TICKS(20));
+    if (!g_paused)
+        Serial.println("map: worker did not park in time - continuing anyway");
 }
 
 void map_worker_resume() {
-    if (g_worker) vTaskResume(g_worker);
+    g_pause_req = false;
 }
 
 void map_set_visible(bool visible) {
@@ -1687,12 +1716,25 @@ void map_set_dark(bool dark) {
     // Nothing is lost by waiting. recentre_at() calls ensure_coarse() itself,
     // so the first overview is requested exactly once, for the tile the user
     // is actually near, in the palette already chosen by then.
-    if (g_centred) ensure_coarse(o);
-    enqueue(jobs, n);
+    // Both of these, for one reason: before the grid is centred it sits at
+    // z/0/0, and everything queued for it is of open ocean off west Africa,
+    // discarded the moment map_seed_position() centres it somewhere real.
+    //
+    // Gating only the overview was not enough. A boot log still showed
+    // "tile 14/0/0 -> READY [stale, dropped] (5560 ms)" - five and a half
+    // seconds rendering a grid tile that was stale before it finished, on top
+    // of the overview this had already stopped.
+    //
+    // recentre_at() queues the whole grid and the overview itself, so waiting
+    // costs nothing: the work happens once, for where the user is, in the
+    // palette chosen by then.
+    if (g_centred) {
+        ensure_coarse(o);
+        enqueue(jobs, n);
+    }
     g_force_redraw = true;
-    Serial.printf("map: switched to %s palette, re-rendering %d tiles%s\n",
-                  dark ? "night" : "day", n,
-                  g_centred ? "" : " (no overview yet - grid not centred)");
+    Serial.printf("map: switched to %s palette%s\n", dark ? "night" : "day",
+                  g_centred ? "" : " (nothing queued - grid not centred yet)");
 }
 
 bool map_is_dark() {

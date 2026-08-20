@@ -147,8 +147,15 @@ void         map_world_check_free();
 //
 // For the few seconds of something that needs those buses on a deadline -
 // SDIO enumeration of the Wi-Fi co-processor is the case this exists for,
-// where a busy worker turned 47 ms of card init into 4.8 s. The job queue is
-// untouched; work resumes where it stopped. Calls do not nest.
+// where a busy worker turned 47 ms of card init into 4.8 s.
+//
+// Cooperative: the worker parks between jobs, where it holds no lock and has
+// no read open. pause() blocks until it has, or gives up after a few seconds
+// and says so. It must not be done by suspending the task from outside -
+// slots 0 and 1 share one sdmmc driver, and a worker frozen mid-read holds
+// its lock forever, which hangs enumeration and the whole boot with it.
+//
+// The queue is untouched; work resumes where it stopped. Calls do not nest.
 void map_worker_pause();
 void map_worker_resume();
 
