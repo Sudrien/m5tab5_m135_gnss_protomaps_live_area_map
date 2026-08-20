@@ -1453,8 +1453,57 @@ static void update_place_names(double wx, double wy) {
     if (!pick[PL_HOOD]) g_place[PL_HOOD][0] = 0;
 }
 
+// Cleared by anything that changes what map_update() would decide from an
+// unchanged fix. See the memo in map_update() for why that is only three
+// callers rather than everything that moves the view.
+static bool g_upd_memo = false;
+
 void map_update(const GnssFix &fix) {
     if (!gnss_coarse(fix)) return;
+
+    // loop() calls this every pass - roughly 200 Hz - for an input that
+    // changes at between 1 Hz and 0.2 Hz, since gnssRatePolicy() runs the
+    // receiver at 1000, 2000 or 5000 ms. Everything below is a pure function
+    // of the position and the zoom, so the other 199 passes recompute an
+    // answer they already have.
+    //
+    // That is not free. merc_from_ll() is fmod, tan and asinh, and the P4's
+    // FPU is single precision only, so all three are software double routines
+    // out of libgcc. ensure_place_blocks() adds two pow() calls and
+    // update_place_names() scans both 160-entry indexes with distance maths.
+    //
+    // The memo is on the fix fields the work actually reads, not on a
+    // sequence number in the parser: the parser publishes once per NMEA
+    // *sentence*, several times per solution, so a counter there would still
+    // let identical positions through. Comparing the position itself is
+    // exact - and doubles compared for equality is the right test here
+    // precisely because these are copied, not computed: an unchanged fix is
+    // bit-identical, and a changed one differs in the last place at worst,
+    // which the heartbeat below catches.
+    //
+    // The 1 s heartbeat is what keeps liveness independent of movement, the
+    // same belt-and-braces used in drawStatus() and the footer. Two things
+    // below need calling again even when nothing has moved:
+    // ensure_place_blocks() retries a failed block read on a 20 s timer, and
+    // recentre() depends on archives that may mount after the fix stops
+    // changing. Bounding the staleness at a second costs one pass in ten and
+    // means neither has to be reasoned about.
+    {
+        static double   last_lat = 0, last_lon = 0;
+        static uint8_t  last_zoom = 0;
+        static char     last_status = 0;
+        static uint32_t last_ms = 0;
+
+        bool same = g_upd_memo &&
+                    fix.lat == last_lat && fix.lon == last_lon &&
+                    fix.status == last_status && g_zoom == last_zoom;
+        if (same && millis() - last_ms < 1000) return;
+
+        last_lat = fix.lat; last_lon = fix.lon;
+        last_status = fix.status; last_zoom = g_zoom;
+        last_ms = millis();
+        g_upd_memo = true;
+    }
 
     merc_pt_t p = merc_from_ll(fix.lat, fix.lon, g_zoom);
 
@@ -1522,6 +1571,7 @@ void map_update(const GnssFix &fix) {
 void map_set_zoom(uint8_t zoom, const GnssFix &fix) {
     if (zoom == g_zoom) return;
     g_zoom = zoom;
+    g_upd_memo = false;          // the same fix now means a different tile
     if (gnss_coarse(fix)) recentre(fix);
 }
 
@@ -2746,6 +2796,7 @@ void map_pan_reset() {
         ensure_place_blocks(g_marker_wx, g_marker_wy);
         update_place_names(g_marker_wx, g_marker_wy);
     }
+    g_upd_memo = false;
     map_invalidate();
 }
 
@@ -2773,6 +2824,7 @@ void map_seed_position(double lat, double lon) {
     view_follow();
     ensure_place_blocks(p.x, p.y);
     update_place_names(p.x, p.y);
+    g_upd_memo = false;
     map_invalidate();
     Serial.printf("map: seeded at %.4f,%.4f from the last known position - "
                   "drawing, but no marker until something measures one\n",
