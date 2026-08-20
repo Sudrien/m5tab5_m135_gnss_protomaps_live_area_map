@@ -143,6 +143,15 @@ tile_state_t map_world_check_state();
 bool         map_world_check_draw(int cx, int cy, int size);
 void         map_world_check_free();
 
+// Hold the render worker off the SD and PSRAM buses, and let it go again.
+//
+// For the few seconds of something that needs those buses on a deadline -
+// SDIO enumeration of the Wi-Fi co-processor is the case this exists for,
+// where a busy worker turned 47 ms of card init into 4.8 s. The job queue is
+// untouched; work resumes where it stopped. Calls do not nest.
+void map_worker_pause();
+void map_worker_resume();
+
 // False until a measured position has been seen this session. The status bar
 // uses it to explain why a perfectly good map has nothing on it.
 bool map_marker_valid();

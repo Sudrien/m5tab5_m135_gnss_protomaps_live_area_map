@@ -539,6 +539,10 @@ static const uint8_t PLACE_SLOT = 0xFD;    // sentinel job slot
 // no buildings, no labels worth the name.
 static const uint8_t WORLD_SLOT = 0xFC;    // sentinel job slot
 
+// The render worker, kept so it can be held off the buses briefly. See
+// map_worker_pause().
+static TaskHandle_t g_worker = nullptr;
+
 // Rendered into its own buffer rather than the overview's, because the
 // overview is requested moments later for a completely different tile and one
 // would overwrite the other. Freed as soon as the boot screen is done with it.
@@ -1146,7 +1150,8 @@ bool map_begin(const char *path, uint8_t zoom, int worker_core, int worker_prio)
     g_centred = false;
 
     BaseType_t ok = xTaskCreatePinnedToCore(
-        worker_task, "tilerender", 12288, nullptr, worker_prio, nullptr, worker_core);
+        worker_task, "tilerender", 12288, nullptr, worker_prio, &g_worker,
+        worker_core);
     if (ok != pdPASS) { Serial.println("map: worker task failed"); return false; }
 
     Serial.printf("map: display z%u from z%u data, %dpx subtiles "
@@ -1575,6 +1580,26 @@ bool map_has_picture() {
 // wait forever.
 bool map_has_anchor() { return g_centred; }
 
+// Hold the render worker off the buses for a moment.
+//
+// The worker reads the archive over SDMMC and rasterises into PSRAM, both
+// flat out. Anything else that needs those buses on a deadline loses, and
+// SDIO card enumeration on slot 1 is exactly that: bringing the C6 up was
+// measured at 47 ms with the worker idle and 4779 ms with it running - the
+// same enumeration, a hundred times slower, for tiles that were in no hurry.
+//
+// Suspension rather than a priority drop, because the contention is for the
+// buses rather than for the core; a lower-priority task still holds the SD
+// bus for the length of a read. The queue is untouched, so nothing is lost -
+// the work resumes where it stopped.
+void map_worker_pause() {
+    if (g_worker) vTaskSuspend(g_worker);
+}
+
+void map_worker_resume() {
+    if (g_worker) vTaskResume(g_worker);
+}
+
 void map_set_visible(bool visible) {
     bool was = g_visible;
     g_visible = visible;
@@ -1649,11 +1674,25 @@ void map_set_dark(bool dark) {
     // it is longer than a second whenever a background fetch is holding the
     // archive lock.
     invalidate_coarse();
-    ensure_coarse(o);
+    // Only once there is somewhere to be. Before the grid is centred, the
+    // origin is z/0/0 and the overview requested for it is of open ocean off
+    // west Africa - which is then thrown away moments later when
+    // map_seed_position() centres the grid and asks for the right one.
+    //
+    // That cost two overview renders on every boot, back to back, and an
+    // overview has been measured at over five seconds on this part: eleven
+    // seconds of startup spent rendering a tile nobody would ever see, for a
+    // palette decision that had not yet been given a position to apply to.
+    //
+    // Nothing is lost by waiting. recentre_at() calls ensure_coarse() itself,
+    // so the first overview is requested exactly once, for the tile the user
+    // is actually near, in the palette already chosen by then.
+    if (g_centred) ensure_coarse(o);
     enqueue(jobs, n);
     g_force_redraw = true;
-    Serial.printf("map: switched to %s palette, re-rendering %d tiles\n",
-                  dark ? "night" : "day", n);
+    Serial.printf("map: switched to %s palette, re-rendering %d tiles%s\n",
+                  dark ? "night" : "day", n,
+                  g_centred ? "" : " (no overview yet - grid not centred)");
 }
 
 bool map_is_dark() {

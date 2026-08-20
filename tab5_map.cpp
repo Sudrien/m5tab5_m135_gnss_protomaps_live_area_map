@@ -3361,7 +3361,12 @@ void setup() {
     // ---- radio, now that the map is up ------------------------------------
     // Everything from here needs the C6, and none of it is needed to draw.
     bootStepBusy("starting wifi radio");
+    // The renderer and SDIO enumeration both want the buses, and only one of
+    // them is on a deadline. Measured: card init takes 47 ms with the worker
+    // idle and 4779 ms with it running. The tiles can wait four seconds.
+    map_worker_pause();
     bool radio = wifiRadioUp();
+    map_worker_resume();
     if (radio) bootStep("wifi radio ready"); else bootStepFail("wifi radio unavailable");
 
     if (!radio) {
