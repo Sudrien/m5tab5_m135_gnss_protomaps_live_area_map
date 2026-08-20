@@ -772,13 +772,34 @@ static void screenOff() {
     map_set_visible(false);
     M5.Display.setBrightness(0);
     M5.Display.fillScreen(TFT_BLACK);
-    // GNSS and the render worker are untouched: the position stays current
-    // and tiles keep arriving, so waking is instant rather than a cold start.
-    Serial.println("screen: off (GPS and rendering continue)");
+
+    // Backlight off is not display off. setBrightness(0) darkens the LED
+    // string and leaves the MIPI-DSI panel controller running, still being
+    // refreshed line by line out of the same framebuffer - the picture is
+    // invisible and the panel is still doing all the work of drawing it.
+    //
+    // sleep() puts the controller itself into its low-power state. Ordered
+    // after the black fill deliberately: the panel retains whatever was last
+    // written, so sleeping over the map would leave that image to reappear
+    // for an instant on wake.
+    //
+    // Kept separate from the brightness call rather than folded into it,
+    // because applyTheme() also drives brightness and must not be able to
+    // wake the controller as a side effect of a day/night transition.
+    M5.Display.sleep();
+
+    // GNSS is untouched, so the position stays current. Tile fetching
+    // continues and rasterising does not - see map_set_visible().
+    Serial.println("screen: off (GPS continues, panel asleep)");
 }
 
 static void screenOn() {
     if (!g_panelOk) return;   // no display attached
+
+    // Before anything is drawn, or the writes land in a controller that is
+    // not listening and the first frame is lost.
+    M5.Display.wakeup();
+
     g_screenOff = false;
     map_set_visible(true);
     // g_brightness may have been updated by a theme change while asleep, so
