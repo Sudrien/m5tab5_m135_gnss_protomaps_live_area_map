@@ -169,6 +169,46 @@ static const uint32_t WIFILOC_WRITE_DIRTY = 400;
 // WiFi.scanComplete() then returns "running" forever.
 static const uint32_t WIFILOC_SCAN_TIMEOUT_MS = 15000;
 
+// ---- radio duty cycling ----------------------------------------------------
+// Between scans the radio is doing nothing. The P4 has no radio of its own -
+// Wi-Fi is an ESP32-C6 companion over SDIO - so an idle station is a second
+// chip powered up and associated for the sake of a scan every twenty seconds.
+//
+// WHAT THIS DOES AND DOES NOT DO
+// WiFi.mode(WIFI_OFF) takes the station down through esp_wifi_remote, which
+// on this board reaches the C6 and stops the radio. It is NOT the same as
+// powering the co-processor down: esp_hosted 3.x ships a "shut down CP when
+// unused" example that does that properly, and this project does not pin
+// esp_hosted - it takes whatever the Arduino core's esp_wifi_remote resolves,
+// which may predate it. Doing this the thorough way also means touching the
+// same bring-up ordering the project CMakeLists already patches to remove the
+// esp_hosted global constructor, which is the machinery that cost the most to
+// get right. So this is the conservative form: real, measurable, and it does
+// not go near that.
+//
+// WHEN IT IS SAFE
+// Only when the station is not associated. If something else has brought the
+// link up - a tile prefetch, the world floor download, the setup portal, an
+// SNTP sync - the radio belongs to it and none of this runs. Scanning does
+// not need an association, so an unassociated radio is exactly the state
+// wifiloc can own outright.
+static const uint32_t WIFILOC_RADIO_WAKE_MS = 1200;
+
+// How long the radio stays up after a scan before being taken down again. A
+// LOCATE that fails is retried in WIFILOC_RETRY_MS, and bringing the radio up
+// twice inside that costs more than leaving it up would have.
+static const uint32_t WIFILOC_RADIO_LINGER_MS = 3000;
+
+enum RadioState {
+    RADIO_UNMANAGED = 0,  // someone else owns it, or duty cycling is off
+    RADIO_DOWN,           // we took it down
+    RADIO_WAKING,         // brought up, waiting for it to be usable
+    RADIO_UP,             // ours and ready
+};
+static RadioState s_radio = RADIO_UNMANAGED;
+static uint32_t   s_radioSince = 0;
+static bool       s_dutyCycle = true;
+
 // The six address bytes packed big-endian into the low 48 bits of a uint64_t,
 // so the existing linear find() and the ApRec layout are unchanged.
 //
@@ -514,9 +554,75 @@ bool wifiloc_position(double *lat, double *lon, float *acc_m, uint32_t *age_ms) 
     return true;
 }
 
+// ---- radio ownership -------------------------------------------------------
+// True when the radio is someone else's: associated to an AP, or about to be.
+// Scanning works fine without an association, so this is the only question -
+// not whether the radio is on, but whether anything is relying on it staying
+// that way.
+static bool radio_in_use_elsewhere() {
+    // Prefetch and the world floor download both saturate the link for
+    // minutes; the poll below already refuses to scan during them, and the
+    // radio must certainly not be taken out from under them.
+    if (map_prefetch_busy()) return true;
+    // An association is the whole test. Anything holding one - tile fetches,
+    // the portal, an SNTP sync in flight - loses it if the mode is dropped.
+    return WiFi.status() == WL_CONNECTED;
+}
+
+// Ask for the radio. Returns true when it is up and a scan may be started.
+// Non-blocking: the first call brings it up and returns false, and a later
+// poll returns true once it has settled.
+static bool radio_acquire() {
+    if (!s_dutyCycle) return true;
+
+    switch (s_radio) {
+        case RADIO_UNMANAGED:
+        case RADIO_UP:
+            return true;
+
+        case RADIO_DOWN:
+            WiFi.mode(WIFI_STA);
+            s_radio = RADIO_WAKING;
+            s_radioSince = millis();
+            return false;
+
+        case RADIO_WAKING:
+            if (millis() - s_radioSince < WIFILOC_RADIO_WAKE_MS) return false;
+            s_radio = RADIO_UP;
+            s_radioSince = millis();
+            return true;
+    }
+    return true;
+}
+
+// Give the radio back, once nothing has needed it for a moment.
+static void radio_release() {
+    if (!s_dutyCycle) return;
+    if (s_radio != RADIO_UP && s_radio != RADIO_UNMANAGED) return;
+    if (millis() - s_radioSince < WIFILOC_RADIO_LINGER_MS) return;
+    if (radio_in_use_elsewhere()) { s_radio = RADIO_UNMANAGED; return; }
+
+    WiFi.mode(WIFI_OFF);
+    s_radio = RADIO_DOWN;
+    s_radioSince = millis();
+}
+
+void wifiloc_set_duty_cycle(bool on) {
+    s_dutyCycle = on;
+    if (!on && s_radio == RADIO_DOWN) {
+        WiFi.mode(WIFI_STA);
+        s_radio = RADIO_UNMANAGED;
+    }
+    Serial.printf("wifiloc: radio duty cycling %s\n", on ? "on" : "off");
+}
+
+bool wifiloc_radio_down() { return s_radio == RADIO_DOWN; }
+
 // ---- state machine ---------------------------------------------------------
-void wifiloc_poll(const GnssFix &fix) {
-    if (!wifiloc_enabled()) return;
+// Split so the many early returns below do not each have to remember to
+// release the radio. The inner function decides what to do; the wrapper hands
+// the radio back afterwards if nothing wanted it.
+static void wifiloc_poll_inner(const GnssFix &fix) {
 
     // A scan in flight takes precedence over starting another one.
     if (s_scanWhy != SCAN_NONE) {
@@ -560,6 +666,10 @@ void wifiloc_poll(const GnssFix &fix) {
         }
         WiFi.scanDelete();
         s_scanWhy = SCAN_NONE;
+        // The linger clock starts when the scan ends, not when it began: a
+        // failed LOCATE is retried soon and two bring-ups inside that window
+        // cost more than staying up would have.
+        s_radioSince = millis();
         return;
     }
 
@@ -590,6 +700,12 @@ void wifiloc_poll(const GnssFix &fix) {
             if (sqrt(dx * dx + dy * dy) < WIFILOC_LEARN_M) return;
         }
 
+        // Checked here, after every other gate: acquiring returns false
+        // while the radio is coming up, and a later poll starts the scan.
+        // None of the once-per-interval state below is touched until it
+        // actually starts, so nothing is consumed by the wait.
+        if (!radio_acquire()) return;
+
         if (WiFi.scanNetworks(true, false) == WIFI_SCAN_FAILED) return;
         s_scanWhy = SCAN_LEARN;
         s_scanStart = millis();
@@ -611,8 +727,20 @@ void wifiloc_poll(const GnssFix &fix) {
     if (s_lastLocate && millis() - s_lastLocate < WIFILOC_RETRY_MS) return;
     if (!s_count) return;                     // nothing to match against yet
 
+    if (!radio_acquire()) return;
+
     if (WiFi.scanNetworks(true, false) == WIFI_SCAN_FAILED) return;
     s_scanWhy = SCAN_LOCATE;
     s_scanStart = millis();
     s_lastLocate = millis();
+}
+
+void wifiloc_poll(const GnssFix &fix) {
+    if (!wifiloc_enabled()) return;
+
+    wifiloc_poll_inner(fix);
+
+    // Never while a scan is in flight, and never while the radio is still
+    // coming up for one - both would abandon work already paid for.
+    if (s_scanWhy == SCAN_NONE && s_radio != RADIO_WAKING) radio_release();
 }

@@ -103,4 +103,22 @@ bool wifiloc_available();
 bool wifiloc_enabled();
 void wifiloc_set_enabled(bool on);
 
+// Radio duty cycling: take the station down between scans and bring it back
+// up for each one. On by default.
+//
+// This only ever touches a radio nothing else is using - an association, a
+// prefetch or the world floor download all keep it up - so it is safe to
+// leave on. Turn it off to keep the station permanently available, at the
+// cost of an idle ESP32-C6 for the sake of a scan every twenty seconds.
+//
+// Note this stops the radio, not the co-processor. Powering the C6 itself
+// down needs esp_hosted's own CP power-save support, which this project does
+// not pin a version for; see the comment in wifiloc.cpp.
+void wifiloc_set_duty_cycle(bool on);
+
+// True when the station is currently down because of the above. Worth showing
+// somewhere, since it explains why a scan for networks may take a second
+// longer than expected.
+bool wifiloc_radio_down();
+
 #endif // WIFILOC_H
