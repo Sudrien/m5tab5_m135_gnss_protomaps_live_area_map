@@ -93,6 +93,9 @@ different hardware can adapt them.
     tab5_map.cpp     233  PREFETCH_RADIUS = 7
     tab5_map.cpp     250  BRIGHT_NIGHT = 60
     tab5_map.cpp     396  BRIGHT_DUSK = 140
+    tab5_map.cpp     448  IDLE_DIM_MS = 120000
+    tab5_map.cpp     449  IDLE_DIM_PCT = 40
+    tab5_map.cpp     450  IDLE_DIM_FLOOR = 30
     tab5_map.cpp     965  ANTENNA_SUSPECT_MS 90000
     tab5_map.cpp    1167  AOP_SAVE_INTERVAL_MS (30 * 60 * 1000)
     netsource.cpp     52  REFRESH_DAYS = 30
@@ -169,6 +172,14 @@ judgements. The experiment that would attribute them is now cheap to run: the
 minutes held at each level gives the milliamps each one costs. Until that is
 recorded, changing any of them is guesswork in both directions - readability
 and consumption.
+
+The three `IDLE_DIM_*` values are the least examined numbers in this set and
+the only ones whose failure is felt rather than measured. Too short a delay
+and the screen dims while someone is reading it at a stop; too deep a step or
+too low a floor and it reads as crashed rather than resting, which matters
+because the way back is a touch and nobody touches a screen they believe has
+died. None of the three has been tried on hardware. They want a session of
+sitting with the device parked more than they want an instrument.
 
 `DUSK_HALFWIDTH_MIN` is attributed, to civil twilight at mid latitudes, but the
 attribution is honest about being a fixed stand-in for something that varies

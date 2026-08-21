@@ -429,6 +429,25 @@ static const double DUSK_HALFWIDTH_MIN = 30.0;
 // map_pan_reset() in screenOff() makes about a panned view.
 enum BrightMode { BRIGHTM_AUTO = 0, BRIGHTM_LOW, BRIGHTM_MED, BRIGHTM_HIGH };
 static BrightMode g_brightMode = BRIGHTM_AUTO;
+
+// Idle dim: how long untouched before the backlight steps down, and how far.
+//
+// A device left on and parked - at a trailhead, on a desk, in a garage
+// overnight - burns the largest single load in the project lighting a screen
+// nobody is looking at. This is the case worth catching, and it is separable
+// from the screen-off button because it needs no gesture to come back from
+// and no decision from the user.
+//
+// A fraction rather than a fixed level, so the step preserves the
+// relationship the level above it established: 40% of a night screen is still
+// a night screen. The floor keeps it visibly lit rather than apparently dead,
+// which matters because the way back is a touch and nobody touches a screen
+// they think has crashed.
+//
+// src: all three are judgements, unattributed - see PROVENANCE.md.
+static const uint32_t IDLE_DIM_MS    = 120000;   // two minutes
+static const int      IDLE_DIM_PCT   = 40;
+static const uint8_t  IDLE_DIM_FLOOR = 30;
 static uint8_t g_brightness = BRIGHT_DAY;
 
 // Split from sunIsUp() so the boot path can ask the same question about a
@@ -562,6 +581,62 @@ static uint8_t brightnessWanted() {
     }
 }
 
+// Whether the backlight should be stepped down for want of anyone looking.
+//
+// The obvious version of this - dim after N minutes untouched - is wrong on
+// the device's main job. Driving is exactly the case where the screen is
+// being read constantly and touched not at all, and a satnav that fades out
+// two minutes into a motorway leg is broken, not thrifty. Touch is a proxy
+// for attention and it is a bad one; movement is the better proxy, and this
+// device already knows.
+//
+// So entry needs stationary as well as untouched, and "stationary" reuses the
+// band gnssRatePolicy() has already settled rather than testing the speed
+// again. That band is debounced by GNSS_RATE_SETTLE_MS and hysteresised
+// against the flip-flopping a single threshold would cause, and a second
+// independent notion of stopped would be free to disagree with it.
+//
+// Entry and exit are deliberately asymmetric - slow to dim, immediate to
+// brighten:
+//
+//   - Entry waits for the settled IDLE band. Being slow costs nothing but a
+//     few seconds of light.
+//   - Exit takes the instantaneous speed, which crosses GNSS_SLOW_KMH some
+//     ten to twenty seconds before the band follows it. Without that, pulling
+//     away from a stop would leave the screen dim for the whole settle
+//     window, which is precisely the manoeuvre where it is being looked at.
+//
+// No fix, or a 2D-only fix, means no dim. gnssRatePolicy() holds the rate at
+// FAST in those cases, so the band test below already refuses, but the
+// reasoning is worth stating: a receiver that cannot say whether the device
+// is moving has not said it is stopped, and the safe reading of silence here
+// is to leave the screen alone.
+static bool idleDimmed(const GnssFix &fix) {
+    if (g_screenOff) return false;
+
+    // Unsigned subtraction, so the 49.7-day millis() wrap takes care of
+    // itself - the difference stays correct across it.
+    if (millis() - g_lastTouchMs < IDLE_DIM_MS) return false;
+
+    if (gnss_coarse(fix) && fix.mode == 3 && fix.speedKmh >= GNSS_SLOW_KMH)
+        return false;
+
+    return gnss_rate_ms() == GNSS_RATE_IDLE;
+}
+
+static uint8_t applyIdleDim(uint8_t want, const GnssFix &fix) {
+    static bool wasDim = false;
+    bool dim = idleDimmed(fix);
+    if (dim != wasDim) {
+        wasDim = dim;
+        Serial.printf("bright: idle dim %s\n", dim ? "on" : "off");
+    }
+    if (!dim) return want;
+
+    int v = want * IDLE_DIM_PCT / 100;
+    return v < IDLE_DIM_FLOOR ? IDLE_DIM_FLOOR : (uint8_t)v;
+}
+
 static void applyTheme(const GnssFix &fix) {
     bool wantDark;
     switch (g_themeMode) {
@@ -571,7 +646,11 @@ static void applyTheme(const GnssFix &fix) {
     }
     if (wantDark != map_is_dark()) map_set_dark(wantDark);
 
-    uint8_t want = brightnessWanted();
+    // The idle dim wraps the chosen level rather than replacing it, so a
+    // manual override still decides what "full" means and this only decides
+    // whether anyone is there to see it. The two questions are independent:
+    // "how much light does this place need" and "is anyone looking".
+    uint8_t want = applyIdleDim(brightnessWanted(), fix);
 
     // Track the level the screen *should* have, but only drive the backlight
     // when the screen is actually on.

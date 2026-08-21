@@ -183,6 +183,16 @@ fixed level overrides the theme button as well as the sun - forcing the night
 palette to keep the map dark-adapted and then asking for a bright screen is a
 coherent thing to want.
 
+Left parked and untouched for two minutes, the backlight steps down to 40% of
+whatever level is in force, and any touch brings it straight back. Parked is
+part of the condition and not a detail: driving is exactly when the screen is
+read constantly and touched not at all, so a dim on idle touch alone would
+fade out mid-journey. It uses the same settled speed band that drives the
+receiver's fix rate, and it releases on the instantaneous speed instead, so
+pulling away from a stop brightens immediately rather than after the band
+catches up. Without a fix it does not dim at all - a receiver that cannot say
+whether the device is moving has not said that it is stopped.
+
 Neither override is remembered across a reboot. Both correct a decision the
 device gets right most of the time, and an override nobody remembers setting
 is worse than one that has to be set again - the same reasoning that drops a
