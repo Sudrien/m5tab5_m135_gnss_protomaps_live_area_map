@@ -888,10 +888,52 @@ bool netsource_begin(const char *local_path) {
         }
 
         src->ok = true;
+
+        // Read the root once here rather than on the first tile, so its
+        // decompressed size can be reported while the archive is being
+        // described.
+        //
+        // The size is the whole point. If it fits root_cache_cap the root is
+        // held in memory and costs nothing again; if it does not, load_dir()
+        // re-reads and re-inflates it on every lookup, and the leaf that
+        // follows overwrites dir_buf so the next lookup repeats the work -
+        // two full read-and-inflate cycles per tile forever.
+        //
+        // This is the difference measured between archive layouts: nine z12
+        // tiles cost 5625 ms of I/O out of a 131 GB planet file and 233 ms
+        // out of a 3 GB extract, for the same tile ids and the same 73
+        // places, on media where the extract was on the *slower* of the two.
+        // Per-tile rather than per-leaf, which is the signature of a root
+        // being refetched rather than a leaf cache missing - nine adjacent
+        // tiles share a leaf, so a leaf miss could not cost nine times.
+        //
+        // Diagnostic for now: this only reports the condition. It does not
+        // raise the cap, because whether raising it is the right fix depends
+        // on how far past 64 KB a planet root actually goes, and nothing has
+        // measured that yet.
+        pmt_err_t re = pmt_prime_root(&src->pmt);
+        uint32_t rdec = src->pmt.root_dec_len;
+
         Serial.printf("netsource: local %s z%u..%u  lon %.2f..%.2f  %.1f MB%s\n",
                       path, src->pmt.hdr.min_zoom, src->pmt.hdr.max_zoom,
                       src->pmt.hdr.min_lon_e7 / 1e7, src->pmt.hdr.max_lon_e7 / 1e7,
                       have / 1048576.0, src->big ? "  [64-bit]" : "");
+
+        if (re != PMT_OK) {
+            Serial.printf("netsource:   root directory unreadable (%s) - "
+                          "every lookup will pay for it\n", pmt_strerror(re));
+        } else if (rdec > src->pmt.root_cache_cap) {
+            Serial.printf("netsource:   root %lu KB decompressed, past the %lu KB "
+                          "cache - re-read and re-inflated on EVERY lookup\n",
+                          (unsigned long)(rdec / 1024),
+                          (unsigned long)(src->pmt.root_cache_cap / 1024));
+        } else {
+            Serial.printf("netsource:   root %lu KB decompressed, cached "
+                          "(%lu KB cache)\n",
+                          (unsigned long)(rdec / 1024),
+                          (unsigned long)(src->pmt.root_cache_cap / 1024));
+        }
+
         g_local_n++;
         return true;
     };

@@ -180,6 +180,8 @@ static pmt_err_t load_dir(pmt_t *p, uint64_t off, uint32_t len,
             return PMT_EDECOMPRESS;
     }
 
+    if (is_root) p->root_dec_len = dec_len;
+
     if (is_root && p->root_cache && dec_len <= p->root_cache_cap) {
         memcpy(p->root_cache, p->dir_buf, dec_len);
         p->root_cache_len = dec_len;
@@ -328,6 +330,11 @@ pmt_err_t pmt_find(pmt_t *p, uint8_t z, uint32_t x, uint32_t y,
         return PMT_OK;
     }
     return PMT_EFORMAT;
+}
+
+pmt_err_t pmt_prime_root(pmt_t *p) {
+    const uint8_t *buf; uint32_t blen;
+    return load_dir(p, p->hdr.root_off, (uint32_t)p->hdr.root_len, &buf, &blen);
 }
 
 pmt_err_t pmt_read_blob(pmt_t *p, uint64_t off, uint32_t len,

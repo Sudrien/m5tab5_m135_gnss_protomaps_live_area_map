@@ -120,6 +120,19 @@ typedef struct {
     uint32_t  dir_srclen;      // source (compressed) length
     uint32_t  dir_len;         // decompressed length held, 0 = empty
 
+    // Decompressed size of the root directory, once it has been read at least
+    // once. 0 until then.
+    //
+    // Recorded because whether it fits root_cache_cap decides how much work a
+    // lookup costs, and nothing currently reports it. When it fits, the root
+    // is copied into root_cache and every later lookup is served from memory.
+    // When it does not, load_dir() takes neither that path nor the dir_off
+    // identity path below it - the !is_root guard excludes the root - so the
+    // root is re-read from the medium and re-inflated on every single lookup,
+    // and the leaf that follows overwrites dir_buf so the next lookup does it
+    // again. Two full read-and-inflate cycles per tile instead of none.
+    uint32_t  root_dec_len;
+
     // Set whenever a call returns PMT_ENOMEM: the number of bytes that would
     // have been required. Leaf directory sizes are not described anywhere in
     // the header, so without this the caller has no way to size raw_buf
@@ -132,6 +145,12 @@ typedef struct {
 
 // Read and validate the 127-byte header. Buffers must already be assigned.
 pmt_err_t pmt_open(pmt_t *p);
+
+// Read the root directory once, so root_dec_len is populated and the root
+// cache is filled if it fits. Optional: lookups work without it, this just
+// moves the first root read off the first tile fetch and makes the size
+// available to report at open time.
+pmt_err_t pmt_prime_root(pmt_t *p);
 
 // Look up a tile. On PMT_OK, *off/*len describe the tile payload inside the
 // archive; the bytes are still in the archive's tile_compression codec.
