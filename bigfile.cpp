@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <esp_timer.h>
+#include <esp_heap_caps.h>
 
 #if MAP_HAVE_BIGFILE
 #include "ff.h"
@@ -39,7 +40,15 @@ struct bigfile_s {
     FIL      fp;
     uint64_t size;
     char     path[64];
+    // Cluster link map, owned here so it outlives the call that built it and
+    // is freed with the handle. Null when fast seek could not be set up, in
+    // which case fp.cltbl is null too and f_lseek() walks the chain.
+    DWORD   *clmt;
 };
+
+// Defined below bigfile_open() because it is long and this is where it is
+// called from; declared here so the order reads open-then-detail.
+static void clmt_build(bigfile_t *b);
 
 bool bigfile_supported() { return sizeof(FSIZE_t) >= 8; }
 
@@ -140,6 +149,7 @@ bigfile_t *bigfile_open(const char *path) {
         if (f_open(&b->fp, b->path, FA_READ) != FR_OK) continue;
 
         b->size = (uint64_t)f_size(&b->fp);
+        clmt_build(b);
         return b;
     }
     b->path[0] = 0;
@@ -151,7 +161,98 @@ bigfile_t *bigfile_open(const char *path) {
 void bigfile_close(bigfile_t *b) {
     if (!b) return;
     f_close(&b->fp);
+    // After f_close, so nothing can seek through a freed table.
+#if FF_USE_FASTSEEK
+    b->fp.cltbl = nullptr;
+#endif
+    free(b->clmt);
     free(b);
+}
+
+// Build a cluster link map so f_lseek() stops walking the FAT.
+//
+// Without one, f_lseek() follows the cluster chain entry by entry from
+// wherever the file position happens to be, reading FAT sectors as it goes.
+// That is fine for a few MB and ruinous for a 131 GB archive, because the
+// access pattern here is the worst case for it: a lookup reads its leaf
+// directory from near the end of the file and its tile body from the middle,
+// so consecutive calls jump about 129 GB and back.
+//
+// Measured on the planet archive before this: a nine-tile place block spent
+// 4984 ms in ten seeks and 71 ms transferring 488 KB. The card was doing
+// about 6.9 MB/s; the seeks were costing roughly 498 ms each. A 3 GB extract
+// on a slower USB stick beat it by more than 20x for exactly this reason -
+// shorter chains, not faster hardware.
+//
+// The table is two entries per contiguous fragment plus a terminator, so a
+// freshly copied archive needs very few and a badly fragmented one needs
+// more. Rather than guess, this asks: FatFs returns the required item count
+// in cltbl[0] when the buffer is too small, so a first attempt at a modest
+// size either succeeds or says exactly what to allocate.
+//
+// Failure is not fatal anywhere. cltbl is left null and f_lseek() reverts to
+// walking the chain - slow, which is what it was doing already. That matters
+// because a fragmented multi-GB file could legitimately need a table too big
+// to be worth holding, and refusing to open the archive over it would be a
+// far worse outcome than reading it slowly.
+static void clmt_build(bigfile_t *b) {
+#if !FF_USE_FASTSEEK
+    // FIL has no cltbl member unless FatFs was built with fast seek, so this
+    // has to compile out rather than merely do nothing - referring to the
+    // field at all is a build error.
+    //
+    // Reaching here means CONFIG_FATFS_USE_FASTSEEK is off in the sdkconfig
+    // this build actually used. Note that sdkconfig.defaults is only consulted
+    // when there is no sdkconfig yet: an existing one takes precedence and
+    // will silently keep the old value. Either delete sdkconfig and rebuild,
+    // or set the option through menuconfig.
+    (void)b;
+    static bool said = false;
+    if (!said) {
+        said = true;
+        Serial.println("bigfile: built without FF_USE_FASTSEEK - every seek "
+                       "walks the FAT chain. Set CONFIG_FATFS_USE_FASTSEEK "
+                       "(sdkconfig.defaults is ignored if sdkconfig exists).");
+    }
+    return;
+#else
+    // Fast seek requires the file be open read-only, which f_open above does.
+    static const uint32_t CLMT_FIRST_TRY = 256;   // items, 1 KB
+    static const uint32_t CLMT_MAX       = 16384; // items, 64 KB
+
+    uint32_t items = CLMT_FIRST_TRY;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        DWORD *tbl = (DWORD *)heap_caps_malloc(items * sizeof(DWORD),
+                                               MALLOC_CAP_SPIRAM);
+        if (!tbl) tbl = (DWORD *)malloc(items * sizeof(DWORD));
+        if (!tbl) break;
+
+        b->fp.cltbl = tbl;
+        tbl[0] = items;
+        FRESULT r = f_lseek(&b->fp, CREATE_LINKMAP);
+        if (r == FR_OK) {
+            b->clmt = tbl;
+            Serial.printf("bigfile: %s fast seek on, %lu of %lu table items\n",
+                          b->path, (unsigned long)tbl[0], (unsigned long)items);
+            f_lseek(&b->fp, 0);
+            return;
+        }
+
+        // Too small: cltbl[0] now holds what it actually needs.
+        uint32_t need = (r == FR_NOT_ENOUGH_CORE) ? (uint32_t)tbl[0] : 0;
+        b->fp.cltbl = nullptr;
+        free(tbl);
+
+        if (!need || need > CLMT_MAX || attempt == 1) {
+            Serial.printf("bigfile: %s fast seek unavailable (%s) - seeks will "
+                          "walk the FAT chain\n", b->path,
+                          need ? "table too large" : "linkmap failed");
+            return;
+        }
+        items = need;
+    }
+    b->fp.cltbl = nullptr;
+#endif  // FF_USE_FASTSEEK
 }
 
 uint64_t bigfile_size(bigfile_t *b) { return b ? b->size : 0; }
@@ -182,20 +283,11 @@ int bigfile_read(void *ctx, uint64_t off, uint32_t len, uint8_t *dst) {
     // archive and its tile body from the middle, so consecutive calls jump
     // about 129 GB and back, over and over.
     //
-    // CONFIG_FATFS_USE_FASTSEEK is not set in this build and nothing here
-    // builds a cluster link map, so f_lseek() walks the FAT chain entry by
-    // entry from wherever the file position happens to be. On a 131 GB file
-    // that chain is millions of entries long, and a 129 GB jump walks a large
-    // part of it, reading FAT sectors along the way. That would be
-    // proportional to file size, would fall on every read rather than only on
-    // directory reads, and would be unaffected by the medium - which matches
-    // a 3 GB extract on a slower USB stick beating this by more than 20x.
-    //
-    // If seek dominates, enabling fast seek and allocating a CLMT per open
-    // archive turns the walk into a table lookup. If transfer dominates
-    // instead, the seek theory is dead and the 8 KB STORAGE_IO_CHUNK is the
-    // next suspect. Measuring says which; guessing has already been wrong
-    // twice here.
+    // That was measured, and the seek won: 4984 ms against 71 ms. The cause
+    // was f_lseek() walking the FAT chain entry by entry, which
+    // CONFIG_FATFS_USE_FASTSEEK and the cluster link map in clmt_build() now
+    // avoid. The counters stay because they are how the fix is confirmed, and
+    // because an archive whose linkmap could not be built still walks.
     uint64_t t_seek = esp_timer_get_time();
     if (f_lseek(&b->fp, (FSIZE_t)off) != FR_OK) return -1;
     if (f_tell(&b->fp) != (FSIZE_t)off) return -1;   // truncated: wrong bytes
