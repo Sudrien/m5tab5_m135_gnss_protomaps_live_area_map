@@ -25,6 +25,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <esp_task_wdt.h>
+#include <esp_app_desc.h>
 #include <esp_heap_caps.h>
 #include <esp_system.h>
 #include <esp_log.h>
@@ -3200,9 +3201,23 @@ void setup() {
     // to distinguish a dark boot from a good one - both report the same - so
     // the useful signal is the panel geometry, which is 0x0 exactly when the
     // framebuffer was never allocated.
-    Serial.printf("\n=== Tab5 map (%s) ===\nPSRAM %u KB free\n"
+    // The version goes on the banner, not just in IDF's app_init block.
+    //
+    // Both are printed at boot, but only one of them survives being pasted
+    // into a bug report: the app_init lines sit above the panel-detect
+    // restart, so a log that starts at the banner - which is where anyone
+    // reading it starts - carries no build identity at all. Two logs from
+    // adjacent builds then look identical, and a timing number cannot be
+    // attributed to the change it was meant to measure.
+    //
+    // esp_app_get_description() reads the header the bootloader already
+    // validated, so this is a struct field rather than any extra work, and it
+    // reports the same "<git-describe>-dirty" string IDF prints. The Arduino
+    // build has the same call through the IDF component underneath it.
+    const esp_app_desc_t *app = esp_app_get_description();
+    Serial.printf("\n=== Tab5 map (%s) %s built %s ===\nPSRAM %u KB free\n"
                   "reset: %s, panel %ldx%ld %s\n",
-                  map_build_flavour(),
+                  map_build_flavour(), app->version, app->date,
                   (unsigned)(ESP.getFreePsram() / 1024), rr,
                   // LovyanGFX returns int32_t, which is 'long' on RISC-V -
                   // and width() dereferences the panel, so with none attached
