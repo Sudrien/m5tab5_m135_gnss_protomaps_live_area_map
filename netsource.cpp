@@ -222,6 +222,65 @@ static const uint32_t DIR_EXPAND = 4;
 // log rather than silent.
 static const uint32_t LOCAL_ROOT_CAP = 64 * 1024;
 
+// ---- shared leaf directory cache -------------------------------------------
+//
+// One array, shared by whichever local archive currently owns dir_buf, on
+// exactly the terms dir_buf is shared - see the owner handoff in local_try().
+// Per-archive caches would be more effective and are not affordable:
+// LOCAL_ARCHIVE_MAX is 16, and a leaf runs to a few hundred KB decompressed.
+//
+// Three slots because three is what the observed working set needs. A boot
+// trace shows the z14 view, the z12 place block and the z6 region block each
+// pulling a different leaf and evicting each other in rotation, so the same
+// directory was read at #5 and again at #12, and another at #3 and #22. Three
+// slots hold all three; a fourth would buy nothing measured.
+static const uint32_t LOCAL_LEAF_SLOTS = 3;
+
+// Ceiling per slot. A leaf past this is not cached rather than allowed to
+// consume PSRAM without limit - the render buffers are the priority and this
+// is an optimisation.
+static const uint32_t LEAF_SLOT_MAX = 1024 * 1024;
+
+static pmt_dir_slot_t g_leaf_slots[LOCAL_LEAF_SLOTS];
+
+// Size the slots once a real leaf has been seen. Leaf sizes appear nowhere in
+// the header - the same reason raw_buf grows on demand rather than being
+// guessed - so this waits until a lookup has decompressed one and then
+// allocates to fit, with headroom for leaves that turn out larger.
+//
+// Failure at any point simply leaves the cache smaller or absent. Nothing
+// here is required for correctness; the reader falls back to the single
+// dir_buf slot it used before.
+static void leaf_cache_fit(uint32_t need) {
+    if (!need || need > LEAF_SLOT_MAX) return;
+
+    uint32_t want = need + need / 2;
+    if (want > LEAF_SLOT_MAX) want = LEAF_SLOT_MAX;
+
+    for (uint32_t i = 0; i < LOCAL_LEAF_SLOTS; i++) {
+        pmt_dir_slot_t *s = &g_leaf_slots[i];
+        if (s->buf && s->cap >= need) continue;
+
+        free(s->buf);
+        s->buf = (uint8_t *)ps_malloc(want);
+        s->cap = s->buf ? want : 0;
+        s->len = 0;                     // contents went with the old buffer
+        if (!s->buf) {
+            Serial.printf("netsource: leaf cache slot %lu (%lu KB) failed - "
+                          "caching %lu of %lu leaves\n",
+                          (unsigned long)i, (unsigned long)(want / 1024),
+                          (unsigned long)i, (unsigned long)LOCAL_LEAF_SLOTS);
+            return;
+        }
+        if (i == LOCAL_LEAF_SLOTS - 1)
+            Serial.printf("netsource: leaf cache %lu x %lu KB "
+                          "(leaf seen at %lu KB decompressed)\n",
+                          (unsigned long)LOCAL_LEAF_SLOTS,
+                          (unsigned long)(want / 1024),
+                          (unsigned long)(need / 1024));
+    }
+}
+
 // Grow a reader's scratch to suit the archive it just opened. Returns false
 // only if the allocation fails outright.
 static bool fit_buffers(pmt_t *p, uint8_t **raw, uint8_t **dir, uint8_t **root,
@@ -1272,14 +1331,31 @@ static bool local_try(uint8_t z, uint32_t x, uint32_t y,
         // within one archive - so switching archives must retire the previous
         // owner's claim, or the next lookup could match an offset from a
         // different file and read another archive's directory as its own.
+        //
+        // The leaf cache is shared on the same terms and carries the same
+        // hazard, so it changes hands here too: every slot is emptied and the
+        // array is handed to the new owner. Emptying is what makes sharing
+        // safe - a slot still holding the old archive's directory would match
+        // by offset alone.
         if (i != g_dir_owner) {
-            if (g_dir_owner >= 0 && g_dir_owner < g_local_n)
+            if (g_dir_owner >= 0 && g_dir_owner < g_local_n) {
                 g_locals[g_dir_owner].pmt.dir_len = 0;
+                g_locals[g_dir_owner].pmt.leaves  = nullptr;
+                g_locals[g_dir_owner].pmt.leaf_n  = 0;
+            }
+            for (uint32_t s = 0; s < LOCAL_LEAF_SLOTS; s++)
+                g_leaf_slots[s].len = 0;
+            src->pmt.leaves = g_leaf_slots;
+            src->pmt.leaf_n = LOCAL_LEAF_SLOTS;
             g_dir_owner = i;
         }
 
         uint32_t n = cap;
         if (pmt_get(&src->pmt, z, x, y, dst, &n) == PMT_OK) {
+            // dir_buf holds the leaf this lookup walked, so its decompressed
+            // size is now known and the slots can be sized to it. Costs a
+            // comparison per hit once they are allocated.
+            leaf_cache_fit(src->pmt.dir_len);
             *len = n;
             g_stats.local_hits++;
             return true;

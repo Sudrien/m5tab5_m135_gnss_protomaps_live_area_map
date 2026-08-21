@@ -80,6 +80,22 @@ typedef struct {
     int32_t  center_lon_e7, center_lat_e7;
 } pmt_header_t;
 
+// ---- leaf directory cache slot ---------------------------------------------
+// One decompressed directory, plus the identity of where it came from. The
+// caller owns `buf` and sets `cap`; everything else belongs to the reader.
+//
+// Zero the struct to mean empty. A slot whose buf is NULL is skipped, so a
+// caller that allocates lazily can hand over an array of zeroes and fill it
+// in as sizes become known.
+typedef struct {
+    uint8_t  *buf;
+    uint32_t  cap;
+    uint64_t  off;         // source offset these contents came from
+    uint32_t  srclen;      // source (compressed) length
+    uint32_t  len;         // decompressed length held, 0 = empty
+    uint32_t  used;        // LRU tick, highest is most recent
+} pmt_dir_slot_t;
+
 // ---- reader handle ---------------------------------------------------------
 typedef struct {
     pmt_header_t   hdr;
@@ -132,6 +148,36 @@ typedef struct {
     // and the leaf that follows overwrites dir_buf so the next lookup does it
     // again. Two full read-and-inflate cycles per tile instead of none.
     uint32_t  root_dec_len;
+
+    // ---- N-way leaf directory cache ---------------------------------------
+    //
+    // Optional and caller-owned, on the same terms as root_cache: this file
+    // still allocates nothing. Leave `leaves` NULL and behaviour is exactly
+    // the single dir_buf slot below.
+    //
+    // The single slot is enough while a lookup walks one leaf and stops. It
+    // is not enough across a working set of several. Three leaves in play -
+    // one for the z14 view, one for the z12 place block, one for the z6
+    // region block - evict each other in rotation, and each eviction costs a
+    // ~130 KB read and a full inflate on the next lookup that wants it back.
+    // In one boot log the same leaf was read at #5 and again at #12, and
+    // another at #3 and #22, purely because a third leaf landed in between.
+    //
+    // Slots are matched on (off, srclen) like the dir_buf slot, and chosen
+    // for replacement by lowest `used`, which is a plain monotonic tick
+    // rather than a timestamp so this stays free of any clock.
+    //
+    // A slot with a NULL buf, or one too small for the directory in hand, is
+    // simply not used: the caller may grow it on demand and a cache that
+    // cannot hold something must still not lie about holding it.
+    // Slots are not owned per-archive by necessity: the caller may share one
+    // array between several readers, provided it retires the previous owner
+    // by clearing each slot's len. Offsets are only meaningful within one
+    // archive, so a shared array that is not retired would match an offset
+    // from a different file - the same hazard the dir_buf slot already has.
+    pmt_dir_slot_t *leaves;
+    uint32_t        leaf_n;        // slots; 0 or NULL leaves = disabled
+    uint32_t        leaf_tick;     // LRU counter, bumped on every touch
 
     // Set whenever a call returns PMT_ENOMEM: the number of bytes that would
     // have been required. Leaf directory sizes are not described anywhere in

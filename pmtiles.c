@@ -142,6 +142,31 @@ pmt_err_t pmt_open(pmt_t *p) {
 // ---- directory load --------------------------------------------------------
 // Reads [off,len) from the archive, inflates it into p->dir_buf, and reports
 // the decompressed length. Uses the root cache when the range is the root.
+// Find a cached leaf holding exactly this directory, or NULL.
+static pmt_dir_slot_t *leaf_find(pmt_t *p, uint64_t off, uint32_t len) {
+    if (!p->leaves) return NULL;
+    for (uint32_t i = 0; i < p->leaf_n; i++) {
+        pmt_dir_slot_t *s = &p->leaves[i];
+        if (s->buf && s->len && s->off == off && s->srclen == len) return s;
+    }
+    return NULL;
+}
+
+// Pick the slot to overwrite: the first empty one, else the least recently
+// used. Slots too small for `need` are skipped rather than grown - this file
+// does not allocate - so a cache of undersized slots simply never fills.
+static pmt_dir_slot_t *leaf_victim(pmt_t *p, uint32_t need) {
+    if (!p->leaves) return NULL;
+    pmt_dir_slot_t *best = NULL;
+    for (uint32_t i = 0; i < p->leaf_n; i++) {
+        pmt_dir_slot_t *s = &p->leaves[i];
+        if (!s->buf || s->cap < need) continue;
+        if (!s->len) return s;                          // empty, take it
+        if (!best || s->used < best->used) best = s;
+    }
+    return best;
+}
+
 static pmt_err_t load_dir(pmt_t *p, uint64_t off, uint32_t len,
                           const uint8_t **out, uint32_t *out_len) {
     int is_root = (off == p->hdr.root_off && len == p->hdr.root_len);
@@ -157,6 +182,19 @@ static pmt_err_t load_dir(pmt_t *p, uint64_t off, uint32_t len,
         *out = p->dir_buf;
         *out_len = p->dir_len;
         return PMT_OK;
+    }
+
+    // Held in the leaf cache from some lookup further back. Checked after
+    // dir_buf because dir_buf is the same directory without the copy, and
+    // before the read because that is the whole point.
+    if (!is_root) {
+        pmt_dir_slot_t *s = leaf_find(p, off, len);
+        if (s) {
+            s->used = ++p->leaf_tick;
+            *out = s->buf;
+            *out_len = s->len;
+            return PMT_OK;
+        }
     }
 
     // From here dir_buf is about to be overwritten, so what it held is no
@@ -197,6 +235,23 @@ static pmt_err_t load_dir(pmt_t *p, uint64_t off, uint32_t len,
         p->dir_off = off;
         p->dir_srclen = len;
         p->dir_len = dec_len;
+
+        // Copy into the leaf cache so the next eviction of dir_buf does not
+        // lose it. The copy is the cost of this cache and it is worth it: it
+        // is a PSRAM memcpy against a re-read and re-inflate of the same
+        // directory, which is two orders of magnitude more work.
+        //
+        // Failure to place it is not an error anywhere - too few slots, or
+        // none large enough - and leaves the reader exactly as it was before
+        // this cache existed.
+        pmt_dir_slot_t *s = leaf_victim(p, dec_len);
+        if (s) {
+            memcpy(s->buf, p->dir_buf, dec_len);
+            s->off = off;
+            s->srclen = len;
+            s->len = dec_len;
+            s->used = ++p->leaf_tick;
+        }
     }
 
     *out = p->dir_buf;
