@@ -1029,7 +1029,16 @@ bool netsource_begin(const char *local_path) {
                 // already skipped the file by then - but it means the write
                 // is bounded by construction and not by an argument about
                 // control flow.
-                char full[1 + 255 + 1];
+                // Static, not automatic. This runs on the Arduino loop task,
+                // whose 8192-byte stack the alive line reports 964 bytes of
+                // headroom on - and that high-water mark is set during setup(),
+                // which is where this call sits. 257 bytes of it for a buffer
+                // used once at boot is a fifth of the remaining margin for
+                // nothing. netsource_begin() is called once, from one task,
+                // so there is no reentrancy to protect against; if that ever
+                // stops being true this has to go back on the stack and the
+                // stack has to grow to suit.
+                static char full[1 + 255 + 1];
                 const size_t lead = (n && n[0] == '/') ? 0 : 1;
                 const size_t cap  = sizeof full - lead - 1;
                 if (is_pmt && ln > cap) {
