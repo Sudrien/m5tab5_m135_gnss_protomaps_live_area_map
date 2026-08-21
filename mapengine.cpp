@@ -667,10 +667,13 @@ static bool load_place_tile(tile_id_t id, PlaceIndex *out, uint32_t want) {
 // The 3x3 block, built in one go so the index is never half-populated while
 // something is searching it.
 static uint32_t g_place_block_ms = 0, g_place_block_io_ms = 0;
+static uint32_t g_place_block_reads = 0, g_place_block_kb = 0;
 
 static bool load_place_block(tile_id_t centre, PlaceIndex *out, uint32_t want) {
     uint64_t t0 = esp_timer_get_time();
     s_place_io_us = 0;
+    uint32_t r0; uint64_t b0;
+    netsource_io_counters(&r0, &b0);
     out->z = centre.z;
     out->n = 0;
     int world = 1 << centre.z;
@@ -687,6 +690,10 @@ static bool load_place_block(tile_id_t centre, PlaceIndex *out, uint32_t want) {
     }
     g_place_block_ms    = (uint32_t)((esp_timer_get_time() - t0) / 1000);
     g_place_block_io_ms = s_place_io_us / 1000;
+    uint32_t r1; uint64_t b1;
+    netsource_io_counters(&r1, &b1);
+    g_place_block_reads = r1 - r0;
+    g_place_block_kb    = (uint32_t)((b1 - b0) / 1024);
     return ok > 0;
 }
 
@@ -755,13 +762,15 @@ static void worker_task(void *arg) {
             // fetches the next - so bracketing netsource_get_local() alone
             // captures bus time with no rasteriser work folded into it.
             Serial.printf("map: %s block z%u/%ld/%ld %s (%u places) "
-                          "in %lu ms (io %lu ms over 9 tiles)\n",
+                          "in %lu ms (io %lu ms, %lu reads, %lu KB over 9 tiles)\n",
                           region ? "region" : "place",
                           (unsigned)job.id.z, (long)job.id.x, (long)job.id.y,
                           ok ? "read" : "FAILED",
                           (unsigned)(ok ? scratch->n : 0),
                           (unsigned long)g_place_block_ms,
-                          (unsigned long)g_place_block_io_ms);
+                          (unsigned long)g_place_block_io_ms,
+                          (unsigned long)g_place_block_reads,
+                          (unsigned long)g_place_block_kb);
             // Hitting the cap means the decode was cut short and the index is
             // whatever happened to come first, which is not the same as the
             // nearest. Worth saying out loud rather than quietly answering

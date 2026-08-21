@@ -557,9 +557,56 @@ static void local_close(local_src_t *src) {
 
 // Reads come from whichever archive asked, passed through io_ctx - there is no
 // longer a single local file to reach for.
+// Every read a local archive makes passes through here - directory levels and
+// tile bodies alike - so this is the one place that can say what an archive
+// lookup actually costs in trips to the medium.
+//
+// Nothing reported that before. Remote fetches log an offset and a length per
+// tile, but local reads were silent, so a place block that took 5.7 seconds
+// gave no clue whether that was one slow read or thirty ordinary ones. The
+// difference matters: pmt_find() walks root, then any intermediate levels,
+// then a leaf, and only the root has a cache of its own. Everything below it
+// shares the single dir_off/dir_srclen/dir_len slot, so on an archive deep
+// enough to have two levels under the root, each level overwrites the other
+// and neither survives to the next tile.
+//
+// Reads per tile is what distinguishes the cases, and it does so cleanly.
+// Depth 2 with a working leaf cache is about one read per tile - nine
+// adjacent tiles share a leaf, so eight of nine skip the directory entirely.
+// Depth 3 with the slot thrashing is three: two directories and a body, every
+// time, with nothing ever reused.
+static uint32_t g_io_reads = 0;
+static uint64_t g_io_bytes = 0;
+
+void netsource_io_counters(uint32_t *reads, uint64_t *bytes) {
+    if (reads) *reads = g_io_reads;
+    if (bytes) *bytes = g_io_bytes;
+}
+
 static int sd_read(void *ctx, uint64_t off, uint32_t len, uint8_t *dst) {
     local_src_t *src = (local_src_t *)ctx;
     if (!src) return -1;
+
+    g_io_reads++;
+    g_io_bytes += len;
+
+    // The first few reads, spelled out.
+    //
+    // Remote fetches have always logged an offset and a length per tile;
+    // local ones logged nothing, so the shape of a lookup was invisible. A
+    // couple of dozen lines is enough to read it directly: a lookup that
+    // shows one read per tile is being served from cached directories, and
+    // one that shows a repeating three - two directory-sized reads then a
+    // tile-sized one - is walking the tree from scratch every time.
+    //
+    // Bounded rather than gated on a flag, because the pattern is identical
+    // from the tenth read to the ten-thousandth. Twenty-four lines at boot
+    // costs nothing and needs no switch to remember to turn on.
+    if (g_io_reads <= 24) {
+        Serial.printf("netsource: read #%lu %s off %llu len %lu\n",
+                      (unsigned long)g_io_reads, src->path,
+                      (unsigned long long)off, (unsigned long)len);
+    }
 
     // The 64-bit reader when the archive was opened with one. bigfile_read()
     // already matches pmt_read_fn, chunks by STORAGE_IO_CHUNK for the same USB

@@ -79,6 +79,13 @@ bool netsource_get_local(uint8_t z, uint32_t x, uint32_t y,
 // the SD cache is a second copy of a file already sitting on the same card.
 bool netsource_local_covers(uint8_t z, uint32_t x, uint32_t y);
 
+// Reads and bytes issued against local archives since boot, counted at the
+// single read callback every PMTiles lookup goes through - directory levels
+// and tile bodies alike. Monotonic; sample either side of a piece of work and
+// subtract. Reads per tile is the figure that shows whether the directory
+// cache is being reused or thrashed.
+void netsource_io_counters(uint32_t *reads, uint64_t *bytes);
+
 // Populate the offline floor by pulling every tile from z0 to maxz into the
 // cache. 5461 tiles at maxz 6; slow (one request each) but resumable, since
 // anything already cached is skipped. `buf`/`cap` is scratch for one tile.
