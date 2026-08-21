@@ -46,7 +46,16 @@ static void IRAM_ATTR ppsIsr() {
     uint32_t d = now - g_ppsLast;
     if (g_ppsLast && d < PPS_RESTART_MS) g_ppsInterval = d;
     g_ppsLast = now;
-    g_ppsCount++;
+    // Written as a load, an add and a store rather than as ++. C++20
+    // deprecates compound assignment and increment on a volatile lvalue,
+    // because the standard leaves the number of accesses to the object
+    // unspecified - and volatile exists here precisely to make accesses
+    // countable. The generated code is the same; only the spelling changes.
+    //
+    // Not made atomic. This is the sole writer, the reader is a single
+    // uint32_t load from a task, and a torn read of an edge counter is not a
+    // failure mode on a 32-bit target.
+    g_ppsCount = g_ppsCount + 1;
 }
 
 // ---- parsing (unchanged from the working sketch) ----------------------------
