@@ -65,6 +65,7 @@ float compass_heading()             { return -1.0f; }
 float compass_field_ut()            { return 0.0f; }
 float compass_roll()                { return 0.0f; }
 float compass_pitch()               { return 0.0f; }
+uint32_t compass_last_motion_ms()   { return 0; }
 void  compass_set_position(double, double) { }
 void  compass_calibrate_start()        { }
 void  compass_calibrate_start_refine() { }
@@ -119,6 +120,37 @@ static TaskHandle_t s_owner = nullptr;
 
 static float s_heading = -1.0f;
 static float s_field   = 0.0f;
+
+// ---- handling detection ---------------------------------------------------
+//
+// A low-passed gravity vector, and the last time the instantaneous reading
+// departed from it. At rest the two agree to within the part's noise; tilting,
+// lifting or knocking the device separates them for as long as the movement
+// lasts and then the filter catches up. That makes this a detector of *change*
+// in attitude rather than of any particular attitude, which is what "someone
+// is handling this" looks like from an accelerometer.
+//
+// Counts, not g. BMI270 at BMI2_ACC_RANGE_2G is 16384 counts/g, but nothing
+// here needs the conversion: the threshold is the only tuned number and it is
+// as easy to state in counts.
+static float    s_grav[3]     = { 0, 0, 0 };
+static bool     s_grav_valid  = false;
+static uint32_t s_motion_ms   = 0;
+static uint8_t  s_motion_run  = 0;
+
+// About 0.05 g. Comfortably above the noise floor of an OSR4-averaged 2 g
+// reading sitting on a desk, and below what a deliberate tilt produces.
+static const float MOTION_COUNTS = 800.0f;
+
+// Samples arrive at 10 Hz, so two in a row is 200 ms of sustained departure.
+// One is enough to be a single knocked-table transient.
+static const uint8_t MOTION_RUN_NEEDED = 2;
+
+// How fast the filter forgets. At 10 Hz this settles a new attitude in a
+// couple of seconds, so holding the device at a new angle stops counting as
+// motion shortly after it stops moving - which is correct, since by then
+// nothing is changing.
+static const float GRAV_ALPHA = 0.08f;
 static float s_declination = 0.0f;
 static float s_roll  = 0.0f;
 static float s_pitch = 0.0f;
@@ -1031,6 +1063,55 @@ void compass_update() {
     if (millis() - last < 100) return;
     last = millis();
 
+    // Accelerometer straight out of the data registers rather than through
+    // bmi2_get_sensor_data(), matching what the source project does. The
+    // units cancel in the roll/pitch atan2s below - only the ratios matter -
+    // so raw counts are exactly as good here as scaled g, and this avoids a
+    // second Bosch call path that would need its own verification.
+    //
+    // src: BMI270 datasheet, DATA_8..DATA_13 at 0x0C, X/Y/Z little-endian.
+    //
+    // Read before the magnetometer, and before the calibration branch below
+    // returns early. Handling detection exists precisely for the case where
+    // the magnetometer is not to be trusted, so it cannot sit downstream of a
+    // successful BMM150 read; and a device being tumbled through a
+    // calibration sweep is the most thoroughly handled it ever is.
+    uint8_t raw[6];
+    if (!M5.In_I2C.readRegister(BMI270_M135_ADDR, 0x0C, raw, sizeof raw, I2C_FREQ))
+        return;
+    float ax = (float)(int16_t)(raw[1] << 8 | raw[0]);
+    float ay = (float)(int16_t)(raw[3] << 8 | raw[2]);
+    float az = (float)(int16_t)(raw[5] << 8 | raw[4]);
+
+    if (!s_grav_valid) {
+        s_grav[0] = ax; s_grav[1] = ay; s_grav[2] = az;
+        s_grav_valid = true;
+    } else {
+        float dx = ax - s_grav[0], dy = ay - s_grav[1], dz = az - s_grav[2];
+        // Vector distance rather than a change in magnitude. A pure rotation
+        // barely changes |a| at all - gravity is still gravity - so a
+        // magnitude test would miss the commonest handling there is, which is
+        // picking the device up and turning it to look at it.
+        float dev = sqrtf(dx * dx + dy * dy + dz * dz);
+
+        if (dev > MOTION_COUNTS) {
+            if (s_motion_run < MOTION_RUN_NEEDED) s_motion_run++;
+            if (s_motion_run >= MOTION_RUN_NEEDED) {
+                // Zero means "never", so the wrap has to skip it. Once per
+                // 49.7 days, and the cost of getting it wrong is one missed
+                // undim.
+                s_motion_ms = millis();
+                if (!s_motion_ms) s_motion_ms = 1;
+            }
+        } else {
+            s_motion_run = 0;
+        }
+
+        s_grav[0] += (ax - s_grav[0]) * GRAV_ALPHA;
+        s_grav[1] += (ay - s_grav[1]) * GRAV_ALPHA;
+        s_grav[2] += (az - s_grav[2]) * GRAV_ALPHA;
+    }
+
     struct bmm150_mag_data md;
     if (bmm150_read_mag_data(&md, &s_bmm) != BMM150_OK) return;
 
@@ -1061,20 +1142,6 @@ void compass_update() {
     my = (my - s_offset[1]) * s_scale[1];
     mz = (mz - s_offset[2]) * s_scale[2];
     s_field = sqrtf(mx * mx + my * my + mz * mz);
-
-    // Accelerometer straight out of the data registers rather than through
-    // bmi2_get_sensor_data(), matching what the source project does. The
-    // units cancel in the roll/pitch atan2s below - only the ratios matter -
-    // so raw counts are exactly as good here as scaled g, and this avoids a
-    // second Bosch call path that would need its own verification.
-    //
-    // src: BMI270 datasheet, DATA_8..DATA_13 at 0x0C, X/Y/Z little-endian.
-    uint8_t raw[6];
-    if (!M5.In_I2C.readRegister(BMI270_M135_ADDR, 0x0C, raw, sizeof raw, I2C_FREQ))
-        return;
-    float ax = (float)(int16_t)(raw[1] << 8 | raw[0]);
-    float ay = (float)(int16_t)(raw[3] << 8 | raw[2]);
-    float az = (float)(int16_t)(raw[5] << 8 | raw[4]);
 
     // Axis remap, magnetometer -> accelerometer frame.
     //
@@ -1144,6 +1211,7 @@ float compass_heading()  { return s_calibrated ? s_heading : -1.0f; }
 float compass_roll()     { return s_roll; }
 float compass_pitch()    { return s_pitch; }
 float compass_field_ut() { return s_field; }
+uint32_t compass_last_motion_ms() { return s_motion_ms; }
 const char *compass_status() { return s_status; }
 
 #endif // COMPASS_HAVE_BOSCH

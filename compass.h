@@ -126,6 +126,17 @@ void compass_set_position(double lat, double lon);
 float compass_roll();
 float compass_pitch();
 
+// millis() when the device was last being handled, or 0 if it has not been
+// since boot. Derived from the accelerometer alone - it needs no calibration
+// and does not care whether the magnetometer answered, which is the point:
+// it is available in exactly the cases where the heading is not.
+//
+// "Handled" means the attitude changed, not that the device is in motion. A
+// device riding in a moving car sits at a constant attitude and will not
+// register here; a stationary one being picked up will. Anything wanting
+// motion in the travelling sense should ask GNSS for speed instead.
+uint32_t compass_last_motion_ms();
+
 void compass_calibrate_start();
 
 // Restart calibration keeping the accumulated fit, so a second sweep improves

@@ -446,6 +446,13 @@ static BrightMode g_brightMode = BRIGHTM_AUTO;
 //
 // src: all three are judgements, unattributed - see PROVENANCE.md.
 static const uint32_t IDLE_DIM_MS    = 120000;   // two minutes
+
+// How long after the last handling the screen stays up. Long enough that
+// setting the device down mid-glance does not dim it in your hand, short
+// enough that a bump in a glovebox costs seconds rather than minutes. The
+// two-minute untouched window still has to elapse again from the touch, so
+// this only governs the accelerometer path.
+static const uint32_t IDLE_UNDIM_HOLD_MS = 15000;
 static const int      IDLE_DIM_PCT   = 40;
 static const uint8_t  IDLE_DIM_FLOOR = 30;
 static uint8_t g_brightness = BRIGHT_DAY;
@@ -600,15 +607,23 @@ static uint8_t brightnessWanted() {
 // against the flip-flopping a single threshold would cause, and a second
 // independent notion of stopped would be free to disagree with it.
 //
-// Entry and exit are deliberately asymmetric - slow to dim, immediate to
+// Entry and exit are deliberately asymmetric - slow to dim, quick to
 // brighten:
 //
 //   - Entry waits for the settled IDLE band. Being slow costs nothing but a
 //     few seconds of light.
-//   - Exit takes the instantaneous speed, which crosses GNSS_SLOW_KMH some
-//     ten to twenty seconds before the band follows it. Without that, pulling
-//     away from a stop would leave the screen dim for the whole settle
-//     window, which is precisely the manoeuvre where it is being looked at.
+//   - Exit takes the near-instantaneous speed, which crosses GNSS_SLOW_KMH
+//     some ten to twenty seconds before the band follows it. Without that,
+//     pulling away from a stop would leave the screen dim for the whole
+//     settle window, which is precisely the manoeuvre where it is being
+//     looked at.
+//
+// Speed is not the only way out, though, and on this device it is the weaker
+// one. Standing still with the screen dim, the things that should bring it
+// back - picking it up, turning it to read it, setting it down again - move
+// the device without moving its position, and GNSS is blind to all of them.
+// The accelerometer sees exactly those and nothing else, so it carries the
+// stationary case and speed carries the travelling one.
 //
 // No fix, or a 2D-only fix, means no dim. gnssRatePolicy() holds the rate at
 // FAST in those cases, so the band test below already refuses, but the
@@ -622,8 +637,35 @@ static bool idleDimmed(const GnssFix &fix) {
     // itself - the difference stays correct across it.
     if (millis() - g_lastTouchMs < IDLE_DIM_MS) return false;
 
-    if (gnss_coarse(fix) && fix.mode == 3 && fix.speedKmh >= GNSS_SLOW_KMH)
-        return false;
+    // Picked up, tilted, or knocked. This is the exit that matters standing
+    // still: GNSS cannot distinguish a device being read in the hand from one
+    // face-down on a seat, because neither is going anywhere, and the
+    // accelerometer can. It needs no calibration and no magnetometer, so it
+    // works on a board where the heading does not.
+    uint32_t moved = compass_last_motion_ms();
+    if (moved && millis() - moved < IDLE_UNDIM_HOLD_MS) return false;
+
+    // Speed, but not on one sample of it. A stationary receiver with a
+    // partial sky view reports occasional multi-km/h epochs - 7.0 km/h
+    // parked, in one log - and a single-sample exit turned those into a
+    // visible dim/undim blink. Two in a row is still well inside the
+    // pulling-away case the instantaneous read exists to serve, and costs one
+    // fix interval.
+    //
+    // Counted per epoch, keyed on the RMC timestamp. lastSentence would tick
+    // several times within one epoch - GGA, GSA, RMC - and count a single
+    // noisy fix as the two the test is asking for.
+    static uint8_t fastEpochs = 0;
+    static char lastUtc[16] = "";
+    if (strcmp(fix.utc, lastUtc) != 0) {
+        snprintf(lastUtc, sizeof lastUtc, "%s", fix.utc);
+        if (gnss_coarse(fix) && fix.mode == 3 && fix.speedKmh >= GNSS_SLOW_KMH) {
+            if (fastEpochs < 2) fastEpochs++;
+        } else {
+            fastEpochs = 0;
+        }
+    }
+    if (fastEpochs >= 2) return false;
 
     return gnss_rate_ms() == GNSS_RATE_IDLE;
 }
