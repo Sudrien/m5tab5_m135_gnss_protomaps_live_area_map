@@ -1510,8 +1510,13 @@ static void update_place_names(double wx, double wy) {
     // "Michigan" every few tiles.
     for (int r = 0; r < PL_COUNT; r++) {
         if (!pick[r]) continue;
-        strncpy(g_place[r], pick[r]->text, LABEL_TEXT_MAX - 1);
-        g_place[r][LABEL_TEXT_MAX - 1] = 0;
+        // snprintf, not strncpy plus a hand-written terminator. The old form
+        // was correct - the next line always wrote the NUL that a maximal
+        // source leaves out - but -Wstringop-truncation fires on the strncpy
+        // itself and does not look at what follows, so at -O2 it is an error
+        // for a bug that was not there. Both are char[LABEL_TEXT_MAX], so
+        // nothing is lost that was not already being truncated.
+        snprintf(g_place[r], LABEL_TEXT_MAX, "%s", pick[r]->text);
     }
     // The neighbourhood is the exception, cleared rather than held: its radius
     // is small by design, so a stale one claims a district you have left.

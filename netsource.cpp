@@ -1004,8 +1004,33 @@ bool netsource_begin(const char *local_path) {
                 const char *n = e.name();
                 size_t ln = n ? strlen(n) : 0;
                 bool is_pmt = ln > 8 && strcmp(n + ln - 8, ".pmtiles") == 0;
-                char full[48];
-                if (is_pmt) snprintf(full, sizeof full, "%s%s", n[0] == '/' ? "" : "/", n);
+                // 48 was not enough for a real name. CONFIG_FATFS_MAX_LFN is
+                // 255, so a leading slash, the name and the NUL need 257, and
+                // anything longer than about 46 characters was previously
+                // truncated here and then handed to try_open() as a path that
+                // cannot exist - a file silently absent from the map for no
+                // stated reason, which is the failure mode this file works
+                // hardest to avoid elsewhere.
+                //
+                // The length is checked before formatting rather than after.
+                // Testing snprintf's return value would catch it too, but it
+                // leaves the compiler unable to bound strlen(n) on the path
+                // that formats, so -Wformat-truncation stays on at -O2. This
+                // way the bound is a fact on that path and the warning has
+                // nothing to say. It also puts the skip where it can name the
+                // file, which the return-value form cannot do as clearly.
+                char full[1 + 255 + 1];
+                if (is_pmt) {
+                    const char *lead = (n[0] == '/') ? "" : "/";
+                    if (ln + strlen(lead) >= sizeof full) {
+                        Serial.printf("netsource: skipping %s - name too long "
+                                      "for a %u-byte path\n",
+                                      n, (unsigned)sizeof full);
+                        is_pmt = false;
+                    } else {
+                        snprintf(full, sizeof full, "%s%s", lead, n);
+                    }
+                }
                 e.close();
                 if (is_pmt) try_open(full);
                 if (g_local_n >= LOCAL_ARCHIVE_MAX) break;
