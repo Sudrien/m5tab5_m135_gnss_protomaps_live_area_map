@@ -450,6 +450,10 @@ static const int      IDLE_DIM_PCT   = 40;
 static const uint8_t  IDLE_DIM_FLOOR = 30;
 static uint8_t g_brightness = BRIGHT_DAY;
 
+// Defined here rather than with the button state below because idleDimmed()
+// reads it several hundred lines earlier than the touch handler writes it.
+static uint32_t g_lastTouchMs = 0;
+
 // Split from sunIsUp() so the boot path can ask the same question about a
 // remembered position, before any fix exists. See themeBoot().
 static bool sunIsUpAt(double lat, double lon) {
@@ -745,7 +749,6 @@ enum { BTN_CACHE = 0, BTN_THEME, BTN_BRIGHT, BTN_POI, BTN_PINS,
 // decisions rather than one.
 
 static uint32_t g_confirmUntil = 0;      // armed state for the cache button
-static uint32_t g_lastTouchMs = 0;
 
 static void buttonRect(int i, int *x, int *y, int *w, int *h) {
     if (!g_panelOk) { *x = *y = *w = *h = 0; return; }
