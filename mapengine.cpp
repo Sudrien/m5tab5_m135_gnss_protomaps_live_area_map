@@ -2471,14 +2471,23 @@ void map_draw(const GnssFix &fix) {
     uint32_t cpu_ms = cpu_us / 1000;
     uint32_t stall  = ms > cpu_ms ? ms - cpu_ms : 0;
 
-    g_stats.last_draw_ms      = ms;
-    g_stats.draw_total_ms    += ms;
-    g_stats.last_draw_cpu_ms  = cpu_ms;
-    g_stats.draw_cpu_total_ms += cpu_ms;
+    // With no run-time counter, work is wall and stall is zero. That keeps the
+    // arithmetic below honest instead of reporting every draw as fully
+    // stalled; cpu_time_valid is what tells the reader which case this is.
+#if !MAP_CPU_TIME_OK
+    cpu_ms = ms;
+    stall  = 0;
+#endif
+
+    g_stats.last_draw_work_ms   = cpu_ms;
+    g_stats.draw_work_total_ms += cpu_ms;
+    g_stats.last_draw_wall_ms   = ms;
+    g_stats.draw_wall_total_ms += ms;
     g_stats.draws++;
-    g_stats.cpu_time_valid    = (MAP_CPU_TIME_OK != 0);
-    if (ms > g_stats.max_draw_ms)    g_stats.max_draw_ms = ms;
-    if (stall > g_stats.max_stall_ms) g_stats.max_stall_ms = stall;
+    g_stats.cpu_time_valid      = (MAP_CPU_TIME_OK != 0);
+    if (cpu_ms > g_stats.max_draw_work_ms) g_stats.max_draw_work_ms = cpu_ms;
+    if (ms     > g_stats.max_draw_wall_ms) g_stats.max_draw_wall_ms = ms;
+    if (stall  > g_stats.max_stall_ms)     g_stats.max_stall_ms     = stall;
 }
 
 // ---- background fetchers ---------------------------------------------------

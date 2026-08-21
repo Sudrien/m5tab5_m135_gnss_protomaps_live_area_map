@@ -2797,7 +2797,8 @@ static void drawStatus(const GnssFix &fix) {
                  (unsigned long)st.rendered, (unsigned long)st.queue_depth,
                  (unsigned long)ns.local_hits,
                  (unsigned long)st.last_render_ms,
-                 (unsigned long)st.last_draw_ms, (unsigned long)st.max_draw_ms,
+                 (unsigned long)st.last_draw_work_ms,
+                 (unsigned long)st.max_draw_work_ms,
                  (unsigned)ns.locals, ns.locals == 1 ? "" : "s");
     } else {
         snprintf(buf, sizeof buf,
@@ -2807,7 +2808,8 @@ static void drawStatus(const GnssFix &fix) {
                  (unsigned long)ns.cache_hits, (unsigned long)ns.net_hits,
                  (unsigned long)ns.local_hits,
                  (unsigned long)st.last_render_ms,
-                 (unsigned long)st.last_draw_ms, (unsigned long)st.max_draw_ms,
+                 (unsigned long)st.last_draw_work_ms,
+                 (unsigned long)st.max_draw_work_ms,
                  (unsigned long)cs.entries,
                  ns.build[0] ? ns.build : "none", ns.online ? "" : " (offline)");
     }
@@ -3787,8 +3789,9 @@ void loop() {
                           "max %lu avg %lu over %lu  q%lu  cache %lu/%lu net %lu  "
                           "coarse %lu/%lug%luw  psram %u KB\n",
                           (unsigned long)st.rendered, (unsigned long)st.last_render_ms,
-                          (unsigned long)st.last_draw_ms, (unsigned long)st.max_draw_ms,
-                          (unsigned long)(st.draws ? st.draw_total_ms / st.draws : 0),
+                          (unsigned long)st.last_draw_work_ms,
+                          (unsigned long)st.max_draw_work_ms,
+                          (unsigned long)(st.draws ? st.draw_work_total_ms / st.draws : 0),
                           (unsigned long)st.draws, (unsigned long)st.queue_depth,
                           (unsigned long)ns.cache_hits, (unsigned long)cs.entries,
                           (unsigned long)ns.net_hits,
@@ -3796,32 +3799,25 @@ void loop() {
                           (unsigned long)st.coarse_gap,
                           (unsigned long)st.coarse_wait,
                           (unsigned)(ESP.getFreePsram() / 1024));
-            // Wall clock against CPU, on its own line.
+            // Wall clock and preemption, on their own line.
             //
-            // The blit figures above are wall clock and so include time the UI
-            // task was ready but not running. That is the difference between
-            // "compositing is expensive" and "something outranked us", and the
-            // two want completely different fixes - the first is the per-row
-            // push loop in blit_region, the second is nothing blit_region can
-            // do anything about. Wi-Fi scans have produced three-second draws
-            // on a parked device that rendered nothing, so this is not a
-            // theoretical distinction.
-            //
-            // Read it as: cpu is real work, stall is time lost to preemption.
-            // If avg-cpu tracks avg and stall stays near zero, the blit is
-            // genuinely slow. If avg-cpu is small and max-stall is seconds,
-            // the wall-clock numbers above are measuring the scheduler.
+            // The blit figures above are work now, so this line carries what
+            // they no longer do: wall clock, and how much of it was spent not
+            // running. Read the two together - blit avg is what compositing
+            // costs, stall max is how long the UI task has been frozen out by
+            // something higher priority, and the second is a scheduling
+            // problem that no amount of work on blit_region will touch.
             if (st.cpu_time_valid) {
-                Serial.printf("draw:  cpu last %lu ms avg %lu ms   stall max %lu ms"
-                              "   (wall avg %lu ms over %lu)\n",
-                              (unsigned long)st.last_draw_cpu_ms,
-                              (unsigned long)(st.draws ? st.draw_cpu_total_ms / st.draws : 0),
+                Serial.printf("draw:  wall last %lu ms max %lu avg %lu"
+                              "   stall max %lu ms   over %lu\n",
+                              (unsigned long)st.last_draw_wall_ms,
+                              (unsigned long)st.max_draw_wall_ms,
+                              (unsigned long)(st.draws ? st.draw_wall_total_ms / st.draws : 0),
                               (unsigned long)st.max_stall_ms,
-                              (unsigned long)(st.draws ? st.draw_total_ms / st.draws : 0),
                               (unsigned long)st.draws);
             } else {
-                Serial.println("draw:  cpu time unavailable "
-                               "(CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS is off)");
+                Serial.println("draw:  wall only - no run-time counter in this "
+                               "build, so the blit figures above are wall clock");
             }
 
             // Separate line rather than more fields on that one: the compass

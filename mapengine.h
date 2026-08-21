@@ -43,29 +43,35 @@ struct MapStats {
     uint32_t last_render_ms = 0;
     uint32_t queue_depth = 0;
 
-    // Compositing cost, to separate "the map is slow to appear" (rendering)
-    // from "the map is slow to update" (blitting).
-    uint32_t last_draw_ms = 0, max_draw_ms = 0;
-    uint32_t draw_total_ms = 0, draws = 0;
+    // Compositing cost, split into work done and time merely elapsed.
+    //
+    // These used to be wall clock, and wall clock turned out to be measuring
+    // the wrong thing most of the time. A Wi-Fi scan runs ESP-Hosted tasks at
+    // priority 23 against loop() at priority 1, and a measured draw of 2773 ms
+    // was 2550 ms of that spent descheduled - so the headline "blit" figure was
+    // reporting the scheduler, on a parked device that had rendered nothing.
+    // An average of 411 ms against 39 ms of actual work is not a number anyone
+    // can act on, and it is the number the status bar puts on the panel.
+    //
+    // So the fields that get read as "how expensive is compositing" now carry
+    // work: the task's own run time across the draw, which is what changing
+    // blit_region could affect. They are named _work_ so that nothing silently
+    // keeps its old meaning under the same identifier - a rename the compiler
+    // enforces, rather than a redefinition a reader has to notice.
+    //
+    // Wall and stall are kept alongside, because the gap between them is the
+    // preemption problem and it is worth watching in its own right. wall is
+    // never less than work; stall is the difference.
+    uint32_t last_draw_work_ms = 0, max_draw_work_ms = 0;
+    uint32_t draw_work_total_ms = 0;
+    uint32_t last_draw_wall_ms = 0, max_draw_wall_ms = 0;
+    uint32_t draw_wall_total_ms = 0;
+    uint32_t max_stall_ms = 0;
+    uint32_t draws = 0;
 
-    // ...and to separate both from "the UI task was not running".
-    //
-    // The draw figures above are wall clock, so they include any time the
-    // task spent descheduled inside the timed region. On this board that is
-    // not a rounding error: a Wi-Fi scan runs ESP-Hosted tasks at priority 23
-    // against loop() at priority 1, and single draws of three seconds have
-    // been logged on a parked device that rendered nothing at all. Averaging
-    // those into draw_total_ms makes the mean useless exactly when something
-    // looks wrong.
-    //
-    // cpu is the same region measured by the task's own run-time counter (via
-    // vTaskGetInfo, since IDF has no per-task ulTaskGetRunTimeCounter), so
-    // wall minus cpu is time the task was ready but not running. A blit that
-    // is genuinely expensive shows a large cpu; one that was merely preempted
-    // shows a small cpu and a large stall. Nothing here changes the existing
-    // fields - they still mean what they meant - these sit alongside.
-    uint32_t last_draw_cpu_ms = 0, max_stall_ms = 0;
-    uint32_t draw_cpu_total_ms = 0;
+    // False when the run-time counter is unavailable at build time, in which
+    // case work is a copy of wall and stall is always zero. The stats line says
+    // so rather than presenting the copy as a measurement.
     bool     cpu_time_valid = false;
 };
 
