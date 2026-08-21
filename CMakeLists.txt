@@ -941,3 +941,67 @@ if(TAB5_VARIANT_INSTALLED_LATE OR M5_PATCHED_LATE)
         "slot powered through an LDO channel this board does not use. Both "
         "fail quietly. See DISPLAY_IDF_NOTES.md.")
 endif()
+
+# ---------------------------------------------------------------------------
+# -Wno-error=stringop-truncation for managed components.
+#
+# Surfaced by the switch to -O2, and not a bug this build introduced. The
+# warning needs the compiler to know how long the source string is, and at -Os
+# it does not bother computing that, so the same code is silent. -O2 tracks it
+# and esp-modbus trips over it:
+#
+#     port_tcp_utils.c:677:9: error: 'strncpy' specified bound depends on the
+#     length of the source argument [-Werror=stringop-truncation]
+#         strncpy(temp_str, *dns_name, strlen(*dns_name));
+#
+# Upstream's code, in a component this project never calls. esp-modbus arrives
+# transitively through arduino-esp32 - the FMB_* block in the imported
+# sdkconfig is the same thing showing up in the configuration - so it cannot
+# simply be dropped from the dependency list, and it gets compiled whether or
+# not a single symbol from it is linked.
+#
+# Note that the hint idf.py prints when this fails is wrong for this warning:
+#
+#     To suppress these warnings use 'idf.py menuconfig' to enable configure
+#     option 'Compiler options' -> 'Disable errors for default warnings'
+#
+# That is CONFIG_COMPILER_DISABLE_DEFAULT_ERRORS, which this project already
+# sets to y (it comes in with the import). All it does is swap -Werror for
+# -Werror=all, and -Wstringop-truncation is part of -Wall, so it stays an
+# error. Verified with gcc 13 directly: -Wall -Werror=all still fails, and
+# -Wno-error=stringop-truncation is what actually lets it through. Following
+# the hint means turning on an option that is already on and concluding the
+# toolchain is broken.
+#
+# Scoped to the component rather than the build. A global
+# idf_build_set_property(COMPILE_OPTIONS ...) would also cover raster.c, mvt.c
+# and inflate.c, which do their own bounded copying and are exactly the code
+# that should still fail loudly on this. Demoted to a warning, not silenced,
+# so it stays visible if upstream's code changes shape.
+#
+# Guarded on presence: the component list is only populated after project(),
+# and asking for a COMPONENT_LIB that does not exist is a hard configure error
+# - which would make a dependency graph without modbus in it fail to build for
+# the sake of a warning it never emits.
+#
+# The type check is the same kind of guard. A component that registers no
+# sources becomes an INTERFACE library, and target_compile_options(... PRIVATE)
+# on one of those is a CMake error rather than a no-op. esp-modbus has sources
+# today; this costs one line and means it stays true if it ever stops having
+# them.
+set(TAB5_WERROR_DEMOTE
+    espressif__esp-modbus)
+
+idf_build_get_property(TAB5_BUILD_COMPONENTS BUILD_COMPONENTS)
+foreach(comp IN LISTS TAB5_WERROR_DEMOTE)
+    if("${comp}" IN_LIST TAB5_BUILD_COMPONENTS)
+        idf_component_get_property(comp_type ${comp} COMPONENT_TYPE)
+        if(comp_type STREQUAL "LIBRARY")
+            idf_component_get_property(comp_lib ${comp} COMPONENT_LIB)
+            target_compile_options(${comp_lib} PRIVATE
+                                   -Wno-error=stringop-truncation)
+            message(STATUS
+                "warnings: ${comp} built with -Wno-error=stringop-truncation")
+        endif()
+    endif()
+endforeach()
