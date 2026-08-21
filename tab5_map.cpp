@@ -998,7 +998,14 @@ static void drawPinPanel(const GnssFix &fix) {
     static char lastSig[256] = "";
     static bool haveLast = false;
     if (haveLast && strcmp(sig, lastSig) == 0) return;
-    strncpy(lastSig, sig, sizeof lastSig - 1);
+    // snprintf rather than strncpy, and not only to quiet -Wstringop-truncation
+    // at -O2. Source and destination are the same size here, so the copy is
+    // bounded at sizeof - 1 and a maximal sig leaves strncpy writing no
+    // terminator at all; what saves it is that lastSig is static, hence
+    // zero-initialised, and its final byte is never written. That is true and
+    // unstated, and it stops being true the moment this buffer stops being
+    // static. snprintf terminates unconditionally and needs no such argument.
+    snprintf(lastSig, sizeof lastSig, "%s", sig);
     haveLast = true;
 
     // Everything below draws in panel-local coordinates, so the same code
@@ -2826,7 +2833,8 @@ static void drawStatus(const GnssFix &fix) {
     snprintf(combined, sizeof combined, "%s|%s|%s|%s|%ld",
              statusLine1, buf, place, nav, (long)(nowt / 60));
     if (strcmp(combined, last) == 0 && millis() - lastDraw < 2000) return;
-    strncpy(last, combined, sizeof last - 1);
+    // snprintf, for the reason given at the lastSig copy in drawPinPanel().
+    snprintf(last, sizeof last, "%s", combined);
     lastDraw = millis();
 
     // Amber for an estimate: neither the green of a fix nor the red of
