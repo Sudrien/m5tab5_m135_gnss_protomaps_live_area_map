@@ -62,12 +62,32 @@ struct MapStats {
     // Wall and stall are kept alongside, because the gap between them is the
     // preemption problem and it is worth watching in its own right. wall is
     // never less than work; stall is the difference.
+    // Windowed, not since boot - see map_stats_reset_window().
+    //
+    // Cumulative was actively misleading here. On a three-minute parked log
+    // the max froze at a single event 56 s in and never moved again, while
+    // the average slid 30 -> 21 -> 16 -> 13 -> 11 -> 9 -> 8 -> 7 -> 6 ms as
+    // marker-rect early-outs at 0 ms diluted the mean. By the end the line
+    // read "avg 6 max 156" and neither number described anything that was
+    // happening. A drive would be worse: one grid shift sets the max, and
+    // everything after averages into a flatter and flatter mean, so twenty
+    // minutes of driving yields one usable data point and no idea whether a
+    // scan froze the UI once or forty times.
+    //
+    // These are therefore cleared each time the stats line prints, so every
+    // interval describes that interval.
     uint32_t last_draw_work_ms = 0, max_draw_work_ms = 0;
     uint32_t draw_work_total_ms = 0;
     uint32_t last_draw_wall_ms = 0, max_draw_wall_ms = 0;
     uint32_t draw_wall_total_ms = 0;
     uint32_t max_stall_ms = 0;
     uint32_t draws = 0;
+
+    // Since boot, never cleared. The window says what is happening now; these
+    // say whether the worst thing seen so far has been seen again. The status
+    // bar reads the peak rather than the window, so a number on the panel does
+    // not silently reset itself every fifteen seconds while being looked at.
+    uint32_t peak_draw_work_ms = 0, peak_stall_ms = 0;
 
     // False when the run-time counter is unavailable at build time, in which
     // case work is a copy of wall and stall is always zero. The stats line says
@@ -261,6 +281,15 @@ bool map_place_text(char *out, size_t cap);
 
 uint8_t  map_zoom();
 void     map_stats(MapStats *out);
+
+// Clear the windowed draw counters. Call right after reporting them.
+//
+// UI-task only, and safe without the grid lock for that reason: every field it
+// touches is written solely by map_draw(), which runs on the same task. The
+// worker's fields - rendered, failed, last_render_ms - are deliberately not
+// reset here, both because they are cumulative counts worth keeping and
+// because clearing them from this task would be a genuine race.
+void     map_stats_reset_window();
 bool     map_has_fix_position();   // true once the grid has been centred
 
 #endif // MAPENGINE_H

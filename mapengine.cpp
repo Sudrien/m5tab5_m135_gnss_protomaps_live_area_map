@@ -2488,6 +2488,8 @@ void map_draw(const GnssFix &fix) {
     if (cpu_ms > g_stats.max_draw_work_ms) g_stats.max_draw_work_ms = cpu_ms;
     if (ms     > g_stats.max_draw_wall_ms) g_stats.max_draw_wall_ms = ms;
     if (stall  > g_stats.max_stall_ms)     g_stats.max_stall_ms     = stall;
+    if (cpu_ms > g_stats.peak_draw_work_ms) g_stats.peak_draw_work_ms = cpu_ms;
+    if (stall  > g_stats.peak_stall_ms)     g_stats.peak_stall_ms     = stall;
 }
 
 // ---- background fetchers ---------------------------------------------------
@@ -2901,4 +2903,15 @@ bool map_has_fix_position() { return g_centred; }
 void map_stats(MapStats *out) {
     *out = g_stats;
     out->queue_depth = g_jobs ? uxQueueMessagesWaiting(g_jobs) : 0;
+}
+
+void map_stats_reset_window() {
+    g_stats.max_draw_work_ms   = 0;
+    g_stats.draw_work_total_ms = 0;
+    g_stats.max_draw_wall_ms   = 0;
+    g_stats.draw_wall_total_ms = 0;
+    g_stats.max_stall_ms       = 0;
+    g_stats.draws              = 0;
+    // last_draw_* are the most recent draw, not an accumulation, so they are
+    // left alone - clearing them would blank the status bar between intervals.
 }

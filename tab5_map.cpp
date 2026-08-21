@@ -2798,7 +2798,7 @@ static void drawStatus(const GnssFix &fix) {
                  (unsigned long)ns.local_hits,
                  (unsigned long)st.last_render_ms,
                  (unsigned long)st.last_draw_work_ms,
-                 (unsigned long)st.max_draw_work_ms,
+                 (unsigned long)st.peak_draw_work_ms,
                  (unsigned)ns.locals, ns.locals == 1 ? "" : "s");
     } else {
         snprintf(buf, sizeof buf,
@@ -2809,7 +2809,7 @@ static void drawStatus(const GnssFix &fix) {
                  (unsigned long)ns.local_hits,
                  (unsigned long)st.last_render_ms,
                  (unsigned long)st.last_draw_work_ms,
-                 (unsigned long)st.max_draw_work_ms,
+                 (unsigned long)st.peak_draw_work_ms,
                  (unsigned long)cs.entries,
                  ns.build[0] ? ns.build : "none", ns.online ? "" : " (offline)");
     }
@@ -3799,6 +3799,9 @@ void loop() {
                           (unsigned long)st.coarse_gap,
                           (unsigned long)st.coarse_wait,
                           (unsigned)(ESP.getFreePsram() / 1024));
+            // Both lines cover the last interval only, not since boot - the
+            // window is cleared below once they have been printed.
+            //
             // Wall clock and preemption, on their own line.
             //
             // The blit figures above are work now, so this line carries what
@@ -3809,16 +3812,24 @@ void loop() {
             // problem that no amount of work on blit_region will touch.
             if (st.cpu_time_valid) {
                 Serial.printf("draw:  wall last %lu ms max %lu avg %lu"
-                              "   stall max %lu ms   over %lu\n",
+                              "   stall max %lu ms   over %lu"
+                              "   (peak since boot: work %lu, stall %lu)\n",
                               (unsigned long)st.last_draw_wall_ms,
                               (unsigned long)st.max_draw_wall_ms,
                               (unsigned long)(st.draws ? st.draw_wall_total_ms / st.draws : 0),
                               (unsigned long)st.max_stall_ms,
-                              (unsigned long)st.draws);
+                              (unsigned long)st.draws,
+                              (unsigned long)st.peak_draw_work_ms,
+                              (unsigned long)st.peak_stall_ms);
             } else {
                 Serial.println("draw:  wall only - no run-time counter in this "
                                "build, so the blit figures above are wall clock");
             }
+
+            // Start the next window here, after both lines have been printed
+            // from the same snapshot. Resetting before the second line would
+            // have it describe a window the first line did not.
+            map_stats_reset_window();
 
             // Separate line rather than more fields on that one: the compass
             // is the thing most likely to need watching over time (a drifting
