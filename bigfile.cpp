@@ -5,6 +5,7 @@
 #include <Arduino.h>
 #include <stdio.h>
 #include <string.h>
+#include <esp_timer.h>
 
 #if MAP_HAVE_BIGFILE
 #include "ff.h"
@@ -155,13 +156,53 @@ void bigfile_close(bigfile_t *b) {
 
 uint64_t bigfile_size(bigfile_t *b) { return b ? b->size : 0; }
 
+// Seek and transfer time, accumulated separately. See bigfile_io_counters().
+static uint64_t s_seek_us = 0, s_xfer_us = 0;
+static uint32_t s_seeks   = 0;
+
+void bigfile_io_counters(uint64_t *seek_us, uint64_t *xfer_us, uint32_t *seeks) {
+    if (seek_us) *seek_us = s_seek_us;
+    if (xfer_us) *xfer_us = s_xfer_us;
+    if (seeks)   *seeks   = s_seeks;
+}
+
 int bigfile_read(void *ctx, uint64_t off, uint32_t len, uint8_t *dst) {
     bigfile_t *b = (bigfile_t *)ctx;
     if (!b) return -1;
     if (off + len > b->size) return -1;
 
+    // The seek is timed apart from the transfer because they are suspected of
+    // costing wildly different amounts, and nothing so far could tell them
+    // apart.
+    //
+    // A traced place block read 489 KB in 5590 ms - about 87 KB/s on SDMMC
+    // 4-bit, where tens of MB/s is normal, and roughly 91 ms per 8 KB chunk.
+    // The read pattern is the reason to suspect the seek rather than the
+    // transfer: a lookup takes its leaf directory from near the end of the
+    // archive and its tile body from the middle, so consecutive calls jump
+    // about 129 GB and back, over and over.
+    //
+    // CONFIG_FATFS_USE_FASTSEEK is not set in this build and nothing here
+    // builds a cluster link map, so f_lseek() walks the FAT chain entry by
+    // entry from wherever the file position happens to be. On a 131 GB file
+    // that chain is millions of entries long, and a 129 GB jump walks a large
+    // part of it, reading FAT sectors along the way. That would be
+    // proportional to file size, would fall on every read rather than only on
+    // directory reads, and would be unaffected by the medium - which matches
+    // a 3 GB extract on a slower USB stick beating this by more than 20x.
+    //
+    // If seek dominates, enabling fast seek and allocating a CLMT per open
+    // archive turns the walk into a table lookup. If transfer dominates
+    // instead, the seek theory is dead and the 8 KB STORAGE_IO_CHUNK is the
+    // next suspect. Measuring says which; guessing has already been wrong
+    // twice here.
+    uint64_t t_seek = esp_timer_get_time();
     if (f_lseek(&b->fp, (FSIZE_t)off) != FR_OK) return -1;
     if (f_tell(&b->fp) != (FSIZE_t)off) return -1;   // truncated: wrong bytes
+    s_seek_us += (uint64_t)(esp_timer_get_time() - t_seek);
+    s_seeks++;
+
+    uint64_t t_xfer = esp_timer_get_time();
 
     // Chunked for the same reason storage_read() is: the USB MSC driver sizes
     // its DMA transfer buffer to whatever it is asked for, and a large ask
@@ -175,6 +216,7 @@ int bigfile_read(void *ctx, uint64_t off, uint32_t len, uint8_t *dst) {
         if (got == 0) return -1;
         done += got;
     }
+    s_xfer_us += (uint64_t)(esp_timer_get_time() - t_xfer);
     return 0;
 }
 
@@ -183,6 +225,15 @@ int bigfile_read(void *ctx, uint64_t off, uint32_t len, uint8_t *dst) {
 bool       bigfile_supported() { return false; }
 int        bigfile_volumes() { return 0; }
 bool       bigfile_volume_info(int, char *, size_t) { return false; }
+
+// Zeroed rather than absent: callers report these unconditionally, and a
+// build without the 64-bit reader has simply never seeked through it.
+void       bigfile_io_counters(uint64_t *seek_us, uint64_t *xfer_us,
+                               uint32_t *seeks) {
+    if (seek_us) *seek_us = 0;
+    if (xfer_us) *xfer_us = 0;
+    if (seeks)   *seeks   = 0;
+}
 int        bigfile_volume_of(const char *, uint64_t) { return -1; }
 bigfile_t *bigfile_open(const char *) { return nullptr; }
 void       bigfile_close(bigfile_t *) {}

@@ -56,6 +56,12 @@ uint64_t   bigfile_size(bigfile_t *b);
 // `ctx` is the bigfile_t*. Returns 0 on success.
 int        bigfile_read(void *ctx, uint64_t off, uint32_t len, uint8_t *dst);
 
+// Time spent seeking versus transferring, in microseconds, since boot, plus
+// the number of seeks. Monotonic; sample either side of a piece of work and
+// subtract. Zero on builds without the 64-bit reader, which never call it.
+void       bigfile_io_counters(uint64_t *seek_us, uint64_t *xfer_us,
+                               uint32_t *seeks);
+
 // Which FatFs volume is this file on?
 //
 // The mapping from a medium to a FatFs drive number is not otherwise
