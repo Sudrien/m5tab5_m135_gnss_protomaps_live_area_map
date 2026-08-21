@@ -58,7 +58,8 @@ struct MapStats {
     // those into draw_total_ms makes the mean useless exactly when something
     // looks wrong.
     //
-    // cpu is the same region measured by the task's own run-time counter, so
+    // cpu is the same region measured by the task's own run-time counter (via
+    // vTaskGetInfo, since IDF has no per-task ulTaskGetRunTimeCounter), so
     // wall minus cpu is time the task was ready but not running. A blit that
     // is genuinely expensive shows a large cpu; one that was merely preempted
     // shows a small cpu and a large stall. Nothing here changes the existing

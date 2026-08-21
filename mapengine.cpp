@@ -2318,19 +2318,36 @@ static void draw_target_guide(const GnssFix &fix, int mx, int my) {
 
 // The calling task's own accumulated run time, in microseconds.
 //
-// FreeRTOS keeps this per task when CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS is
-// on, which sdkconfig.defaults already sets, and IDF clocks it from esp_timer -
-// so it is in the same units as the wall-clock reading it gets subtracted from
-// and the two are directly comparable. Two counter reads per draw.
+// FreeRTOS keeps this per task when configGENERATE_RUN_TIME_STATS is on, and
+// IDF clocks it from esp_timer - so it is in the same units as the wall-clock
+// reading it gets subtracted from, and the two are directly comparable.
 //
-// The build-time guard is not hypothetical: the counter only exists when that
-// option is set, and a build without it would otherwise report every draw as
-// 100% stalled. When it is missing the numbers are marked invalid and the
-// stats line says so rather than printing a confident zero.
-#if defined(configGENERATE_RUN_TIME_STATS) && (configGENERATE_RUN_TIME_STATS == 1)
+// It is read through vTaskGetInfo() rather than ulTaskGetRunTimeCounter(),
+// which is the obvious call and is not there: IDF's FreeRTOS ships
+// ulTaskGetIdleRunTimeCounter() but not the general per-task form, so naming
+// it does not compile. vTaskGetInfo() is documented for this target, takes
+// NULL to mean the calling task, and fills ulRunTimeCounter from the same
+// counter.
+//
+// Both arguments after the struct matter for cost. pdFALSE skips the stack
+// high-water-mark walk, which is the expensive part of this call, and eInvalid
+// skips the task-state lookup - leaving a short critical section and a struct
+// copy. TaskStatus_t is around fifty bytes of stack, against roughly 2.7 KB of
+// headroom on the UI task.
+//
+// Two config options have to hold, and the guard checks both because they fail
+// differently: without configUSE_TRACE_FACILITY the call does not exist and the
+// build breaks loudly, while without configGENERATE_RUN_TIME_STATS it compiles
+// and returns zero, which would report every draw as 100% stalled - a wrong
+// answer that looks like a real finding. When either is missing the numbers are
+// marked invalid and the stats line says so instead.
+#if defined(configUSE_TRACE_FACILITY) && (configUSE_TRACE_FACILITY == 1) && \
+    defined(configGENERATE_RUN_TIME_STATS) && (configGENERATE_RUN_TIME_STATS == 1)
   #define MAP_CPU_TIME_OK 1
 static inline uint32_t draw_cpu_us() {
-    return (uint32_t)ulTaskGetRunTimeCounter(nullptr);
+    TaskStatus_t ts;
+    vTaskGetInfo(nullptr, &ts, pdFALSE, eInvalid);
+    return (uint32_t)ts.ulRunTimeCounter;
 }
 #else
   #define MAP_CPU_TIME_OK 0
