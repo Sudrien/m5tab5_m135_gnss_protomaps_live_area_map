@@ -468,24 +468,6 @@ CONFIG_FATFS_FS_LOCK=0
 CONFIG_FATFS_TIMEOUT_MS=10000
 CONFIG_FATFS_PER_FILE_CACHE=y
 CONFIG_FATFS_ALLOC_PREFER_EXTRAM=y
-# Fast seek (deviation from the reference).
-#
-# Without it f_lseek() follows the FAT cluster chain entry by entry from the
-# current file position, reading FAT sectors on the way. Measured on the
-# 131 GB planet archive: a nine-tile place block spent 4984 ms in ten seeks
-# against 71 ms transferring 488 KB - the card was managing 6.9 MB/s while
-# each seek cost about 498 ms.
-#
-# The access pattern is the worst case for a chain walk. A lookup takes its
-# leaf directory from near the end of the archive and its tile body from the
-# middle, so consecutive reads jump roughly 129 GB and back. Chain length
-# scales with file size, which is why a 3 GB extract on a slower USB stick
-# beat the planet file by more than 20x.
-#
-# Fast seek only applies to files opened read-only, which is what
-# bigfile_open() does; bigfile.cpp builds the cluster link map per archive.
-CONFIG_FATFS_USE_FASTSEEK=y
-
 CONFIG_FATFS_USE_STRFUNC_NONE=y
 CONFIG_FATFS_VFS_FSTAT_BLKSIZE=0
 CONFIG_FATFS_USE_LABEL=y
