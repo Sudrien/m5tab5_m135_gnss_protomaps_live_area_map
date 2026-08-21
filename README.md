@@ -171,29 +171,40 @@ resolves.
 There is no heading display yet. The magnetometer is read, and it is
 calibrated, but nothing on screen points anywhere.
 
-The reason is that a raw magnetometer reading is not a heading. It has to be
-corrected for the difference between magnetic and true north, which is over
-ten degrees across much of the continental US - enough that a needle would
-visibly disagree with the streets under it - and for the magnetic distortion
-of the device and whatever it is mounted in. Gathering the data to do that
-correction properly is what the log below is for. Until it exists, showing a
-direction would mean showing a confident wrong one.
+The reason is interference from the hardware around the sensor. The Tab5's
+speaker contains a permanent magnet, and the bolts holding the M135 module
+to the Tab5 may be steel. Both sit close to the magnetometer and both
+distort what it measures. The speaker magnet adds a fixed offset in sensor
+frame, which ordinary hard-iron calibration can remove; steel is worse,
+because it bends the field differently depending on which way the device is
+pointing, and no fixed offset removes that.
+
+The scale of it shows in the numbers the device already prints. The stored
+calibration carries an offset of about 33 uT on one axis, and the measured
+total field reads 68 uT where southeast Michigan should be closer to 52 uT.
+Something magnetic is sitting next to the sensor.
+
+Working out how much of that is the speaker, how much is the bolts, and how
+much of it can actually be corrected has not been done to a standard worth
+relying on. Until it has, a heading on screen would be a confident wrong
+one, which on a map is worse than no heading at all.
 
 The log is one row per second of the magnetometer against the GNSS course,
 written as CSV to the card. The magnetometer says which way the device
 points and the course says which way it is travelling; those are the same
-only when the device is fixed to something moving in the direction it faces.
-The difference between them is the correction data being collected. Raw and
-calibration-corrected vectors are both written, along with the
-accelerometer, so a fit can be redone later against different calibration
-values without another drive. Nothing is logged while the compass is being
-calibrated, while the receiver is searching, or below walking pace - a
-parked receiver reports an empty course, which would otherwise fill the file
-with confident southbound zeroes.
+only when the device is fixed to something moving in the direction it
+faces. The difference between them is the data that has to be gathered
+before any of the above can be settled. Raw and calibration-corrected
+vectors are both written, along with the accelerometer, so a fit can be
+redone later against different calibration values without another drive.
+Nothing is logged while the compass is being calibrated, while the receiver
+is searching, or below walking pace - a parked receiver reports an empty
+course, which would otherwise fill the file with confident southbound
+zeroes.
 
-Calibration has its own button and is a deliberate act, because it needs the
-device turned through every orientation and a half-finished sweep biases
-every reading afterwards.
+Calibration has its own button and is a deliberate act, because it needs
+the device turned through every orientation and a half-finished sweep
+biases every reading afterwards.
 
 ## Power
 
