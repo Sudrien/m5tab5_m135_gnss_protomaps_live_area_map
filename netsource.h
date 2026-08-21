@@ -109,6 +109,13 @@ bool netsource_prefetch_world(uint8_t maxz, uint8_t *buf, uint32_t cap,
 bool netsource_world_ready();
 void netsource_world_mark_done();
 
+// True when the open local archives already span the planet across z0-6, so
+// there is no floor to store. Asked before netsource_world_ready() because
+// the marker file lives under /t, which only exists once a network build has
+// been adopted - on a local-only card probing for it fails, and the failure
+// is both noisy and beside the point.
+bool netsource_world_local();
+
 // Checkpoint for the world floor walk.
 //
 // Without one, an interrupted run restarts at z0 and re-walks every position

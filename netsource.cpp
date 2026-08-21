@@ -1217,6 +1217,17 @@ void netsource_world_mark_done() {
     netsource_world_clear_pos();
 }
 
+// The floor is 5461 tiles from z0 to z6. Rather than test all of them, test
+// the extremes: an archive holding z0/0/0 and all four z6 corners spans the
+// full lon/lat range across the whole zoom span, which is the only shape a
+// planet extract comes in. A partial extract fails a corner and falls through
+// to the download path, which is the safe direction to be wrong in.
+bool netsource_world_local() {
+    if (!netsource_local_covers(0, 0, 0)) return false;
+    return netsource_local_covers(6, 0, 0)  && netsource_local_covers(6, 63, 0) &&
+           netsource_local_covers(6, 0, 63) && netsource_local_covers(6, 63, 63);
+}
+
 void netsource_world_save_pos(uint8_t z, uint32_t x, uint32_t y) {
     File f = g_fs->open(WORLD_POS, FILE_WRITE);
     if (!f) return;

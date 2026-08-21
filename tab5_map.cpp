@@ -3820,7 +3820,9 @@ void setup() {
     // Kick off the world floor if it has never been stored. It runs in the
     // background and survives being interrupted, so there is no reason to
     // hold up startup for it.
-    if (WiFi.status() == WL_CONNECTED && !netsource_world_ready()) {
+    if (netsource_world_local()) {
+        bootStep("world floor not needed (local archive covers z0-6)");
+    } else if (WiFi.status() == WL_CONNECTED && !netsource_world_ready()) {
         bootStep("storing world floor in background");
         map_world_floor_start();
     }
