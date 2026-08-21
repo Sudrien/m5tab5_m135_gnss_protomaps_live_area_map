@@ -3367,28 +3367,8 @@ void setup() {
         // the user actually travels over from drawing, and refusing to boot
         // on it would turn a diagnostic into an outage.
     }
-    // The magnetometer, for a heading that exists while standing still.
-    //
-    // After M5.begin() and not before: bringing it up means driving EXT_5V on
-    // the expander at 0x43, and Power_Class::begin() rewrites that expander's
-    // direction register - the same ordering trap storage.cpp documents for
-    // USB VBUS on 0x44. Optional in every sense: no module, no drivers, or a
-    // dead sensor all leave the dial falling back to GNSS course.
-    if (compass_begin()) {
-        // Card is already mounted several steps earlier, so a stored
-        // calibration is available before the first heading is ever drawn -
-        // no uncalibrated window on a device that has been calibrated before.
-        calLoad();
-        bootStep("compass ready");
-    } else if (compass_supported()) {
-        bootStep("no compass (see log)");
-    }
-
-    // The magnetometer log, off the same card. After compass_begin() so the
-    // button label can say "no mag" rather than "no card" when the sensor is
-    // the thing that is missing, and after the card is mounted so a first row
-    // has somewhere to go.
-    maglog_begin();
+    // The magnetometer used to be brought up here. It now waits until after
+    // the first picture - see sensorsLateBegin() below the boot wait.
 
     // The saved-point list, off the same card. Read here rather than lazily:
     // the first map_draw asks for it, and that runs on the UI task while the
@@ -3461,6 +3441,38 @@ void setup() {
                       map_has_picture() ? "" : " (gave up waiting)",
                       (unsigned long)millis());
     }
+
+    // ---- sensors, now that there is a map on the panel --------------------
+    //
+    // The magnetometer bring-up is not cheap: compass_begin() pushes 8 KB of
+    // BMI270 configuration over I2C and then reads back an internal status,
+    // and calLoad() opens the card for the stored calibration. On this board
+    // that lands between "archive readable" and "drawing the last known
+    // area", which is exactly the wrong place - it delays the first picture
+    // by however long it takes, and nothing it produces is needed to draw
+    // one. There is no heading on screen, and the log it feeds is gated on
+    // walking pace, so its first useful sample is a drive away regardless.
+    //
+    // Moving it here costs nothing it was buying. The card is still mounted,
+    // so a device that has been calibrated before still has its calibration
+    // in hand before any heading could be drawn. The ordering trap that put
+    // it after M5.begin() in the first place still holds - EXT_5V lives on
+    // the expander at 0x43 and Power_Class::begin() rewrites that expander's
+    // direction register - and this is later still, so it is no less safe.
+    //
+    // It stays ahead of the radio block below on purpose. The C6 brings up
+    // SDIO on the same SDMMC host the card uses, and an 8 KB I2C upload is
+    // better finished before that starts than interleaved with it.
+    if (compass_begin()) {
+        calLoad();
+        Serial.println("compass: ready");
+    } else if (compass_supported()) {
+        Serial.println("compass: not available (see log above)");
+    }
+
+    // After compass_begin() so the button label can say "no mag" rather than
+    // "no card" when the sensor is the thing that is missing.
+    maglog_begin();
 
 
 
@@ -3618,12 +3630,33 @@ void loop() {
     gnss_get(&fix);
 
     batteryPoll(false);                // 1 Hz internally
-    compass_update();                  // 10 Hz internally, loop()'s task only
+
+    // The sensor polls wait for a picture; the rest of the pass does not.
+    //
+    // loop() begins the moment setup() returns, which on a cold start can be
+    // ahead of the first picture - the boot wait gives up after 12 s whether
+    // or not a tile has landed. Until then the renderer wants the PSRAM bus
+    // and the UI task needs to keep compositing, and these polls compete for
+    // both while producing nothing anyone can see.
+    //
+    // None of them loses anything by waiting. compass_update() feeds no
+    // display, maglog_poll() writes nothing below walking pace, and
+    // wifiloc_poll() needs a radio the boot sequence has not started yet.
+    // This is a reordering, not a reduction: once there is a picture they run
+    // every pass exactly as before.
+    //
+    // It has to be a gate around these three and NOT an early return from
+    // loop(). map_draw() and handleTouch() are further down, and a return here
+    // would stop the very compositing that makes map_has_picture() true - the
+    // condition would then never clear and the device would sit dark.
+    const bool painted = map_has_picture();
+
+    if (painted) compass_update();     // 10 Hz internally, loop()'s task only
 
     // Written from the loop rather than from inside calibrate_finish: that
     // runs deep in compass_update and has no business touching the card, and
     // the flag makes the write happen once, on the next pass, on this task.
-    if (compass_cal_dirty()) { compass_cal_clear_dirty(); calSave(); }
+    if (painted && compass_cal_dirty()) { compass_cal_clear_dirty(); calSave(); }
     handleTouch(fix);
 
     // True north correction. The map is drawn in true north and the sensor
@@ -3631,11 +3664,13 @@ void loop() {
     // the continental US - enough that the needle would visibly disagree with
     // the streets under it. Recomputed only when the position has moved far
     // enough to matter.
-    if (gnss_coarse(fix)) compass_set_position(fix.lat, fix.lon);
+    if (painted && gnss_coarse(fix)) compass_set_position(fix.lat, fix.lon);
     gnssRatePolicy(fix);
     ntpPolicy(fix);
-    maglog_poll(fix);
-    wifiloc_poll(fix);
+    if (painted) {
+        maglog_poll(fix);
+        wifiloc_poll(fix);
+    }
     // After wifiloc_poll, so the cross-check inside sees this second's
     // estimate rather than the previous one.
     gpstrust_update(fix);
