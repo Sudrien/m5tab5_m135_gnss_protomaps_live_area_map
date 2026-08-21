@@ -47,6 +47,25 @@ struct MapStats {
     // from "the map is slow to update" (blitting).
     uint32_t last_draw_ms = 0, max_draw_ms = 0;
     uint32_t draw_total_ms = 0, draws = 0;
+
+    // ...and to separate both from "the UI task was not running".
+    //
+    // The draw figures above are wall clock, so they include any time the
+    // task spent descheduled inside the timed region. On this board that is
+    // not a rounding error: a Wi-Fi scan runs ESP-Hosted tasks at priority 23
+    // against loop() at priority 1, and single draws of three seconds have
+    // been logged on a parked device that rendered nothing at all. Averaging
+    // those into draw_total_ms makes the mean useless exactly when something
+    // looks wrong.
+    //
+    // cpu is the same region measured by the task's own run-time counter, so
+    // wall minus cpu is time the task was ready but not running. A blit that
+    // is genuinely expensive shows a large cpu; one that was merely preempted
+    // shows a small cpu and a large stall. Nothing here changes the existing
+    // fields - they still mean what they meant - these sit alongside.
+    uint32_t last_draw_cpu_ms = 0, max_stall_ms = 0;
+    uint32_t draw_cpu_total_ms = 0;
+    bool     cpu_time_valid = false;
 };
 
 // Bring up buffers, open the archive, and start the render worker.

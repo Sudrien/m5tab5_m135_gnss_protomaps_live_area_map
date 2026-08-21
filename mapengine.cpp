@@ -2316,6 +2316,27 @@ static void draw_target_guide(const GnssFix &fix, int mx, int my) {
     M5.Display.clearClipRect();
 }
 
+// The calling task's own accumulated run time, in microseconds.
+//
+// FreeRTOS keeps this per task when CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS is
+// on, which sdkconfig.defaults already sets, and IDF clocks it from esp_timer -
+// so it is in the same units as the wall-clock reading it gets subtracted from
+// and the two are directly comparable. Two counter reads per draw.
+//
+// The build-time guard is not hypothetical: the counter only exists when that
+// option is set, and a build without it would otherwise report every draw as
+// 100% stalled. When it is missing the numbers are marked invalid and the
+// stats line says so rather than printing a confident zero.
+#if defined(configGENERATE_RUN_TIME_STATS) && (configGENERATE_RUN_TIME_STATS == 1)
+  #define MAP_CPU_TIME_OK 1
+static inline uint32_t draw_cpu_us() {
+    return (uint32_t)ulTaskGetRunTimeCounter(nullptr);
+}
+#else
+  #define MAP_CPU_TIME_OK 0
+static inline uint32_t draw_cpu_us() { return 0; }
+#endif
+
 void map_draw(const GnssFix &fix) {
     if (g_headless) return;
     if (!g_visible || !g_view_set) return;
@@ -2355,6 +2376,7 @@ void map_draw(const GnssFix &fix) {
         return;
 
     uint64_t t0 = esp_timer_get_time();
+    uint32_t cpu0 = draw_cpu_us();
 
     // A screen with nothing drawable looks identical to a crash, so say so.
     {
@@ -2420,11 +2442,26 @@ void map_draw(const GnssFix &fix) {
     have_last = true;
     g_force_redraw = false;
 
-    uint32_t ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
-    g_stats.last_draw_ms = ms;
-    g_stats.draw_total_ms += ms;
+    uint32_t us     = (uint32_t)(esp_timer_get_time() - t0);
+    uint32_t cpu_us = draw_cpu_us() - cpu0;
+    // Clamped rather than trusted: the two clocks are read a few instructions
+    // apart and the run-time counter is updated on context switch, so a short
+    // draw can measure a cpu delta a hair above the wall delta. That is noise,
+    // not a negative stall.
+    if (cpu_us > us) cpu_us = us;
+
+    uint32_t ms     = us / 1000;
+    uint32_t cpu_ms = cpu_us / 1000;
+    uint32_t stall  = ms > cpu_ms ? ms - cpu_ms : 0;
+
+    g_stats.last_draw_ms      = ms;
+    g_stats.draw_total_ms    += ms;
+    g_stats.last_draw_cpu_ms  = cpu_ms;
+    g_stats.draw_cpu_total_ms += cpu_ms;
     g_stats.draws++;
-    if (ms > g_stats.max_draw_ms) g_stats.max_draw_ms = ms;
+    g_stats.cpu_time_valid    = (MAP_CPU_TIME_OK != 0);
+    if (ms > g_stats.max_draw_ms)    g_stats.max_draw_ms = ms;
+    if (stall > g_stats.max_stall_ms) g_stats.max_stall_ms = stall;
 }
 
 // ---- background fetchers ---------------------------------------------------

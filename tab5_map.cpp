@@ -3796,6 +3796,34 @@ void loop() {
                           (unsigned long)st.coarse_gap,
                           (unsigned long)st.coarse_wait,
                           (unsigned)(ESP.getFreePsram() / 1024));
+            // Wall clock against CPU, on its own line.
+            //
+            // The blit figures above are wall clock and so include time the UI
+            // task was ready but not running. That is the difference between
+            // "compositing is expensive" and "something outranked us", and the
+            // two want completely different fixes - the first is the per-row
+            // push loop in blit_region, the second is nothing blit_region can
+            // do anything about. Wi-Fi scans have produced three-second draws
+            // on a parked device that rendered nothing, so this is not a
+            // theoretical distinction.
+            //
+            // Read it as: cpu is real work, stall is time lost to preemption.
+            // If avg-cpu tracks avg and stall stays near zero, the blit is
+            // genuinely slow. If avg-cpu is small and max-stall is seconds,
+            // the wall-clock numbers above are measuring the scheduler.
+            if (st.cpu_time_valid) {
+                Serial.printf("draw:  cpu last %lu ms avg %lu ms   stall max %lu ms"
+                              "   (wall avg %lu ms over %lu)\n",
+                              (unsigned long)st.last_draw_cpu_ms,
+                              (unsigned long)(st.draws ? st.draw_cpu_total_ms / st.draws : 0),
+                              (unsigned long)st.max_stall_ms,
+                              (unsigned long)(st.draws ? st.draw_total_ms / st.draws : 0),
+                              (unsigned long)st.draws);
+            } else {
+                Serial.println("draw:  cpu time unavailable "
+                               "(CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS is off)");
+            }
+
             // Separate line rather than more fields on that one: the compass
             // is the thing most likely to need watching over time (a drifting
             // |B| means the calibration has gone stale, or something magnetic
