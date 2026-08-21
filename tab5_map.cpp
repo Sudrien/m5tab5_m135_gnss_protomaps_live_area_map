@@ -675,7 +675,15 @@ static uint8_t applyIdleDim(uint8_t want, const GnssFix &fix) {
     bool dim = idleDimmed(fix);
     if (dim != wasDim) {
         wasDim = dim;
-        Serial.printf("bright: idle dim %s\n", dim ? "on" : "off");
+        // Say which of the two exits released it. They fail differently - a
+        // spurious speed exit is a noisy fix, a spurious handling exit is a
+        // threshold set too low or a vibrating mount - and the fix for one is
+        // not the fix for the other, so the log has to distinguish them at
+        // the moment it happens rather than leave it to be inferred.
+        uint32_t movedMs = compass_last_motion_ms();
+        bool byHand = movedMs && millis() - movedMs < IDLE_UNDIM_HOLD_MS;
+        Serial.printf("bright: idle dim %s%s\n", dim ? "on" : "off",
+                      dim ? "" : byHand ? " (handled)" : " (moving)");
     }
     if (!dim) return want;
 
@@ -4147,13 +4155,30 @@ void loop() {
             // moved), and it is easier to grep for on its own.
             if (compass_ok()) {
                 float h = compass_heading();
-                // compass_status() already ends in the field magnitude, so this
-            // does not repeat it.
-            Serial.printf("compass: %s, %.0f deg %s  "
+                // compass_status() already ends in the field magnitude, so
+                // this does not repeat it.
+                //
+                // Handling, as seconds since the last detected movement and the
+                // largest departure seen in this window. The peak is what the
+                // MOTION_COUNTS threshold gets set against: watch it sitting
+                // untouched to find the floor, then handle the device and watch
+                // it again to find the ceiling, and put the threshold between
+                // them. Without it the only symptom of a badly chosen threshold
+                // is a backlight that behaves oddly, which says nothing about
+                // which way to move it.
+                uint32_t movedMs = compass_last_motion_ms();
+                char moved[24];
+                if (!movedMs) snprintf(moved, sizeof moved, "none");
+                else snprintf(moved, sizeof moved, "%.0fs ago",
+                              (millis() - movedMs) / 1000.0);
+
+                Serial.printf("compass: %s, %.0f deg %s  "
+                              "moved %s peak %.0f  "
                               "log %s %lu rows %u KB  gnss %u ms  "
                               "wifi %lu APs\n",
                               compass_status(),
                               h < 0 ? 0.0f : h, compass_label(h),
+                              moved, compass_motion_peak_take(),
                               !maglog_available() ? "unavailable"
                                                   : maglog_enabled() ? "on" : "off",
                               (unsigned long)maglog_rows(),

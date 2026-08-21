@@ -137,6 +137,15 @@ float compass_pitch();
 // motion in the travelling sense should ask GNSS for speed instead.
 uint32_t compass_last_motion_ms();
 
+// Largest acceleration departure seen since this was last called, in the same
+// raw counts the detector works in, and cleared by the call. Reporting only:
+// nothing decides anything from it. It exists because the detection threshold
+// is the one number here that has to be set against a particular board in a
+// particular mount, and it cannot be set against figures nobody can see.
+//
+// 16384 counts per g at the configured 2 g range, if a conversion is wanted.
+float compass_motion_peak_take();
+
 void compass_calibrate_start();
 
 // Restart calibration keeping the accumulated fit, so a second sweep improves

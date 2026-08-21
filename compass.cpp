@@ -66,6 +66,7 @@ float compass_field_ut()            { return 0.0f; }
 float compass_roll()                { return 0.0f; }
 float compass_pitch()               { return 0.0f; }
 uint32_t compass_last_motion_ms()   { return 0; }
+float compass_motion_peak_take()    { return 0.0f; }
 void  compass_set_position(double, double) { }
 void  compass_calibrate_start()        { }
 void  compass_calibrate_start_refine() { }
@@ -137,6 +138,13 @@ static float    s_grav[3]     = { 0, 0, 0 };
 static bool     s_grav_valid  = false;
 static uint32_t s_motion_ms   = 0;
 static uint8_t  s_motion_run  = 0;
+
+// Largest departure seen since the last read, for the log. Kept so the
+// threshold can be set against what this board in this mount actually
+// produces - a number that varies with how the device is held, what it is
+// resting on, and whether an engine is running nearby, none of which is
+// knowable from here.
+static float    s_motion_peak = 0.0f;
 
 // About 0.05 g. Comfortably above the noise floor of an OSR4-averaged 2 g
 // reading sitting on a desk, and below what a deliberate tilt produces.
@@ -1093,6 +1101,7 @@ void compass_update() {
         // magnitude test would miss the commonest handling there is, which is
         // picking the device up and turning it to look at it.
         float dev = sqrtf(dx * dx + dy * dy + dz * dz);
+        if (dev > s_motion_peak) s_motion_peak = dev;
 
         if (dev > MOTION_COUNTS) {
             if (s_motion_run < MOTION_RUN_NEEDED) s_motion_run++;
@@ -1212,6 +1221,12 @@ float compass_roll()     { return s_roll; }
 float compass_pitch()    { return s_pitch; }
 float compass_field_ut() { return s_field; }
 uint32_t compass_last_motion_ms() { return s_motion_ms; }
+
+float compass_motion_peak_take() {
+    float v = s_motion_peak;
+    s_motion_peak = 0.0f;
+    return v;
+}
 const char *compass_status() { return s_status; }
 
 #endif // COMPASS_HAVE_BOSCH
