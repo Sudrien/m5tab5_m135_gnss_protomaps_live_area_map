@@ -635,11 +635,38 @@ static int sd_read(void *ctx, uint64_t off, uint32_t len, uint8_t *dst) {
     return storage_read(src->file, dst, len) == len ? 0 : -1;
 }
 
+// Directory decompression, timed and counted.
+//
+// This function is the archive reader's `inflate` callback and nothing else,
+// which is what makes it a clean measuring point: pmt_find() calls it for
+// root and leaf directories, and tile payloads never come through here - they
+// are handed back still compressed and inflated by the render worker with
+// inflate_auto_fast(). So everything counted below is directory work, and
+// every call is a cache miss, because load_dir() returns early on a hit.
+//
+// Added because the existing split could not see this. A place block reported
+// io 317 ms against seek 4 and xfer 72, and the 241 ms between them was
+// assumed to be tile decode - which it is not, since `io` brackets
+// netsource_get_local() alone and tile decode happens after it returns. The
+// only other thing inside that bracket large enough to matter is inflating a
+// ~130 KB leaf directory, and this says so rather than leaving it inferred.
+static uint32_t g_dir_inflate_us = 0;
+static uint32_t g_dir_loads = 0;
+
+void netsource_dir_counters(uint32_t *inflate_us, uint32_t *loads) {
+    if (inflate_us) *inflate_us = g_dir_inflate_us;
+    if (loads)      *loads      = g_dir_loads;
+}
+
 static int gz_inflate(void *ctx, uint8_t codec, const uint8_t *src,
                       uint32_t src_len, uint8_t *dst, uint32_t *dst_len) {
     (void)ctx;
     if (codec != PMT_COMPRESS_GZIP) return -1;
-    return inflate_auto(src, src_len, dst, dst_len) == INF_OK ? 0 : -1;
+    uint64_t t0 = esp_timer_get_time();
+    int rc = inflate_auto(src, src_len, dst, dst_len) == INF_OK ? 0 : -1;
+    g_dir_inflate_us += (uint32_t)(esp_timer_get_time() - t0);
+    g_dir_loads++;
+    return rc;
 }
 
 // ---- cache -----------------------------------------------------------------

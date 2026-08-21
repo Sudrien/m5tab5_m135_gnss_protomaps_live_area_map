@@ -86,6 +86,17 @@ bool netsource_local_covers(uint8_t z, uint32_t x, uint32_t y);
 // cache is being reused or thrashed.
 void netsource_io_counters(uint32_t *reads, uint64_t *bytes);
 
+// Directory decompression since boot: microseconds spent inflating, and the
+// number of inflates. Both are directory-only - tile payloads are inflated by
+// the caller, not in here - and every counted inflate is a directory cache
+// miss, since a hit returns before the decompress. Monotonic, same sample-and
+// -subtract use as netsource_io_counters().
+//
+// This is what separates a slow medium from a thrashing directory cache. Raw
+// file time already shows up as seek and xfer; whatever is left inside a
+// lookup is mostly this.
+void netsource_dir_counters(uint32_t *inflate_us, uint32_t *loads);
+
 // Populate the offline floor by pulling every tile from z0 to maxz into the
 // cache. 5461 tiles at maxz 6; slow (one request each) but resumable, since
 // anything already cached is skipped. `buf`/`cap` is scratch for one tile.

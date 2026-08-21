@@ -671,6 +671,7 @@ static uint32_t g_place_block_ms = 0, g_place_block_io_ms = 0;
 static uint32_t g_place_block_reads = 0, g_place_block_kb = 0;
 static uint32_t g_place_block_seek_ms = 0, g_place_block_xfer_ms = 0;
 static uint32_t g_place_block_seeks = 0;
+static uint32_t g_place_block_dir_ms = 0, g_place_block_dir_loads = 0;
 
 static bool load_place_block(tile_id_t centre, PlaceIndex *out, uint32_t want) {
     uint64_t t0 = esp_timer_get_time();
@@ -679,6 +680,8 @@ static bool load_place_block(tile_id_t centre, PlaceIndex *out, uint32_t want) {
     netsource_io_counters(&r0, &b0);
     uint64_t sk0, xf0; uint32_t sn0;
     bigfile_io_counters(&sk0, &xf0, &sn0);
+    uint32_t di0, dl0;
+    netsource_dir_counters(&di0, &dl0);
     out->z = centre.z;
     out->n = 0;
     int world = 1 << centre.z;
@@ -704,6 +707,10 @@ static bool load_place_block(tile_id_t centre, PlaceIndex *out, uint32_t want) {
     g_place_block_seek_ms = (uint32_t)((sk1 - sk0) / 1000);
     g_place_block_xfer_ms = (uint32_t)((xf1 - xf0) / 1000);
     g_place_block_seeks   = sn1 - sn0;
+    uint32_t di1, dl1;
+    netsource_dir_counters(&di1, &dl1);
+    g_place_block_dir_ms    = (di1 - di0) / 1000;
+    g_place_block_dir_loads = dl1 - dl0;
     return ok > 0;
 }
 
@@ -773,7 +780,8 @@ static void worker_task(void *arg) {
             // captures bus time with no rasteriser work folded into it.
             Serial.printf("map: %s block z%u/%ld/%ld %s (%u places) "
                           "in %lu ms (io %lu ms, %lu reads, %lu KB over 9 tiles"
-                          "; seek %lu ms over %lu, xfer %lu ms)\n",
+                          "; seek %lu ms over %lu, xfer %lu ms"
+                          "; dir inflate %lu ms over %lu)\n",
                           region ? "region" : "place",
                           (unsigned)job.id.z, (long)job.id.x, (long)job.id.y,
                           ok ? "read" : "FAILED",
@@ -784,7 +792,9 @@ static void worker_task(void *arg) {
                           (unsigned long)g_place_block_kb,
                           (unsigned long)g_place_block_seek_ms,
                           (unsigned long)g_place_block_seeks,
-                          (unsigned long)g_place_block_xfer_ms);
+                          (unsigned long)g_place_block_xfer_ms,
+                          (unsigned long)g_place_block_dir_ms,
+                          (unsigned long)g_place_block_dir_loads);
             // Hitting the cap means the decode was cut short and the index is
             // whatever happened to come first, which is not the same as the
             // nearest. Worth saying out loud rather than quietly answering
