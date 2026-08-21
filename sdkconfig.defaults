@@ -1220,6 +1220,36 @@ CONFIG_ESP_HOSTED_GPIO_SLAVE_RESET_SLAVE=15
 # fixed. Try turning it back on; if it boots, delete this override.
 CONFIG_ESP_HOSTED_USE_MEMPOOL=n
 
+# ---- FatFs fast seek -------------------------------------------------------
+# Unlike exFAT and LBA64, which are hardcoded literals in IDF's ffconf.h and
+# so need tools/patch_ffconf.py, this one is a real Kconfig option:
+#
+#     #define FF_USE_FASTSEEK	CONFIG_FATFS_USE_FASTSEEK
+#
+# with no depends and no conflicts. It is simply `default n`, and the
+# arduino-cli reference imported above carries no line for it, so nothing
+# ever turns it on.
+#
+# It has to be set here rather than by hand, because this whole file is
+# regenerated from the reference on any configure where the text differs -
+# a hand-added line lasts exactly until the next `idf.py build`.
+#
+# What it costs to leave off: bigfile.cpp's clmt_build() is wrapped in
+# #if FF_USE_FASTSEEK and compiles out entirely, so every f_lseek() walks
+# the cluster chain a FAT sector at a time. Measured on the planet archive,
+# a nine-tile place block spent 4984 ms in ten seeks against 71 ms actually
+# transferring 488 KB - roughly 498 ms per seek.
+#
+# Independent of MAP_FATFS_EXFAT. FatFs builds a CLMT on exFAT volumes
+# happily: exFAT signals end-of-chain as 0x7FFFFFFF rather than 0xFFFFFFFF,
+# which is not the value CREATE_LINKMAP treats as a disk error, so the
+# fragment loop terminates on `cl < fs->n_fatent` as intended.
+#
+# CONFIG_FATFS_FAST_SEEK_BUFFER_SIZE becomes visible once this is set and is
+# deliberately left alone: it only sizes the CLMT that vfs_fat.c preallocates
+# on VFS opens, and bigfile.cpp holds its own FIL and sizes its own table.
+CONFIG_FATFS_USE_FASTSEEK=y
+
 # ---- TEMPORARY: diagnostics ------------------------------------------------
 # The reference sets LOG_DEFAULT_LEVEL_ERROR, right for shipping and wrong
 # while the board is being brought up: it silences heap_init and esp_psram.
