@@ -92,6 +92,7 @@ different hardware can adapt them.
     tab5_map.cpp     148  ZOOM_HOLD_MS = 8000
     tab5_map.cpp     233  PREFETCH_RADIUS = 7
     tab5_map.cpp     250  BRIGHT_NIGHT = 60
+    tab5_map.cpp     396  BRIGHT_DUSK = 140
     tab5_map.cpp     965  ANTENNA_SUSPECT_MS 90000
     tab5_map.cpp    1167  AOP_SAVE_INTERVAL_MS (30 * 60 * 1000)
     netsource.cpp     52  REFRESH_DAYS = 30
@@ -160,6 +161,20 @@ explanation exists, the attribution does not.
 constraint rather than an origin - both are 52 and neither says where 52 came
 from. If one is derived from a font metric or a touch-target minimum, that is
 the attribution, and the other should say "must match" and point at it.
+
+`BRIGHT_DAY`, `BRIGHT_DUSK` and `BRIGHT_NIGHT` are the three numbers with the
+largest effect on battery life in the project, and two of the three are
+judgements. The experiment that would attribute them is now cheap to run: the
+`power:` line reports mean current against the brightness in force, so a few
+minutes held at each level gives the milliamps each one costs. Until that is
+recorded, changing any of them is guesswork in both directions - readability
+and consumption.
+
+`DUSK_HALFWIDTH_MIN` is attributed, to civil twilight at mid latitudes, but the
+attribution is honest about being a fixed stand-in for something that varies
+with latitude and season. That is a different state from unattributed and does
+not belong in the lists above; it is noted here so it is not mistaken for
+settled.
 
 `SUBTILE_PX 1280` and `Z_FLOOR 14` are probably the two most load-bearing
 numbers in the project. They decide the whole tiling scheme and appear in the
