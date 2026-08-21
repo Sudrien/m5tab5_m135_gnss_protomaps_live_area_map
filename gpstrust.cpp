@@ -218,20 +218,29 @@ void gpstrust_update(const GnssFix &fix) {
 
     // ---- satellite SNR spread ----------------------------------------------
     {
-        int sats = 0, best = 0, worst = 127, seen = 0;
+        int sats = 0, best = 0, worst = 0, seen = 0;
         for (int i = 0; i < 4; i++) {
             sats += fix.cons[i].visible;
             if (!fix.cons[i].visible || !fix.cons[i].bestSnr) continue;
             seen++;
-            if (fix.cons[i].bestSnr > best)  best  = fix.cons[i].bestSnr;
-            if (fix.cons[i].bestSnr < worst) worst = fix.cons[i].bestSnr;
+            // Across every tracked satellite, not across the per-constellation
+            // maxima. An earlier version compared cons[i].bestSnr against
+            // cons[j].bestSnr, which is the strongest bird in each - and those
+            // are near enough identical on any healthy sky, because both are
+            // whichever satellite happens to be highest. It fired on every
+            // fix, which is the one failure mode the thresholds above were
+            // written to avoid.
+            if (fix.cons[i].bestSnr > best) best = fix.cons[i].bestSnr;
+            if (fix.cons[i].worstSnr &&
+                (!worst || fix.cons[i].worstSnr < worst))
+                worst = fix.cons[i].worstSnr;
         }
         // Only meaningful with several constellations visible. A single
         // transmitter usually cannot produce a credible multi-constellation
         // picture at all, so few constellations with many satellites is itself
         // the pattern - but that is also what a cheap antenna indoors looks
         // like, so this stays conservative and only flags the bunching.
-        if (seen >= 2 && sats >= TRUST_SNR_MIN_SATS &&
+        if (seen >= 2 && worst && sats >= TRUST_SNR_MIN_SATS &&
             (best - worst) < TRUST_SNR_MIN_SPREAD)
             flag_set(3);                                    // TRUST_F_SNR
     }
@@ -241,7 +250,12 @@ void gpstrust_update(const GnssFix &fix) {
         uint32_t iv = gnss_pps_interval();
         // Zero means no pulse has been seen - the pin may not be wired, which
         // is the documented default (DIP position 3 is optional).
-        if (iv && (iv < TRUST_PPS_LO || iv > TRUST_PPS_HI))
+        //
+        // Below a 3D fix the pulse is not disciplined to a solution, because
+        // there is no solution; whatever the receiver emits then says nothing
+        // about whether it is being lied to. Same reasoning as the status
+        // check at the top of this function.
+        if (fix.mode >= 3 && iv && (iv < TRUST_PPS_LO || iv > TRUST_PPS_HI))
             flag_set(4);                                    // TRUST_F_PPS
     }
 

@@ -30,9 +30,21 @@ static volatile uint32_t g_firstCoarseMs = 0, g_firstFineMs = 0;
 // path can occupy far longer than the pulse width.
 static volatile uint32_t g_ppsCount = 0, g_ppsLast = 0, g_ppsInterval = 0;
 
+// Gap above which two pulses are treated as belonging to different runs
+// rather than as one very long interval. Twice the nominal second, so a
+// genuinely bad pulse is still measured and reported.
+static const uint32_t PPS_RESTART_MS = 2000;
+
 static void IRAM_ATTR ppsIsr() {
     uint32_t now = millis();
-    if (g_ppsLast) g_ppsInterval = now - g_ppsLast;
+    // Only record an interval between two pulses that actually belong to the
+    // same run. The receiver stops pulsing, or stops disciplining the pulse,
+    // whenever it loses lock, so the first edge after an outage would
+    // otherwise measure the whole outage - seconds - and that value then
+    // sticks in g_ppsInterval until the next edge overwrites it. Anything
+    // past this bound is a restart, not a bad pulse.
+    uint32_t d = now - g_ppsLast;
+    if (g_ppsLast && d < PPS_RESTART_MS) g_ppsInterval = d;
     g_ppsLast = now;
     g_ppsCount++;
 }
@@ -94,11 +106,22 @@ static void parseSentence(char *s, GnssFix &fix) {
     } else if (!strcmp(type, "GSV") && n >= 4) {
         int ci = conIndex(talker);
         if (ci >= 0) {
-            if (atoi(f[2]) == 1) fix.cons[ci].bestSnr = 0;
+            if (atoi(f[2]) == 1) {
+                fix.cons[ci].bestSnr  = 0;
+                fix.cons[ci].worstSnr = 0;
+            }
             fix.cons[ci].visible = atoi(f[3]);
             for (int i = 4; i + 3 < n; i += 4) {
+                // An empty SNR field means the satellite is listed as visible
+                // but not tracked. atoi() gives 0 for it, which must not be
+                // taken as a real 0 dB reading - it would peg worstSnr at 0
+                // on every sweep and make the spread meaningless.
+                if (!f[i + 3][0]) continue;
                 int snr = atoi(f[i + 3]);
+                if (snr <= 0) continue;
                 if (snr > fix.cons[ci].bestSnr) fix.cons[ci].bestSnr = snr;
+                if (!fix.cons[ci].worstSnr || snr < fix.cons[ci].worstSnr)
+                    fix.cons[ci].worstSnr = snr;
             }
         }
     }

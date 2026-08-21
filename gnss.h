@@ -17,6 +17,11 @@ struct Constellation {
     const char *name;
     int visible;
     int bestSnr;
+    // Weakest tracked satellite in this constellation, or 0 when none has
+    // reported a usable SNR yet. Needed because the scatter a real sky
+    // produces is *within* a constellation, not between them - see the SNR
+    // check in gpstrust.cpp.
+    int worstSnr;
 };
 
 struct GnssFix {
@@ -27,7 +32,8 @@ struct GnssFix {
     double speedKmh = 0, course = 0;
     char   utc[16] = "", date[16] = "";
     uint32_t lastSentence = 0;         // millis() of last parsed sentence
-    Constellation cons[4] = {{"GPS",0,0},{"GLO",0,0},{"GAL",0,0},{"BDS",0,0}};
+    Constellation cons[4] = {{"GPS",0,0,0},{"GLO",0,0,0},
+                             {"GAL",0,0,0},{"BDS",0,0,0}};
 };
 
 // Quality gates for the staged zoom-in.
