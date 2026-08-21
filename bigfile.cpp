@@ -195,6 +195,20 @@ void bigfile_close(bigfile_t *b) {
 // because a fragmented multi-GB file could legitimately need a table too big
 // to be worth holding, and refusing to open the archive over it would be a
 // far worse outcome than reading it slowly.
+// Said at compile time as well as at runtime, for the same reason the
+// FF_FS_EXFAT check at the top of this file is: a Serial.println() only helps
+// somebody who is watching the console at the moment the first archive opens,
+// and the symptom otherwise is slowness, which looks like the card or the
+// archive rather than the config. This is the line that names the option.
+//
+// A #warning and not an #error. Fast seek is a performance feature and a build
+// without it works; refusing to compile would also punish anyone deliberately
+// running -DMAP_FATFS_EXFAT=0 on small FAT32 media, where chains are short and
+// the table is not worth its RAM.
+#if !FF_USE_FASTSEEK
+#warning "fatfs has FF_USE_FASTSEEK=0 - f_lseek walks the FAT chain, ~498 ms/seek on large archives. Set CONFIG_FATFS_USE_FASTSEEK=y and delete sdkconfig."
+#endif
+
 static void clmt_build(bigfile_t *b) {
 #if !FF_USE_FASTSEEK
     // FIL has no cltbl member unless FatFs was built with fast seek, so this

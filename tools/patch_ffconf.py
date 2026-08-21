@@ -74,6 +74,15 @@ text = set_ff(text, 'FF_USE_TRIM', '0')
 # Every option defined this way carries the same hazard, so guard them all
 # rather than waiting for each new exFAT code path to light one up. Behaviour
 # is unchanged: set stays set, unset becomes the 0 it always meant.
+#
+# One consequence worth stating plainly, because it cost an afternoon. Not
+# every line this rewrites is an option nobody chose. FF_USE_FASTSEEK is here
+# too, and it is a genuine menuconfig knob that happens to default off - so
+# before this ran, an unset CONFIG_FATFS_USE_FASTSEEK was a loud build error,
+# and afterwards it is a silent 0 and a build that quietly walks the FAT chain
+# on every seek. That is the right trade (the alternative is refusing to build
+# at all), but it means the guarded list below is not noise: a feature you
+# believe you turned on and that appears in it is a feature that is off.
 pattern = re.compile(
     r'^#define[ \t]+(FF_[A-Z0-9_]+)[ \t]+(CONFIG_[A-Z0-9_]+)[ \t]*$',
     re.MULTILINE)
@@ -96,3 +105,13 @@ print("ffconf: FF_FS_EXFAT=1 FF_LBA64=1 FF_USE_TRIM=0")
 if guarded:
     print("ffconf: guarded %d Kconfig bools: %s"
           % (len(guarded), ", ".join(guarded)))
+    # Options whose absence changes behaviour rather than just compiling, and
+    # which are therefore worth naming rather than leaving in a list of thirty.
+    NOTABLE = {
+        'FF_USE_FASTSEEK':
+            'CONFIG_FATFS_USE_FASTSEEK - default n; off means every f_lseek '
+            'walks the cluster chain',
+    }
+    for ff in guarded:
+        if ff in NOTABLE:
+            print("ffconf: note: %s is guarded (%s)" % (ff, NOTABLE[ff]))
