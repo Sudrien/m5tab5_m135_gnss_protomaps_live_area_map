@@ -146,9 +146,13 @@ static uint8_t  s_motion_run  = 0;
 // knowable from here.
 static float    s_motion_peak = 0.0f;
 
-// About 0.05 g. Comfortably above the noise floor of an OSR4-averaged 2 g
-// reading sitting on a desk, and below what a deliberate tilt produces.
-static const float MOTION_COUNTS = 800.0f;
+// About 0.09 g, measured rather than guessed. On a Tab5 on a desk the peak
+// departure over a 30 s window sits at 206-255 counts; a device picked up and
+// turned reads 18109; a device set back down at a new angle and left alone
+// still showed 1078 while the filter caught up with the new gravity vector.
+// That last figure is the one that sets this: below it, settling counts as
+// handling and the screen never dims after being moved.
+static const float MOTION_COUNTS = 1500.0f;
 
 // Samples arrive at 10 Hz, so two in a row is 200 ms of sustained departure.
 // One is enough to be a single knocked-table transient.

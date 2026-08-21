@@ -453,6 +453,15 @@ static const uint32_t IDLE_DIM_MS    = 120000;   // two minutes
 // two-minute untouched window still has to elapse again from the touch, so
 // this only governs the accelerometer path.
 static const uint32_t IDLE_UNDIM_HOLD_MS = 15000;
+
+// How far from the anchor counts as having gone somewhere, and how long an
+// anchor lives before it is replaced. 25 m is far outside the few metres a
+// parked receiver wanders and is reached in about three seconds at 30 km/h,
+// so pulling away still brightens the screen about as fast as the old speed
+// test did. 30 s is long enough that a slow walk clears the distance before
+// the window rolls.
+static const double   IDLE_UNDIM_MOVE_M    = 25.0;
+static const uint32_t IDLE_UNDIM_ANCHOR_MS = 30000;
 static const int      IDLE_DIM_PCT   = 40;
 static const uint8_t  IDLE_DIM_FLOOR = 30;
 static uint8_t g_brightness = BRIGHT_DAY;
@@ -612,18 +621,18 @@ static uint8_t brightnessWanted() {
 //
 //   - Entry waits for the settled IDLE band. Being slow costs nothing but a
 //     few seconds of light.
-//   - Exit takes the near-instantaneous speed, which crosses GNSS_SLOW_KMH
-//     some ten to twenty seconds before the band follows it. Without that,
-//     pulling away from a stop would leave the screen dim for the whole
-//     settle window, which is precisely the manoeuvre where it is being
-//     looked at.
+//   - Exit measures displacement from a rolling anchor, which clears
+//     IDLE_UNDIM_MOVE_M within a few seconds of actually setting off - well
+//     before the settled band would follow. Without that, pulling away from
+//     a stop would leave the screen dim for the whole settle window, which
+//     is precisely the manoeuvre where it is being looked at.
 //
-// Speed is not the only way out, though, and on this device it is the weaker
-// one. Standing still with the screen dim, the things that should bring it
+// Position is not the only way out, though, and on this device it is the
+// weaker one. Standing still with the screen dim, the things that should bring it
 // back - picking it up, turning it to read it, setting it down again - move
 // the device without moving its position, and GNSS is blind to all of them.
 // The accelerometer sees exactly those and nothing else, so it carries the
-// stationary case and speed carries the travelling one.
+// stationary case and displacement carries the travelling one.
 //
 // No fix, or a 2D-only fix, means no dim. gnssRatePolicy() holds the rate at
 // FAST in those cases, so the band test below already refuses, but the
@@ -645,27 +654,46 @@ static bool idleDimmed(const GnssFix &fix) {
     uint32_t moved = compass_last_motion_ms();
     if (moved && millis() - moved < IDLE_UNDIM_HOLD_MS) return false;
 
-    // Speed, but not on one sample of it. A stationary receiver with a
-    // partial sky view reports occasional multi-km/h epochs - 7.0 km/h
-    // parked, in one log - and a single-sample exit turned those into a
-    // visible dim/undim blink. Two in a row is still well inside the
-    // pulling-away case the instantaneous read exists to serve, and costs one
-    // fix interval.
+    // Displacement, not speed.
     //
-    // Counted per epoch, keyed on the RMC timestamp. lastSentence would tick
-    // several times within one epoch - GGA, GSA, RMC - and count a single
-    // noisy fix as the two the test is asking for.
-    static uint8_t fastEpochs = 0;
-    static char lastUtc[16] = "";
-    if (strcmp(fix.utc, lastUtc) != 0) {
-        snprintf(lastUtc, sizeof lastUtc, "%s", fix.utc);
-        if (gnss_coarse(fix) && fix.mode == 3 && fix.speedKmh >= GNSS_SLOW_KMH) {
-            if (fastEpochs < 2) fastEpochs++;
-        } else {
-            fastEpochs = 0;
-        }
+    // The speed field is the obvious signal and the wrong one. A stationary
+    // receiver with a partial sky view does not report the odd bad epoch, it
+    // reports a wandering speed for as long as the sky stays bad: one log has
+    // it holding above GNSS_SLOW_KMH long enough for gnssRatePolicy's whole
+    // ten-second settle to elapse and the band to change, on a device sitting
+    // on a desk with the accelerometer reading 235 counts of nothing. Neither
+    // an instantaneous read nor an N-epoch debounce survives that, because
+    // the noise is sustained rather than impulsive.
+    //
+    // What the noise does not do is accumulate. It wanders and comes back,
+    // so the distance from where the device was half a minute ago stays near
+    // zero; travel of any kind does not. Comparing against an anchor rather
+    // than integrating speed also costs nothing to keep.
+    static double anchorLat = 0, anchorLon = 0;
+    static uint32_t anchorMs = 0;
+    static bool anchored = false;
+
+    if (!gnss_coarse(fix) || fix.mode != 3) {
+        // Nothing worth anchoring to. Drop it rather than hold a stale one,
+        // so the first fix after a gap is compared against itself and not
+        // against wherever the device was before the sky closed in.
+        anchored = false;
+    } else if (!anchored) {
+        anchorLat = fix.lat; anchorLon = fix.lon;
+        anchorMs = millis(); anchored = true;
+    } else if (wp_distance_m(fix.lat, fix.lon, anchorLat, anchorLon)
+               >= IDLE_UNDIM_MOVE_M) {
+        // Genuinely somewhere else. Re-anchor here so a continuing journey
+        // keeps clearing the test rather than measuring from the start of it.
+        anchorLat = fix.lat; anchorLon = fix.lon;
+        anchorMs = millis();
+        return false;
+    } else if (millis() - anchorMs >= IDLE_UNDIM_ANCHOR_MS) {
+        // Rolling window. Without this the anchor ages indefinitely and slow
+        // drift eventually crosses the threshold from standing still.
+        anchorLat = fix.lat; anchorLon = fix.lon;
+        anchorMs = millis();
     }
-    if (fastEpochs >= 2) return false;
 
     return gnss_rate_ms() == GNSS_RATE_IDLE;
 }
@@ -676,14 +704,15 @@ static uint8_t applyIdleDim(uint8_t want, const GnssFix &fix) {
     if (dim != wasDim) {
         wasDim = dim;
         // Say which of the two exits released it. They fail differently - a
-        // spurious speed exit is a noisy fix, a spurious handling exit is a
-        // threshold set too low or a vibrating mount - and the fix for one is
-        // not the fix for the other, so the log has to distinguish them at
-        // the moment it happens rather than leave it to be inferred.
+        // spurious position exit is a receiver that has wandered 25 m without
+        // moving, a spurious handling exit is a threshold set too low or a
+        // vibrating mount - and the fix for one is not the fix for the other,
+        // so the log has to distinguish them at the moment it happens rather
+        // than leave it to be inferred.
         uint32_t movedMs = compass_last_motion_ms();
         bool byHand = movedMs && millis() - movedMs < IDLE_UNDIM_HOLD_MS;
         Serial.printf("bright: idle dim %s%s\n", dim ? "on" : "off",
-                      dim ? "" : byHand ? " (handled)" : " (moving)");
+                      dim ? "" : byHand ? " (handled)" : " (moved away)");
     }
     if (!dim) return want;
 
