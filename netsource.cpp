@@ -1012,24 +1012,37 @@ bool netsource_begin(const char *local_path) {
                 // stated reason, which is the failure mode this file works
                 // hardest to avoid elsewhere.
                 //
-                // The length is checked before formatting rather than after.
-                // Testing snprintf's return value would catch it too, but it
-                // leaves the compiler unable to bound strlen(n) on the path
-                // that formats, so -Wformat-truncation stays on at -O2. This
-                // way the bound is a fact on that path and the warning has
-                // nothing to say. It also puts the skip where it can name the
-                // file, which the return-value form cannot do as clearly.
+                // Built with memcpy rather than snprintf("%s%s", ...), and
+                // that is the point rather than a style preference.
+                // -Wformat-truncation has to bound strlen(n) at the call to
+                // stay quiet, and it will not take that bound from a guard
+                // written earlier in the function - not even an explicit one
+                // - because an intervening call could in principle have
+                // rewritten the string. Enlarging the buffer does not help
+                // either: with no upper bound the compiler reports "between 9
+                // and 2147483645 bytes" whatever the destination size is.
+                //
+                // memcpy is outside that warning's scope entirely, and the
+                // length it is given is an integer clamped against a
+                // compile-time constant on the line above, which nothing has
+                // to infer. The clamp is belt and braces - ln > cap has
+                // already skipped the file by then - but it means the write
+                // is bounded by construction and not by an argument about
+                // control flow.
                 char full[1 + 255 + 1];
+                const size_t lead = (n && n[0] == '/') ? 0 : 1;
+                const size_t cap  = sizeof full - lead - 1;
+                if (is_pmt && ln > cap) {
+                    Serial.printf("netsource: skipping %s - name is %u "
+                                  "characters, over the %u this path allows\n",
+                                  n, (unsigned)ln, (unsigned)cap);
+                    is_pmt = false;
+                }
                 if (is_pmt) {
-                    const char *lead = (n[0] == '/') ? "" : "/";
-                    if (ln + strlen(lead) >= sizeof full) {
-                        Serial.printf("netsource: skipping %s - name too long "
-                                      "for a %u-byte path\n",
-                                      n, (unsigned)sizeof full);
-                        is_pmt = false;
-                    } else {
-                        snprintf(full, sizeof full, "%s%s", lead, n);
-                    }
+                    const size_t cpy = ln < cap ? ln : cap;
+                    if (lead) full[0] = '/';
+                    memcpy(full + lead, n, cpy);
+                    full[lead + cpy] = 0;
                 }
                 e.close();
                 if (is_pmt) try_open(full);
