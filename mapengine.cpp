@@ -619,12 +619,23 @@ static const uint32_t PLACE_WANT_FINE =
 static const uint32_t PLACE_WANT_COARSE =
     (1u << S_PLACE_REGION) | (1u << S_PLACE_COUNTRY);
 
+// Archive-read time accumulated across one place block, in microseconds.
+//
+// The worker reads and renders strictly in a row - fetch a tile, inflate it,
+// decode it, then the next - so the SD bus and the rasteriser are never busy
+// at the same time and their costs can be separated cleanly by bracketing the
+// fetch alone. Reset by load_place_block() before its nine tiles.
+static uint32_t s_place_io_us = 0;
+
 static bool load_place_tile(tile_id_t id, PlaceIndex *out, uint32_t want) {
     // Local only: see netsource_get_local(). A place block is nine tiles, and
     // nine failing range requests in a row is what stalled the worker and
     // starved the wifi driver of DMA heap.
     uint32_t got = TILE_CAP;
-    if (!netsource_get_local(id.z, id.x, id.y, w_tile, &got)) return false;
+    uint64_t io0 = esp_timer_get_time();
+    bool got_it = netsource_get_local(id.z, id.x, id.y, w_tile, &got);
+    s_place_io_us += (uint32_t)(esp_timer_get_time() - io0);
+    if (!got_it) return false;
     if (got < 18 || w_tile[0] != 0x1F || w_tile[1] != 0x8B) return false;
     uint32_t need = gzip_isize(w_tile, got);
     if (need > MVT_CAP) return false;
@@ -655,7 +666,11 @@ static bool load_place_tile(tile_id_t id, PlaceIndex *out, uint32_t want) {
 
 // The 3x3 block, built in one go so the index is never half-populated while
 // something is searching it.
+static uint32_t g_place_block_ms = 0, g_place_block_io_ms = 0;
+
 static bool load_place_block(tile_id_t centre, PlaceIndex *out, uint32_t want) {
+    uint64_t t0 = esp_timer_get_time();
+    s_place_io_us = 0;
     out->z = centre.z;
     out->n = 0;
     int world = 1 << centre.z;
@@ -670,6 +685,8 @@ static bool load_place_block(tile_id_t centre, PlaceIndex *out, uint32_t want) {
             if (load_place_tile(id, out, want)) ok++;
         }
     }
+    g_place_block_ms    = (uint32_t)((esp_timer_get_time() - t0) / 1000);
+    g_place_block_io_ms = s_place_io_us / 1000;
     return ok > 0;
 }
 
@@ -715,11 +732,36 @@ static void worker_task(void *arg) {
                               g_place_centre = job.id;  g_place_ok = true; }
                 xSemaphoreGive(g_glock);
             }
-            Serial.printf("map: %s block z%u/%ld/%ld %s (%u places)\n",
+            // Timing on the line that already exists, split into archive
+            // reads and everything else.
+            //
+            // This is here to settle one question: whether a Wi-Fi scan slows
+            // the SD card down. The C6 talks SDIO on slot 1 of the same SDMMC
+            // host the card uses - CONFIG_ESP_HOSTED_SDIO_SLOT=1, which is why
+            // boot reports the host as already initialised - so a scan and an
+            // archive read are contending for one controller. In the logs
+            // where the UI task stalled for 2.6 s, a nine-tile region read
+            // landed inside the scan window, and there was no way to tell
+            // whether it took its usual time or several seconds.
+            //
+            // Now there is. Compare io against a block read with no scan in
+            // flight: if it is unchanged, the stall is pure CPU preemption by
+            // the priority-23 hosted tasks and the fix belongs on the wifiloc
+            // side. If io stretches, the shared controller is contributing and
+            // a scan-side fix alone will not be enough.
+            //
+            // The split is meaningful precisely because the worker is serial -
+            // it fetches a whole tile, then inflates and decodes it, then
+            // fetches the next - so bracketing netsource_get_local() alone
+            // captures bus time with no rasteriser work folded into it.
+            Serial.printf("map: %s block z%u/%ld/%ld %s (%u places) "
+                          "in %lu ms (io %lu ms over 9 tiles)\n",
                           region ? "region" : "place",
                           (unsigned)job.id.z, (long)job.id.x, (long)job.id.y,
                           ok ? "read" : "FAILED",
-                          (unsigned)(ok ? scratch->n : 0));
+                          (unsigned)(ok ? scratch->n : 0),
+                          (unsigned long)g_place_block_ms,
+                          (unsigned long)g_place_block_io_ms);
             // Hitting the cap means the decode was cut short and the index is
             // whatever happened to come first, which is not the same as the
             // nearest. Worth saying out loud rather than quietly answering
