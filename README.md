@@ -65,9 +65,9 @@ questionable one, red when several consistency checks fail together, and
 dark red when there is no position yet.
 
 **A row of buttons** along the bottom. From left to right: the area cache,
-the day/night palette, place and POI labels, saved points, magnetometer
-logging, compass calibration, Wi-Fi positioning, recentring the view, and
-turning the screen off.
+the day/night palette, the backlight, place and POI labels, saved points,
+magnetometer logging, compass calibration, Wi-Fi positioning, recentring the
+view, and turning the screen off.
 
 Labels can be switched on and off instantly, because they are drawn over the
 map rather than baked into the tiles.
@@ -165,6 +165,38 @@ two remain distinguishable at low brightness. The backlight dims as well.
 The theme button overrides this to always-day or always-night. It names the
 current mode, and in automatic it also shows which way that currently
 resolves.
+
+The backlight is a separate decision from the palette, and has its own
+button. Automatic gives it three levels rather than two: full in daylight,
+dim at night, and a step in between for the half hour either side of sunrise
+and sunset - an hour twice a day when full brightness is painful but the
+night palette is not yet readable. The palette stays binary, because a
+half-lit palette reads worse than either of the two it sits between, while
+brightness is simply a continuum.
+
+There is no ambient light sensor on this board, so all of that is inferred
+from where the sun is, and the sun cannot see an overcast morning, a
+multi-storey car park or a low winter sun through the windscreen. The
+brightness button cycles automatic, dim, medium, full and back to automatic,
+which is the way to say so. It shows the level in force either way, and a
+fixed level overrides the theme button as well as the sun - forcing the night
+palette to keep the map dark-adapted and then asking for a bright screen is a
+coherent thing to want.
+
+Left parked and untouched for two minutes, the backlight steps down to 40% of
+whatever level is in force, and any touch brings it straight back. Parked is
+part of the condition and not a detail: driving is exactly when the screen is
+read constantly and touched not at all, so a dim on idle touch alone would
+fade out mid-journey. It uses the same settled speed band that drives the
+receiver's fix rate, and it releases on the instantaneous speed instead, so
+pulling away from a stop brightens immediately rather than after the band
+catches up. Without a fix it does not dim at all - a receiver that cannot say
+whether the device is moving has not said that it is stopped.
+
+Neither override is remembered across a reboot. Both correct a decision the
+device gets right most of the time, and an override nobody remembers setting
+is worse than one that has to be set again - the same reasoning that drops a
+panned view when the screen goes off.
 
 ## Magnetometer
 

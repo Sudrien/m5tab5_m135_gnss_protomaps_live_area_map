@@ -365,19 +365,96 @@ static bool   g_sunValid = false;
 static double g_sunriseMin = 0, g_sunsetMin = 0;
 static int    g_sunDay = -1;
 
+// The instant sunIsUpAt() last decided from, minutes past midnight UTC.
+//
+// Cached rather than recomputed by the twilight test below, for two reasons.
+// The cheap one is that it saves a second time()/gmtime_r() on a function
+// that runs every pass of loop(). The one that matters is that the palette
+// and the backlight must be decided from the same instant: recomputing means
+// the two calls can straddle a minute boundary, and the pair that goes wrong
+// is exactly the pair at a crossing, where the palette flips to night while
+// the backlight still reads one minute short of the window.
+static double g_sunNowMin = 0;
+static bool   g_sunNowValid = false;
+
 // Backlight levels. Night is dim enough not to ruin dark adaptation but
 // still readable; day is full, since sunlight is the harder problem.
 // src: M5GFX LGFX_Device::setBrightness takes a uint8_t, so 255 is the top of
 //      the range and not a chosen number.
 // src: BRIGHT_NIGHT is a judgement, unattributed - see PROVENANCE.md.
 static const uint8_t BRIGHT_DAY = 255, BRIGHT_NIGHT = 60;
+
+// The step between them, for the hour around a crossing.
+//
+// 255 is absurd at dusk. The sun is below the horizon or nearly so, the eye
+// has begun to adapt, and the panel is the brightest thing in the vehicle -
+// but it is not yet dark enough for the night palette to be readable, so the
+// existing two levels have nothing to offer here. This is the backlight
+// admitting to an in-between state that the palette cannot.
+//
+// src: BRIGHT_DUSK is a judgement, unattributed - see PROVENANCE.md.
+static const uint8_t BRIGHT_DUSK = 140;
+
+// Half-width of the window, in minutes either side of sunrise and sunset.
+//
+// src: civil twilight - the sun between the horizon and 6 degrees below it -
+//      runs roughly 30 minutes at the mid latitudes this device is used at.
+//      That is where the number comes from, but it is a fixed window standing
+//      in for a quantity that actually varies with latitude and season, and
+//      it is badly wrong toward the poles, where twilight lasts hours. The
+//      error is in the safe direction: too narrow a window means a few
+//      minutes at 255 that could have been at 140, which is a nuisance, where
+//      too wide would mean a dim screen in full sun, which is unreadable.
+static const double DUSK_HALFWIDTH_MIN = 30.0;
+
+// Manual override of the backlight.
+//
+// There is no ambient light sensor on this board. Everything above infers the
+// light from the sun's position, which is the best a device without a sensor
+// can do and is still routinely wrong: an overcast morning, a multi-storey
+// car park, a tunnel approach, a low winter sun straight through the
+// windscreen. The sun calculation cannot see any of that, and until now there
+// was no way to tell it so.
+//
+// The manual levels are exactly the three automatic ones rather than a new
+// scale. Two reasons. They are already chosen to be readable at their
+// intended light, so reusing them adds no new judgement to attribute - the
+// PROVENANCE entry for the set covers the manual case unchanged. And it keeps
+// the failure mode small: the worst a wrong manual choice can do is put the
+// screen at a level automatic would itself have picked an hour earlier.
+//
+// Deliberately not persisted, matching g_themeMode. Both are overrides of a
+// decision the device makes correctly most of the time, and an override that
+// survives a reboot is one nobody remembers setting - the same argument
+// map_pan_reset() in screenOff() makes about a panned view.
+enum BrightMode { BRIGHTM_AUTO = 0, BRIGHTM_LOW, BRIGHTM_MED, BRIGHTM_HIGH };
+static BrightMode g_brightMode = BRIGHTM_AUTO;
+
+// Idle dim: how long untouched before the backlight steps down, and how far.
+//
+// A device left on and parked - at a trailhead, on a desk, in a garage
+// overnight - burns the largest single load in the project lighting a screen
+// nobody is looking at. This is the case worth catching, and it is separable
+// from the screen-off button because it needs no gesture to come back from
+// and no decision from the user.
+//
+// A fraction rather than a fixed level, so the step preserves the
+// relationship the level above it established: 40% of a night screen is still
+// a night screen. The floor keeps it visibly lit rather than apparently dead,
+// which matters because the way back is a touch and nobody touches a screen
+// they think has crashed.
+//
+// src: all three are judgements, unattributed - see PROVENANCE.md.
+static const uint32_t IDLE_DIM_MS    = 120000;   // two minutes
+static const int      IDLE_DIM_PCT   = 40;
+static const uint8_t  IDLE_DIM_FLOOR = 30;
 static uint8_t g_brightness = BRIGHT_DAY;
 
 // Split from sunIsUp() so the boot path can ask the same question about a
 // remembered position, before any fix exists. See themeBoot().
 static bool sunIsUpAt(double lat, double lon) {
     time_t now = time(nullptr);
-    if (now < 1767225600) return true;                   // clock not set yet
+    if (now < 1767225600) { g_sunNowValid = false; return true; }  // clock unset
     struct tm t;
     gmtime_r(&now, &t);
 
@@ -399,6 +476,8 @@ static bool sunIsUpAt(double lat, double lon) {
     if (!g_sunValid) return true;
 
     double nowMin = t.tm_hour * 60.0 + t.tm_min;
+    g_sunNowMin = nowMin;
+    g_sunNowValid = true;
 
     // SunSet returns minutes past midnight in the timezone it was given, and
     // we give it UTC - so a location whose evening falls after 00:00Z gets a
@@ -424,10 +503,138 @@ static bool sunIsUpAt(double lat, double lon) {
 // have not moved, wrong if the device was carried somewhere between runs.
 static bool g_sunFromStored = false;
 
+// Minutes to the nearest sunrise or sunset, or -1 when the question does not
+// apply.
+//
+// Reads the cache sunIsUpAt() just filled and must only be called after it.
+// Returning -1 rather than a large number for "no crossing" keeps the two
+// unanswerable cases - clock not set, and a latitude with no crossing at all -
+// from being confused with "a long way from dusk", which they are not: one is
+// ignorance and the other is a polar day.
+static double minutesToTwilight() {
+    if (!g_sunValid || !g_sunNowValid) return -1.0;
+
+    double rise = fmod(g_sunriseMin, 1440.0); if (rise < 0) rise += 1440.0;
+    double set  = fmod(g_sunsetMin,  1440.0); if (set  < 0) set  += 1440.0;
+
+    // Equal means no crossing: polar day or polar night, which sunIsUpAt()
+    // resolves to daylight because that is the safer guess. There is no
+    // twilight to be near, and without this guard the two distances below
+    // would be equal and would both read as zero once a day - dimming the
+    // screen to dusk in the middle of a polar noon.
+    if (rise == set) return -1.0;
+
+    // Circular distance on a 1440-minute clock. Straight subtraction is wrong
+    // for the case this function exists to catch: at 23:50 with a sunrise at
+    // 00:10 the difference is 1420 minutes and the answer is 20.
+    double dr = fabs(g_sunNowMin - rise); if (dr > 720.0) dr = 1440.0 - dr;
+    double ds = fabs(g_sunNowMin - set);  if (ds > 720.0) ds = 1440.0 - ds;
+    return dr < ds ? dr : ds;
+}
+
 static bool sunIsUp(const GnssFix &fix) {
     if (fix.status != 'A' || !fix.utc[0]) return true;   // assume day if unsure
     if (g_sunFromStored) { g_sunDay = -1; g_sunFromStored = false; }
     return sunIsUpAt(fix.lat, fix.lon);
+}
+
+// What automatic would choose right now.
+//
+// The palette is binary and stays that way. This is the backlight only, and
+// the separation is the substance of the change: a third palette would have
+// to be a half-lit one, and no such thing reads well - the night palette's
+// contrast is built for a dark cabin and the day palette's for sunlight, and
+// anything between them is worse than both. Brightness has no such problem.
+// It is a continuum, and 140 is simply less light than 255.
+//
+// The dusk step applies only when the theme is automatic too. THEME_DAY and
+// THEME_NIGHT are the user overriding the sun calculation, and a device told
+// to be in day mode should be readable as if it were day; stepping it down at
+// 18:40 because the sun disagrees would be the override failing to override.
+//
+// Reads map_is_dark() rather than taking the palette as an argument, so the
+// footer can call it to label the button. applyTheme() calls this after
+// map_set_dark(), so the two agree; anywhere else the palette is whatever was
+// last applied, which is what the button should be reporting anyway.
+static uint8_t brightnessAuto() {
+    if (g_themeMode == THEME_DAY)   return BRIGHT_DAY;
+    if (g_themeMode == THEME_NIGHT) return BRIGHT_NIGHT;
+
+    double d = minutesToTwilight();
+    if (d >= 0.0 && d <= DUSK_HALFWIDTH_MIN) return BRIGHT_DUSK;
+    return map_is_dark() ? BRIGHT_NIGHT : BRIGHT_DAY;
+}
+
+// What the backlight should be, honouring a manual override.
+//
+// A fixed level beats the theme override as well as the sun, which is the
+// only ordering that makes sense once the two decisions are separate: someone
+// who has forced the night palette to keep the map dark-adapted and then asks
+// for full brightness is asking for exactly that, and there is no reading of
+// "night theme" that should quietly veto it.
+static uint8_t brightnessWanted() {
+    switch (g_brightMode) {
+        case BRIGHTM_LOW:  return BRIGHT_NIGHT;
+        case BRIGHTM_MED:  return BRIGHT_DUSK;
+        case BRIGHTM_HIGH: return BRIGHT_DAY;
+        default:           return brightnessAuto();
+    }
+}
+
+// Whether the backlight should be stepped down for want of anyone looking.
+//
+// The obvious version of this - dim after N minutes untouched - is wrong on
+// the device's main job. Driving is exactly the case where the screen is
+// being read constantly and touched not at all, and a satnav that fades out
+// two minutes into a motorway leg is broken, not thrifty. Touch is a proxy
+// for attention and it is a bad one; movement is the better proxy, and this
+// device already knows.
+//
+// So entry needs stationary as well as untouched, and "stationary" reuses the
+// band gnssRatePolicy() has already settled rather than testing the speed
+// again. That band is debounced by GNSS_RATE_SETTLE_MS and hysteresised
+// against the flip-flopping a single threshold would cause, and a second
+// independent notion of stopped would be free to disagree with it.
+//
+// Entry and exit are deliberately asymmetric - slow to dim, immediate to
+// brighten:
+//
+//   - Entry waits for the settled IDLE band. Being slow costs nothing but a
+//     few seconds of light.
+//   - Exit takes the instantaneous speed, which crosses GNSS_SLOW_KMH some
+//     ten to twenty seconds before the band follows it. Without that, pulling
+//     away from a stop would leave the screen dim for the whole settle
+//     window, which is precisely the manoeuvre where it is being looked at.
+//
+// No fix, or a 2D-only fix, means no dim. gnssRatePolicy() holds the rate at
+// FAST in those cases, so the band test below already refuses, but the
+// reasoning is worth stating: a receiver that cannot say whether the device
+// is moving has not said it is stopped, and the safe reading of silence here
+// is to leave the screen alone.
+static bool idleDimmed(const GnssFix &fix) {
+    if (g_screenOff) return false;
+
+    // Unsigned subtraction, so the 49.7-day millis() wrap takes care of
+    // itself - the difference stays correct across it.
+    if (millis() - g_lastTouchMs < IDLE_DIM_MS) return false;
+
+    if (gnss_coarse(fix) && fix.mode == 3 && fix.speedKmh >= GNSS_SLOW_KMH)
+        return false;
+
+    return gnss_rate_ms() == GNSS_RATE_IDLE;
+}
+
+static uint8_t applyIdleDim(uint8_t want, const GnssFix &fix) {
+    static bool wasDim = false;
+    bool dim = idleDimmed(fix);
+    if (dim != wasDim) {
+        wasDim = dim;
+        Serial.printf("bright: idle dim %s\n", dim ? "on" : "off");
+    }
+    if (!dim) return want;
+
+    int v = want * IDLE_DIM_PCT / 100;
+    return v < IDLE_DIM_FLOOR ? IDLE_DIM_FLOOR : (uint8_t)v;
 }
 
 static void applyTheme(const GnssFix &fix) {
@@ -439,6 +646,12 @@ static void applyTheme(const GnssFix &fix) {
     }
     if (wantDark != map_is_dark()) map_set_dark(wantDark);
 
+    // The idle dim wraps the chosen level rather than replacing it, so a
+    // manual override still decides what "full" means and this only decides
+    // whether anyone is there to see it. The two questions are independent:
+    // "how much light does this place need" and "is anyone looking".
+    uint8_t want = applyIdleDim(brightnessWanted(), fix);
+
     // Track the level the screen *should* have, but only drive the backlight
     // when the screen is actually on.
     //
@@ -446,8 +659,8 @@ static void applyTheme(const GnssFix &fix) {
     // backlight back on without resuming drawing - a lit panel showing
     // nothing at all, no map, no status bar, no buttons. Indistinguishable
     // from a crash, and it survives until someone happens to touch the
-    // middle of the screen.
-    uint8_t want = wantDark ? BRIGHT_NIGHT : BRIGHT_DAY;
+    // middle of the screen. The dusk step adds two more crossings a day at
+    // which this can fire, so the guard matters more than it did.
     if (want != g_brightness) {
         g_brightness = want;
         if (!g_screenOff) M5.Display.setBrightness(want);
@@ -514,16 +727,22 @@ static const int BTN_PAD_TOP = 26, BTN_PAD_SIDE = 6;
 // a PSRAM sprite, a per-frame repaint and a projection. The magnetometer is
 // still read, and now goes to the card instead of the screen: see maglog.cpp.
 // BTN_MAG toggles that, BTN_CAL is what calibration moved to.
-enum { BTN_CACHE = 0, BTN_THEME, BTN_POI, BTN_PINS,
+enum { BTN_CACHE = 0, BTN_THEME, BTN_BRIGHT, BTN_POI, BTN_PINS,
        BTN_MAG, BTN_CAL, BTN_WIFI, BTN_HOME, BTN_SLEEP, BTN_COUNT };
 
-// Nine buttons at 1280 px is 116 px each, and at text size 2 the built-in
-// font is 12 px per character - so a label has room for about nine
+// Ten buttons at 1280 px is 114 px each - buttonRect() below divides
+// 1280 - BTN_M * (BTN_COUNT + 1) between them - and at text size 2 the
+// built-in font is 12 px per character, so a label has room for about nine
 // characters before it runs into its own border. Every label below is
 // written to that budget, which is why several of them read as abbreviations
 // rather than as sentences. Nothing enforces it; a longer one is clipped by
 // the sprite rather than overflowing into the neighbouring button, so the
 // failure mode is a truncated word and not a corrupted row.
+//
+// BTN_BRIGHT sits next to BTN_THEME because the two are read together: the
+// theme button says what the palette is doing and the brightness button says
+// what the backlight is doing, and after this commit those are genuinely two
+// decisions rather than one.
 
 static uint32_t g_confirmUntil = 0;      // armed state for the cache button
 static uint32_t g_lastTouchMs = 0;
@@ -735,6 +954,20 @@ static void drawFooter(const GnssFix &fix) {
     setButton(BTN_THEME, tl,
                g_themeMode == THEME_AUTO ? M5.Display.color565(60, 90, 60)
                                          : M5.Display.color565(70, 70, 90));
+
+    // The brightness button, in the same idiom: it names the mode, and in
+    // auto it also shows the level that mode currently resolves to. Without
+    // the number, "auto" says nothing about why the screen looks as it does -
+    // which is the same reason the theme button spells out "auto:day".
+    //
+    // Nine characters is the label budget, and "fixed:140" is exactly nine.
+    char bl[12];
+    snprintf(bl, sizeof bl, "%s:%u",
+             g_brightMode == BRIGHTM_AUTO ? "auto" : "fixed",
+             (unsigned)brightnessWanted());
+    setButton(BTN_BRIGHT, bl,
+               g_brightMode == BRIGHTM_AUTO ? M5.Display.color565(60, 90, 60)
+                                            : M5.Display.color565(70, 70, 90));
 
     // Labels are an overlay, so this is genuinely instant - there is no
     // "re-rendering" state to show, unlike the theme button.
@@ -1311,6 +1544,28 @@ static void handleTouch(const GnssFix &fix) {
         Serial.printf("theme: %s\n",
                       g_themeMode == THEME_AUTO ? "auto" :
                       g_themeMode == THEME_DAY  ? "day" : "night");
+        break;
+
+    case BTN_BRIGHT:
+        // auto -> low -> medium -> high -> auto. Cycling back to auto rather
+        // than stopping at the top matters: a manual level is a temporary
+        // correction for a condition the sun calculation cannot see, and the
+        // condition passes. Leaving no way back short of a reboot would turn
+        // every tunnel into a permanently wrong screen.
+        //
+        // The order runs upward from auto so that the first press from
+        // automatic is downward in light, which is the direction it is
+        // usually wanted: the complaint that prompts reaching for this button
+        // is far more often "too bright" than "too dim", because the
+        // too-bright case is painful and the too-dim case is merely
+        // inconvenient.
+        g_brightMode = (BrightMode)((g_brightMode + 1) % 4);
+        // Applied on the next pass by applyTheme(), which owns g_brightness
+        // and the screen-off guard. Setting the backlight here would bypass
+        // both and light a sleeping panel.
+        Serial.printf("bright: %s (%u)\n",
+                      g_brightMode == BRIGHTM_AUTO ? "auto" : "fixed",
+                      (unsigned)brightnessWanted());
         break;
 
     case BTN_CACHE:
