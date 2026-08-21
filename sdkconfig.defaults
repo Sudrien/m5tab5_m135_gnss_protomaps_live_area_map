@@ -1250,6 +1250,44 @@ CONFIG_ESP_HOSTED_USE_MEMPOOL=n
 # on VFS opens, and bigfile.cpp holds its own FIL and sizes its own table.
 CONFIG_FATFS_USE_FASTSEEK=y
 
+# ---- Compiler optimization -------------------------------------------------
+# -O2 rather than the reference's -Os.
+#
+# This is a rendering and parsing workload - inflate.c, mvt.c and raster.c
+# run over every tile that reaches the screen - and those are exactly the
+# loops -Os declines to unroll or inline. The seek work either side of this
+# was I/O bound and the CPU was not the limit; once the CLMT removes the FAT
+# walk, decode is what is left.
+#
+# The choice is imported as CONFIG_COMPILER_OPTIMIZATION_SIZE=y (line ~133),
+# and the reference also carries two deprecated aliases for the same choice
+# near the end of its legacy block:
+#
+#     CONFIG_OPTIMIZATION_LEVEL_RELEASE=y
+#     CONFIG_COMPILER_OPTIMIZATION_LEVEL_RELEASE=y
+#
+# both of which sdkconfig.rename maps onto COMPILER_OPTIMIZATION_SIZE. That
+# is three lines selecting -Os, so it is worth being explicit about why one
+# line here beats them: kconfiglib resolves a renamed symbol inline as it
+# reads each line, not in a pass afterwards, so all three land as
+# COMPILER_OPTIMIZATION_SIZE=y at their own position in the stream and this,
+# being last, takes the choice. Same mechanism that lets the log level below
+# override the reference's LOG_DEFAULT_LEVEL_ERROR.
+#
+# Configure therefore prints, and this is correct rather than a problem:
+#
+#     NOTE: Choice COMPILER_OPTIMIZATION has multiple active selections.
+#     The last one will be used: COMPILER_OPTIMIZATION_PERF.
+#
+# The bootloader is deliberately left at -Os. Its partition is 0x6000 and
+# already tight enough that raising its log level overflows it - see the
+# diagnostics note below. It runs once, so there is nothing to win there.
+#
+# Costs: roughly 10-20% more .text, against 0x300000 of app partition, so
+# check `idf.py size` rather than assuming. Assertions are a separate axis
+# and stay on (ASSERTION_LEVEL=2) - this changes speed, not checking.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
 # ---- TEMPORARY: diagnostics ------------------------------------------------
 # The reference sets LOG_DEFAULT_LEVEL_ERROR, right for shipping and wrong
 # while the board is being brought up: it silences heap_init and esp_psram.
