@@ -774,9 +774,10 @@ static void applyTheme(const GnssFix &fix) {
 }
 
 // ---- footer buttons --------------------------------------------------------
-// Three across the bottom: cache, theme, screen off. The map is clipped out
-// of this strip (FOOTER_H in mapengine) so they are not fighting it for
-// pixels every frame.
+// Five across the bottom - the controls you use while moving. Everything you
+// set once and leave alone lives in the settings panel instead; see the enum
+// below. The map is clipped out of this strip (FOOTER_H in mapengine) so they
+// are not fighting it for pixels every frame.
 static const int BTN_H = 54, BTN_M = 12;
 
 // ---- flicker-free strips ---------------------------------------------------
@@ -819,37 +820,32 @@ static bool     g_btnCvOk     = false;
 // The touch target is taller than the drawn button. A 54 px outline is a
 // small thing to hit on a moving vehicle, and there is nothing else along
 // the bottom edge to steal a press from - so the target extends upward into
-// the map and downward to the screen edge.
+// the map and downward to the screen edge. Less critical now that there are
+// five buttons rather than ten, but the padding costs nothing and the vertical
+// half of it is doing the same work it always was.
 static const int BTN_PAD_TOP = 26, BTN_PAD_SIDE = 6;
 
-// Six across the bottom. At 1280 px that is 199 px each - narrower than the
-// five-button row was, but the row got the compass dial's 110 px back when the
-// dial went, so the net change is small. The touch zone still extends past the
-// drawn outline in every direction (BTN_PAD_*), so the usable area is larger
-// again than the number suggests.
+// Five across the bottom, and the count is the point.
 //
-// The ball compass that used to sit at the left end is gone. It was answering
-// a question - "which way am I facing" - that the map, drawn north-up with a
-// marker on it, mostly already answers, and answering it took a 110 px circle,
-// a PSRAM sprite, a per-frame repaint and a projection. The magnetometer is
-// still read, and now goes to the card instead of the screen: see maglog.cpp.
-// BTN_MAG toggles that, BTN_CAL is what calibration moved to.
-enum { BTN_CACHE = 0, BTN_THEME, BTN_BRIGHT, BTN_POI, BTN_PINS,
-       BTN_MAG, BTN_CAL, BTN_WIFI, BTN_HOME, BTN_SLEEP, BTN_COUNT };
+// It was ten. Ten buttons at 1280 px is 114 px each, which at text size 2 is
+// about nine characters - so every label was an abbreviation, and the row read
+// as a strip of codes rather than as controls. Worse, they were not the same
+// kind of thing. "recentre" is something you press while driving, with one
+// hand, without reading it. "auto:nite" is something you set once and then
+// leave alone for weeks.
+//
+// So the row keeps the first kind and the second kind moves behind BTN_SET
+// into the settings panel, which has room to spell things out. The test for
+// which side of the line a control falls on: would you press it with the
+// device in a cradle and your eyes on the road? If yes it stays in the row.
+//
+// Five at 1280 px is 244 px each - about twenty characters - so these labels
+// are words now.
+enum { BTN_HOME = 0, BTN_PINS, BTN_CACHE, BTN_SET, BTN_SLEEP, BTN_COUNT };
 
-// Ten buttons at 1280 px is 114 px each - buttonRect() below divides
-// 1280 - BTN_M * (BTN_COUNT + 1) between them - and at text size 2 the
-// built-in font is 12 px per character, so a label has room for about nine
-// characters before it runs into its own border. Every label below is
-// written to that budget, which is why several of them read as abbreviations
-// rather than as sentences. Nothing enforces it; a longer one is clipped by
-// the sprite rather than overflowing into the neighbouring button, so the
-// failure mode is a truncated word and not a corrupted row.
-//
-// BTN_BRIGHT sits next to BTN_THEME because the two are read together: the
-// theme button says what the palette is doing and the brightness button says
-// what the backlight is doing, and after this commit those are genuinely two
-// decisions rather than one.
+// The order is by how often it is reached for while moving, left to right,
+// with the two that change the least at the right-hand end. BTN_SLEEP is last
+// because it is the one press that is annoying to make by accident.
 
 static uint32_t g_confirmUntil = 0;      // armed state for the cache button
 
@@ -1041,7 +1037,7 @@ static void drawFooter(const GnssFix &fix) {
     else if (held)  snprintf(label, sizeof label, "offline");
     else if (armed) snprintf(label, sizeof label, "confirm?");
     else if (!net)  snprintf(label, sizeof label, "wifi set");
-    else            snprintf(label, sizeof label, "cache%dk",
+    else            snprintf(label, sizeof label, "cache %d km",
                              (int)(((2 * PREFETCH_RADIUS + 1) * 40075.0
                                     * 0.74 / (1 << DATA_ZOOM_OF(Z_FLOOR)))));
     setButton(BTN_CACHE, label,
@@ -1050,37 +1046,6 @@ static void drawFooter(const GnssFix &fix) {
                armed ? TFT_ORANGE   :
                net   ? M5.Display.color565(40, 70, 150)
                      : M5.Display.color565(70, 70, 70));
-
-    // The theme button names the mode, and in auto also shows which way it
-    // currently resolves - otherwise "auto" tells you nothing about why the
-    // screen looks the way it does.
-    const char *tl = g_themeMode == THEME_DAY   ? "day"
-                   : g_themeMode == THEME_NIGHT ? "night"
-                   : (map_is_dark() ? "auto:nite" : "auto:day");
-    setButton(BTN_THEME, tl,
-               g_themeMode == THEME_AUTO ? M5.Display.color565(60, 90, 60)
-                                         : M5.Display.color565(70, 70, 90));
-
-    // The brightness button, in the same idiom: it names the mode, and in
-    // auto it also shows the level that mode currently resolves to. Without
-    // the number, "auto" says nothing about why the screen looks as it does -
-    // which is the same reason the theme button spells out "auto:day".
-    //
-    // Nine characters is the label budget, and "fixed:140" is exactly nine.
-    char bl[12];
-    snprintf(bl, sizeof bl, "%s:%u",
-             g_brightMode == BRIGHTM_AUTO ? "auto" : "fixed",
-             (unsigned)brightnessWanted());
-    setButton(BTN_BRIGHT, bl,
-               g_brightMode == BRIGHTM_AUTO ? M5.Display.color565(60, 90, 60)
-                                            : M5.Display.color565(70, 70, 90));
-
-    // Labels are an overlay, so this is genuinely instant - there is no
-    // "re-rendering" state to show, unlike the theme button.
-    bool lab = map_labels_on();
-    setButton(BTN_POI, lab ? "labels" : "no labels",
-               lab ? M5.Display.color565(60, 80, 110)
-                   : M5.Display.color565(70, 70, 70));
 
     // The pin button doubles as the guidance readout: while a target is set
     // the button names it, so the one control that turns guidance off also
@@ -1092,67 +1057,13 @@ static void drawFooter(const GnssFix &fix) {
         if (t >= 0) {
             Waypoint w;
             if (wp_get(t, &w)) snprintf(pl, sizeof pl, "to %s", w.name);
-            else               snprintf(pl, sizeof pl, "pins");
+            else               snprintf(pl, sizeof pl, "saved points");
         } else {
-            snprintf(pl, sizeof pl, "pins (%d)", wp_count());
+            snprintf(pl, sizeof pl, "points (%d)", wp_count());
         }
         setButton(BTN_PINS, pl,
                    t >= 0 ? M5.Display.color565(150, 60, 30)
                           : M5.Display.color565(70, 70, 70));
-    }
-
-    // The magnetometer button is a logging control, not a heading readout.
-    // It shows the row count rather than a state word, because "on" says the
-    // switch is set and the count says data is actually landing on the card -
-    // which is the thing that goes wrong silently.
-    {
-        char ml[40];
-        if (!compass_ok())            snprintf(ml, sizeof ml, "no mag");
-        else if (!maglog_available()) snprintf(ml, sizeof ml, "mag: -");
-        else if (!maglog_enabled())   snprintf(ml, sizeof ml, "mag off");
-        else snprintf(ml, sizeof ml, "mag %lu", (unsigned long)maglog_rows());
-        setButton(BTN_MAG, ml,
-                   (compass_ok() && maglog_enabled())
-                       ? M5.Display.color565(60, 80, 110)
-                       : M5.Display.color565(70, 70, 70));
-    }
-
-    // Calibration used to live on the dial. It still has to be a deliberate
-    // act rather than something automatic - it needs the device turned through
-    // every orientation, which nothing can ask for on its own behalf, and a
-    // half-finished sweep biases every reading afterwards - so it keeps its
-    // own control now that there is no dial to tap.
-    {
-        char cl[40];
-        if (!compass_ok())               snprintf(cl, sizeof cl, "no mag");
-        else if (compass_calibrating())  snprintf(cl, sizeof cl, "cal %d%%",
-                                                  compass_calibrate_progress());
-        else snprintf(cl, sizeof cl, "%s", compass_status());
-        setButton(BTN_CAL, cl,
-                   compass_calibrating() ? TFT_ORANGE
-                                         : M5.Display.color565(70, 70, 70));
-    }
-
-    // The access point count, which is the only honest progress indicator this
-    // feature has: the database is useless below a few hundred records and
-    // there is nothing else on the device that says how far along it is. It
-    // counts total records rather than usable ones - a record needs three
-    // observations before an estimate will touch it - because the total is
-    // what grows visibly on a drive and the distinction belongs in the log
-    // line, not on a 116 px button.
-    //
-    // Lit amber while an estimate is actually driving the map, which is the
-    // one moment the number stops being trivia.
-    {
-        char wl[40];
-        if (!wifiloc_available())    snprintf(wl, sizeof wl, "wifi: -");
-        else if (!wifiloc_enabled()) snprintf(wl, sizeof wl, "wifi off");
-        else if (g_estimated)        snprintf(wl, sizeof wl, "~%d AP", wifiloc_used());
-        else snprintf(wl, sizeof wl, "wifi %lu", (unsigned long)wifiloc_entries());
-        setButton(BTN_WIFI, wl,
-                   g_estimated ? M5.Display.color565(150, 100, 20)
-                   : wifiloc_enabled() ? M5.Display.color565(60, 80, 110)
-                                       : M5.Display.color565(70, 70, 70));
     }
 
     // Lit only while the view is somewhere the device is not. A panned view
@@ -1164,6 +1075,31 @@ static void drawFooter(const GnssFix &fix) {
         setButton(BTN_HOME, panned ? "recentre" : "centred",
                    panned ? M5.Display.color565(150, 60, 30)
                           : M5.Display.color565(70, 70, 70));
+    }
+
+    // Settings carries a badge rather than a plain label when something
+    // behind it is actively doing work - a calibration sweep in progress, a
+    // logger running - because those are the states where a closed panel
+    // could otherwise hide the fact that the device is busy on your behalf.
+    //
+    // Calibration wins the badge when both apply: it is the one that wants
+    // finishing, and it is the one the user is mid-way through.
+    {
+        char sl[40];
+        uint16_t sc = M5.Display.color565(70, 70, 70);
+        if (compass_calibrating()) {
+            snprintf(sl, sizeof sl, "cal %d%%", compass_calibrate_progress());
+            sc = TFT_ORANGE;
+        } else if (g_estimated) {
+            snprintf(sl, sizeof sl, "settings ~%d AP", wifiloc_used());
+            sc = M5.Display.color565(150, 100, 20);
+        } else if (maglog_enabled() || wifiloc_enabled()) {
+            snprintf(sl, sizeof sl, "settings (logging)");
+            sc = M5.Display.color565(60, 80, 110);
+        } else {
+            snprintf(sl, sizeof sl, "settings");
+        }
+        setButton(BTN_SET, sl, sc);
     }
 
     setButton(BTN_SLEEP, "screen off", M5.Display.color565(70, 70, 70));
@@ -1465,6 +1401,358 @@ static void drawPinPanel(const GnssFix &fix) {
     }
 }
 
+// ---- settings panel --------------------------------------------------------
+// Everything that used to be a footer button and did not need to be.
+//
+// Same furniture as the saved-points panel, and deliberately so: a device with
+// two kinds of panel is two programs. Same sprite trick, same "tap outside to
+// close", same row height.
+//
+// What is different is the row. A saved point is a thing with a name, so its
+// row is a label and two actions. A setting is a question with an answer, so
+// its row is a name on the left, the current answer as a chip on the right,
+// and one line underneath saying what the answer means. That third line is the
+// whole reason for doing this: "auto:nite" had to fit in nine characters, and
+// "following the sun - dark until 10:48Z" does not have to fit in anything.
+//
+// Rows are actions as much as toggles - calibration is neither on nor off -
+// so each one owns what tapping it does, and the chip says where it is now.
+enum { SET_THEME = 0, SET_BRIGHT, SET_LABELS, SET_MAG, SET_CAL,
+       SET_WIFILOC, SET_WIFISET, SET_COUNT };
+
+static bool g_setPanel = false;
+static M5Canvas g_setCv(&M5.Display);
+static bool     g_setCvOk = false;
+static uint32_t g_setEpoch = 0;
+
+static const int SP_ROW_H = 62;
+static const int SP_HEAD_H = 70, SP_FOOT_H = 62;
+
+// Taller than the pin panel: seven rows of two lines each need the height, and
+// unlike the pin list there is no scrolling to fall back on - a settings list
+// with a hidden page is a settings list where somebody never finds the switch.
+static void setPanelRect(int *x, int *y, int *w, int *h) {
+    if (!g_panelOk) { *x = *y = *w = *h = 0; return; }
+    int W = M5.Display.width(), H = M5.Display.height();
+    *w = W * 3 / 4;
+    *h = SP_HEAD_H + SP_FOOT_H + SET_COUNT * SP_ROW_H;
+    if (*h > H - 40) *h = H - 40;
+    *x = (W - *w) / 2;
+    *y = (H - *h) / 2;
+}
+
+static void setPanelOpen() {
+    g_setPanel = true;
+    g_setEpoch++;
+    if (!g_panelOk || g_setCvOk) return;
+    int x, y, w, h; setPanelRect(&x, &y, &w, &h);
+    g_setCv.setPsram(true);
+    g_setCv.setColorDepth(16);
+    g_setCvOk = g_setCv.createSprite(w, h);
+    if (!g_setCvOk)
+        Serial.println("settings: panel canvas failed, drawing direct");
+}
+
+static void setPanelClose() {
+    g_setPanel = false;
+    if (g_setCvOk) { g_setCv.deleteSprite(); g_setCvOk = false; }
+    if (!g_panelOk) return;
+    M5.Display.fillScreen(style_background());
+    map_invalidate();
+    g_btnShownValid = false;
+}
+
+// One row's text. `name` is fixed, `value` is the chip, `note` is the line
+// underneath. `lit` colours the chip: a setting doing something is blue, a
+// setting at its automatic default is green, an inert one is grey.
+static void setRowText(int i, char *name, size_t nn, char *value, size_t vn,
+                       char *note, size_t tn, uint16_t *chip) {
+    const uint16_t GREY  = M5.Display.color565(70, 70, 70);
+    const uint16_t BLUE  = M5.Display.color565(60, 80, 110);
+    const uint16_t GREEN = M5.Display.color565(60, 90, 60);
+    *chip = GREY;
+
+    switch (i) {
+    case SET_THEME:
+        snprintf(name, nn, "palette");
+        snprintf(value, vn, "%s", g_themeMode == THEME_DAY   ? "day"
+                                : g_themeMode == THEME_NIGHT ? "night" : "auto");
+        if (g_themeMode == THEME_AUTO) {
+            snprintf(note, tn, "following the sun - %s right now",
+                     map_is_dark() ? "night" : "day");
+            *chip = GREEN;
+        } else {
+            snprintf(note, tn, "held %s until you change it",
+                     g_themeMode == THEME_DAY ? "light" : "dark");
+            *chip = BLUE;
+        }
+        break;
+
+    case SET_BRIGHT:
+        snprintf(name, nn, "brightness");
+        snprintf(value, vn, "%s", g_brightMode == BRIGHTM_AUTO ? "auto"
+                                : g_brightMode == BRIGHTM_LOW  ? "low"
+                                : g_brightMode == BRIGHTM_MED  ? "medium" : "high");
+        snprintf(note, tn, "backlight at %u of 255%s",
+                 (unsigned)brightnessWanted(),
+                 g_brightMode == BRIGHTM_AUTO ? ", set by the palette" : "");
+        *chip = g_brightMode == BRIGHTM_AUTO ? GREEN : BLUE;
+        break;
+
+    case SET_LABELS:
+        snprintf(name, nn, "place names");
+        snprintf(value, vn, "%s", map_labels_on() ? "on" : "off");
+        snprintf(note, tn, "drawn over the map - instant either way");
+        *chip = map_labels_on() ? BLUE : GREY;
+        break;
+
+    case SET_MAG:
+        snprintf(name, nn, "magnetometer log");
+        if (!compass_ok())            snprintf(value, vn, "no sensor");
+        else if (!maglog_available()) snprintf(value, vn, "no card");
+        else snprintf(value, vn, "%s", maglog_enabled() ? "on" : "off");
+        // The row count rather than a state word: "on" says the switch is
+        // set, the count says data is actually landing on the card, and it is
+        // the second one that fails silently.
+        snprintf(note, tn, "%lu rows, %u KB written to /maglog.csv",
+                 (unsigned long)maglog_rows(),
+                 (unsigned)(maglog_bytes() / 1024));
+        *chip = (compass_ok() && maglog_enabled()) ? BLUE : GREY;
+        break;
+
+    case SET_CAL:
+        snprintf(name, nn, "compass calibration");
+        if (!compass_ok())              snprintf(value, vn, "no sensor");
+        else if (compass_calibrating()) snprintf(value, vn, "%d%%",
+                                                 compass_calibrate_progress());
+        else snprintf(value, vn, "%s", compass_status());
+        snprintf(note, tn, "%s", compass_calibrating()
+                 ? "turn the device through every orientation - tap to stop"
+                 : "tap to refine; needs the device tumbled slowly");
+        *chip = compass_calibrating() ? TFT_ORANGE : GREY;
+        break;
+
+    case SET_WIFILOC:
+        snprintf(name, nn, "wifi positioning");
+        if (!wifiloc_available())    snprintf(value, vn, "no memory");
+        else snprintf(value, vn, "%s", wifiloc_enabled() ? "on" : "off");
+        if (g_estimated)
+            snprintf(note, tn, "position from %d access points right now",
+                     wifiloc_used());
+        else
+            snprintf(note, tn, "%lu access points learned so far",
+                     (unsigned long)wifiloc_entries());
+        *chip = g_estimated ? M5.Display.color565(150, 100, 20)
+              : wifiloc_enabled() ? BLUE : GREY;
+        break;
+
+    case SET_WIFISET:
+        snprintf(name, nn, "wifi network");
+        if (WiFi.status() == WL_CONNECTED)
+            snprintf(value, vn, "%s", WiFi.SSID().c_str());
+        else snprintf(value, vn, "offline");
+        snprintf(note, tn, "%s", WiFi.status() == WL_CONNECTED
+                 ? "tap to join a different network"
+                 : "tap to open the setup portal on this screen");
+        *chip = WiFi.status() == WL_CONNECTED ? M5.Display.color565(40, 70, 150)
+                                              : GREY;
+        break;
+
+    default:
+        name[0] = value[0] = note[0] = 0;
+        break;
+    }
+}
+
+static void drawSetPanel() {
+    if (!g_panelOk || !g_setPanel) return;
+    int x, y, w, h; setPanelRect(&x, &y, &w, &h);
+
+    // Same signature-compare as the pin panel: a settings list is almost
+    // always identical to the last frame, and the two that are not - a
+    // calibration percentage and a logger's row count - move slowly.
+    char sig[512];
+    int used = snprintf(sig, sizeof sig, "%lu", (unsigned long)g_setEpoch);
+    for (int i = 0; i < SET_COUNT && used < (int)sizeof sig - 1; i++) {
+        char n[40], v[40], t[80]; uint16_t c;
+        setRowText(i, n, sizeof n, v, sizeof v, t, sizeof t, &c);
+        used += snprintf(sig + used, sizeof sig - used, "|%s|%s|%u", v, t,
+                         (unsigned)c);
+    }
+    static char lastSig[512] = "";
+    static bool haveLast = false;
+    if (haveLast && strcmp(sig, lastSig) == 0) return;
+    snprintf(lastSig, sizeof lastSig, "%s", sig);
+    haveLast = true;
+
+    lgfx::LovyanGFX *g = g_setCvOk ? (lgfx::LovyanGFX *)&g_setCv
+                                   : (lgfx::LovyanGFX *)&M5.Display;
+    const int ox = g_setCvOk ? 0 : x, oy = g_setCvOk ? 0 : y;
+
+    if (g_setCvOk) g_setCv.fillSprite(M5.Display.color565(20, 20, 26));
+    else           M5.Display.fillRoundRect(x, y, w, h, 14,
+                                            M5.Display.color565(20, 20, 26));
+    g->drawRoundRect(ox, oy, w, h, 14, TFT_WHITE);
+
+    g->setTextDatum(top_left);
+    g->setTextColor(TFT_WHITE);
+    g->setTextSize(2);
+    g->drawString("settings", ox + 18, oy + 18);
+    g->setTextColor(TFT_DARKGREY);
+    g->drawString("tap a row to change it", ox + 150, oy + 20);
+
+    for (int i = 0; i < SET_COUNT; i++) {
+        int ry = oy + SP_HEAD_H + i * SP_ROW_H;
+        char n[40], v[40], t[80]; uint16_t chip;
+        setRowText(i, n, sizeof n, v, sizeof v, t, sizeof t, &chip);
+
+        g->fillRoundRect(ox + 14, ry, w - 28, SP_ROW_H - 8, 8,
+                         M5.Display.color565(45, 45, 55));
+
+        g->setTextDatum(top_left);
+        g->setTextSize(2);
+        g->setTextColor(TFT_WHITE);
+        g->drawString(n, ox + 30, ry + 8);
+        g->setTextColor(TFT_LIGHTGREY);
+        g->drawString(t, ox + 30, ry + 32);
+
+        // The chip is right-aligned and sized to its text, so a long value
+        // ("fivescore", a compass status) does not have to fit a fixed box.
+        int tw = (int)g->textWidth(v) + 28;
+        if (tw < 90) tw = 90;
+        int cx = ox + w - 24 - tw;
+        g->fillRoundRect(cx, ry + 8, tw, SP_ROW_H - 24, 8, chip);
+        g->setTextDatum(middle_center);
+        g->setTextColor(TFT_WHITE);
+        g->drawString(v, cx + tw / 2, ry + 8 + (SP_ROW_H - 24) / 2);
+    }
+
+    g->setTextDatum(middle_center);
+    g->setTextColor(TFT_WHITE);
+    g->fillRoundRect(ox + 14, oy + h - 56, 150, 44, 8,
+                     M5.Display.color565(70, 70, 70));
+    g->drawString("close", ox + 89, oy + h - 34);
+    g->setTextDatum(top_left);
+
+    if (g_setCvOk) {
+        const uint16_t KEY = 0xF81F;
+        for (int i = 0; i < 14; i++) {
+            for (int j = 0; j < 14; j++) {
+                int dx = 14 - i, dy = 14 - j;
+                if (dx * dx + dy * dy <= 196) continue;
+                g_setCv.drawPixel(i, j, KEY);
+                g_setCv.drawPixel(w - 1 - i, j, KEY);
+                g_setCv.drawPixel(i, h - 1 - j, KEY);
+                g_setCv.drawPixel(w - 1 - i, h - 1 - j, KEY);
+            }
+        }
+        g_setCv.pushSprite(x, y, KEY);
+    }
+}
+
+// What a row does when tapped. Split from the drawing so the two cannot
+// disagree about which row is which - they share the enum and nothing else.
+static void setRowTap(int i) {
+    switch (i) {
+    case SET_THEME:
+        g_themeMode = (ThemeMode)((g_themeMode + 1) % 3);
+        Serial.printf("theme: %s\n",
+                      g_themeMode == THEME_AUTO ? "auto" :
+                      g_themeMode == THEME_DAY  ? "day" : "night");
+        break;
+
+    case SET_BRIGHT:
+        // auto -> low -> medium -> high -> auto. Cycling back to auto rather
+        // than stopping at the top matters: a manual level is a temporary
+        // correction for a condition the sun calculation cannot see, and the
+        // condition passes. Leaving no way back short of a reboot would turn
+        // every tunnel into a permanently wrong screen.
+        //
+        // Applied on the next pass by applyTheme(), which owns g_brightness
+        // and the screen-off guard. Setting the backlight here would bypass
+        // both and light a sleeping panel.
+        g_brightMode = (BrightMode)((g_brightMode + 1) % 4);
+        Serial.printf("bright: %s (%u)\n",
+                      g_brightMode == BRIGHTM_AUTO ? "auto" : "fixed",
+                      (unsigned)brightnessWanted());
+        break;
+
+    case SET_LABELS:
+        map_set_labels(!map_labels_on());
+        break;
+
+    case SET_MAG:
+        if (!maglog_available()) {
+            Serial.println("maglog: nothing to log to - no filesystem mounted");
+            break;
+        }
+        maglog_set_enabled(!maglog_enabled());
+        break;
+
+    case SET_CAL:
+        if (!compass_ok()) break;
+        // Tapping an already-calibrated compass refines it rather than
+        // throwing the accumulated sweep away - repeated tumbles converge
+        // instead of each one starting over. Delete /compasscal.bin to force
+        // a genuinely fresh start.
+        //
+        // The log is stopped for the duration either way: compass_update()
+        // publishes no sample while calibrating, so maglog_poll() would find
+        // nothing new and write nothing, but flushing here means the rows
+        // taken before the sweep are on the card before the device starts
+        // being waved about.
+        maglog_flush();
+        if (compass_calibrating()) compass_calibrate_cancel();
+        else                       compass_calibrate_start_refine();
+        break;
+
+    case SET_WIFILOC:
+        if (!wifiloc_available()) {
+            Serial.println("wifiloc: unavailable - no PSRAM table was "
+                           "allocated, see the boot log");
+            break;
+        }
+        // Toggling off keeps the database and stops both learning and
+        // locating. Worth having as a control rather than a rebuild: a scan
+        // interrupts the association, so somebody downloading tiles over a
+        // marginal link has a reason to stop this for a while.
+        wifiloc_set_enabled(!wifiloc_enabled());
+        break;
+
+    case SET_WIFISET:
+        // The portal paints over the whole screen, including this panel, so
+        // the panel is closed first rather than left believing it is still up.
+        setPanelClose();
+        Serial.println("wifi: opening setup portal from settings");
+        wifiSetPins();
+        portal_run(300000);
+        M5.Display.fillScreen(style_background());
+        map_invalidate();
+        g_btnShownValid = false;
+        break;
+
+    default:
+        break;
+    }
+}
+
+// True when the tap belonged to the panel, so handleTouch stops there.
+static bool setPanelTouch(int px, int py) {
+    if (!g_setPanel) return false;
+    int x, y, w, h; setPanelRect(&x, &y, &w, &h);
+
+    if (px < x || px >= x + w || py < y || py >= y + h) { setPanelClose(); return true; }
+
+    if (py > y + h - SP_FOOT_H) {
+        if (px < x + 170) setPanelClose();
+        return true;
+    }
+
+    int r = (py - (y + SP_HEAD_H)) / SP_ROW_H;
+    if (r >= 0 && r < SET_COUNT && py >= y + SP_HEAD_H) setRowTap(r);
+    return true;
+}
+
 // True when the tap belonged to the panel, so handleTouch stops there.
 static bool pinPanelTouch(int px, int py, const GnssFix &fix) {
     if (!g_pinPanel) return false;
@@ -1541,6 +1829,7 @@ static void handleTouch(const GnssFix &fix) {
 
     // The panel is over everything, so it gets first refusal on the tap -
     // otherwise a row landing on a footer button would trigger both.
+    if (setPanelTouch(t.x, t.y)) return;
     if (pinPanelTouch(t.x, t.y, fix)) return;
 
     // Pan by thirds: a tap on the map steps the view one third of a screen
@@ -1596,21 +1885,9 @@ static void handleTouch(const GnssFix &fix) {
         else            pinPanelOpen();
         break;
 
-    case BTN_POI:
-        map_set_labels(!map_labels_on());
-        break;
-
-    case BTN_WIFI:
-        if (!wifiloc_available()) {
-            Serial.println("wifiloc: unavailable - no PSRAM table was "
-                           "allocated, see the boot log");
-            break;
-        }
-        // Toggling off keeps the database and stops both learning and
-        // locating. Worth having as a control rather than a rebuild: a scan
-        // interrupts the association, so somebody downloading tiles over a
-        // marginal link has a reason to stop this for a while.
-        wifiloc_set_enabled(!wifiloc_enabled());
+    case BTN_SET:
+        if (g_setPanel) setPanelClose();
+        else            setPanelOpen();
         break;
 
     case BTN_HOME:
@@ -1618,60 +1895,6 @@ static void handleTouch(const GnssFix &fix) {
         // the control you reach for when you are not sure whether the map is
         // showing you or somewhere you left it.
         map_pan_reset();
-        break;
-
-    case BTN_MAG:
-        if (!maglog_available()) {
-            Serial.println("maglog: nothing to log to - no filesystem mounted");
-            break;
-        }
-        maglog_set_enabled(!maglog_enabled());
-        break;
-
-    case BTN_CAL:
-        if (!compass_ok()) break;
-        // Tapping an already-calibrated compass refines it rather than
-        // throwing the accumulated sweep away - repeated tumbles converge
-        // instead of each one starting over. Delete /compasscal.bin to force
-        // a genuinely fresh start.
-        //
-        // The log is stopped for the duration either way: compass_update()
-        // publishes no sample while calibrating, so maglog_poll() would find
-        // nothing new and write nothing, but flushing here means the rows
-        // taken before the sweep are on the card before the device starts
-        // being waved about.
-        maglog_flush();
-        if (compass_calibrating()) compass_calibrate_cancel();
-        else                       compass_calibrate_start_refine();
-        break;
-
-    case BTN_THEME:
-        g_themeMode = (ThemeMode)((g_themeMode + 1) % 3);
-        Serial.printf("theme: %s\n",
-                      g_themeMode == THEME_AUTO ? "auto" :
-                      g_themeMode == THEME_DAY  ? "day" : "night");
-        break;
-
-    case BTN_BRIGHT:
-        // auto -> low -> medium -> high -> auto. Cycling back to auto rather
-        // than stopping at the top matters: a manual level is a temporary
-        // correction for a condition the sun calculation cannot see, and the
-        // condition passes. Leaving no way back short of a reboot would turn
-        // every tunnel into a permanently wrong screen.
-        //
-        // The order runs upward from auto so that the first press from
-        // automatic is downward in light, which is the direction it is
-        // usually wanted: the complaint that prompts reaching for this button
-        // is far more often "too bright" than "too dim", because the
-        // too-bright case is painful and the too-dim case is merely
-        // inconvenient.
-        g_brightMode = (BrightMode)((g_brightMode + 1) % 4);
-        // Applied on the next pass by applyTheme(), which owns g_brightness
-        // and the screen-off guard. Setting the backlight here would bypass
-        // both and light a sleeping panel.
-        Serial.printf("bright: %s (%u)\n",
-                      g_brightMode == BRIGHTM_AUTO ? "auto" : "fixed",
-                      (unsigned)brightnessWanted());
         break;
 
     case BTN_CACHE:
@@ -4474,10 +4697,11 @@ void loop() {
         // running, since a device waiting on its first fix still has a bar
         // and buttons to show.
         if (g_bootActive)       map_pump();
-        else if (!g_pinPanel)   map_draw(view);
+        else if (!g_pinPanel && !g_setPanel) map_draw(view);
         drawStatus(view);
         drawFooter(view);
         drawPinPanel(view);
+        drawSetPanel();
     }
 
     // Loop cadence.
