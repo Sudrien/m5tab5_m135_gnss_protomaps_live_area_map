@@ -1930,6 +1930,9 @@ static void bootEnd() {
     // that far. A second fillScreen would wipe a map that is already up.
     if (!g_bootActive) return;
     g_bootActive = false;
+    // The overview goes back to standing in for tiles that are still
+    // rendering, now that there is no boot world for it to be worse than.
+    map_set_coarse_fill_pending(true);
     // The archive check's z0 buffer is a diagnostic, not the backdrop any
     // more, but it is still half a megabyte of PSRAM with nothing left to do.
     map_world_check_free();
@@ -3934,6 +3937,10 @@ void setup() {
     // No marker: see map_seed_position(). What is on screen is "here is where
     // you were", not "here is where you are".
     {
+        // No blurry placeholders while the boot world is up: the overview is
+        // a whole second of the same bus the four real tiles are queued on,
+        // and the thing it would be covering is already on screen.
+        map_set_coarse_fill_pending(false);
         double slat, slon;
         if (lastFixLoad(&slat, &slon)) map_seed_position(slat, slon);
     }

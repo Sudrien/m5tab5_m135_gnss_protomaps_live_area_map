@@ -180,7 +180,17 @@ void map_pump();
 // on the second: one slot filled from the overview satisfies
 // map_has_picture() and looks like a patch of map floating on an empty band.
 int  map_picture_slots();
+
+// True once no slot is still rendering - which is not the same as every slot
+// being drawable, since a slot outside the archive's coverage never becomes
+// drawable at all.
 bool map_picture_complete();
+
+// Whether the overview may stand in for a slot that is merely still
+// rendering. Gaps in the data are always filled regardless. Off during boot,
+// where the boot screen is already showing something better than a blurry
+// z12 and the overview render is competing with the tiles it stands in for.
+void map_set_coarse_fill_pending(bool on);
 
 bool map_has_anchor();
 bool map_has_picture();

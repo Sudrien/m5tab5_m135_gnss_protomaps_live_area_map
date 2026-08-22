@@ -1069,6 +1069,22 @@ static const int COARSE_FILLS_PER_PASS =
 #define COARSE_FILL_PENDING 1
 #endif
 
+// ...and a runtime one, for the boot screen.
+//
+// The two jobs above are both about a slot that has nothing to show. During
+// boot there is something to show - the compiled-in world - so the PENDING
+// half of the fill has nothing to buy and two things to spend: a second of
+// the same SD bus and rasteriser the real tiles are waiting on, and the
+// distinction the boot wait needs. A slot filled from the overview reports
+// TILE_COARSE, which is indistinguishable from a finished render, so the
+// handover cannot tell "the grid is populated" from "the grid is four blurry
+// copies of one z12 tile".
+//
+// setup() turns it on at bootEnd(). Everything after boot is unchanged.
+static volatile bool g_fill_pending = true;
+
+void map_set_coarse_fill_pending(bool on) { g_fill_pending = on; }
+
 static void coarse_fill_pending() {
     // Retry a failed overview on a timer.
     if (!g_coarse_ok && g_coarse_retry_at &&
@@ -1097,7 +1113,8 @@ static void coarse_fill_pending() {
             // is what turns driving out of cached territory into a white
             // screen rather than a coarse one.
             bool gap  = (st == TILE_NODATA || st == TILE_ERROR);
-            bool wants = gap || (COARSE_FILL_PENDING && st == TILE_PENDING);
+            bool wants = gap || (COARSE_FILL_PENDING && g_fill_pending
+                                 && st == TILE_PENDING);
             if (wants) {
                 if (gap) g_stats.coarse_gap++; else g_stats.coarse_wait++;
                 target = &g_grid.slots[i];
@@ -1157,9 +1174,18 @@ static void ensure_coarse(tile_id_t origin) {
     j.generation = 0;                        // never stale; not a grid slot
     g_coarse_want = want;
     g_coarse_retry_at = 0;
-    // Front of the queue: with the working level missing, this tile is the
-    // only thing standing between the user and a blank screen.
-    xQueueSendToFront(g_jobs, &j, 0);
+    // Front of the queue once there is a screen to protect: with the working
+    // level missing, this tile is the only thing between the user and a blank
+    // one, and a band step while driving turns over half the grid at once.
+    //
+    // Not at boot, though. There the overview is ahead of every tile it is
+    // covering for - it was measured at 1047 ms on a local archive, all of it
+    // spent before the first z14 render could start - and what it would be
+    // covering is the boot world, which is already on screen and did not cost
+    // a bus transaction. So the first one goes to the back and the real tiles
+    // go first.
+    if (map_has_picture()) xQueueSendToFront(g_jobs, &j, 0);
+    else                   xQueueSend(g_jobs, &j, 0);
 }
 
 // ---- setup -----------------------------------------------------------------
@@ -1782,7 +1808,19 @@ int map_picture_slots() {
     return n;
 }
 
-bool map_picture_complete() { return map_picture_slots() >= GRID_COUNT; }
+// "Settled" rather than "drawable": a slot the archive has no tile for ends
+// up EMPTY and will never become drawable, and waiting for it would stall the
+// handover at the edge of an extract until the deadline. What the boot wait
+// actually needs to know is that no slot is still being rendered.
+bool map_picture_complete() {
+    if (!g_centred) return false;
+    bool pending = false;
+    xSemaphoreTake(g_glock, portMAX_DELAY);
+    for (int i = 0; i < GRID_COUNT && !pending; i++)
+        pending = (g_grid.slots[i].state == TILE_PENDING);
+    xSemaphoreGive(g_glock);
+    return !pending;
+}
 
 bool map_has_picture() {
     if (!g_centred) return false;
