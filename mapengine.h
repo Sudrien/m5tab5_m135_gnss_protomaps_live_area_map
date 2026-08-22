@@ -176,6 +176,12 @@ void map_seed_position(double lat, double lon);
 // painted over before there is a map to replace it with.
 void map_pump();
 
+// Drawable slots, and whether every slot is drawable. The boot handover waits
+// on the second: one slot filled from the overview satisfies
+// map_has_picture() and looks like a patch of map floating on an empty band.
+int  map_picture_slots();
+bool map_picture_complete();
+
 bool map_has_anchor();
 bool map_has_picture();
 

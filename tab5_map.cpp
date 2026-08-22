@@ -3956,12 +3956,21 @@ void setup() {
     if (map_has_anchor()) {
         bootStep("drawing the last known area");
 
-        // The boot list has served its purpose; hand the screen over now so
-        // the map appears as it is rendered rather than after the wait.
-        bootEnd();
+        // The handover used to be here, before the wait, on the reasoning
+        // that the map should appear as it is rendered. What that actually
+        // produced: map_has_picture() goes true as soon as one slot is filled
+        // from the z12 overview - 222 ms in, on the log this was traced from -
+        // so the world was replaced by a single coarse patch on a background-
+        // filled band, which then sat there for several seconds while the
+        // real z14 tiles rendered. At night the background is near black, so
+        // it read as the map vanishing.
+        //
+        // So the wait comes first and the handover happens once the grid is
+        // actually populated. The world stays up for those few seconds, which
+        // is a better thing to be looking at than a splotch.
 
         uint32_t t0 = millis();
-        while (!map_has_picture() && millis() - t0 < 12000) {
+        while (!map_picture_complete() && millis() - t0 < 12000) {
             M5.update();
             GnssFix f; gnss_get(&f);
             // Deliberately not map_draw() here. blit_region() paints
@@ -3969,22 +3978,31 @@ void setup() {
             // calling it before the first tile lands wipes the map band to
             // flat colour and holds it there for the whole wait - the second
             // flash. There is nothing to show until map_has_picture() is
-            // true, so the world stays up until there is. map_pump() still
-            // runs the placeholder fill, which is what makes it true.
+            // complete, so the world stays up until it is. map_pump() still
+            // runs the placeholder fill, which is what fills the slots.
             map_pump();
             drawStatus(f);
             delay(50);
         }
-        // One pass after the picture lands, so the first frame is on the
-        // panel before the radio work below starts competing for the bus.
+        // Now hand over, and paint in the same pass: bootEnd() clears the map
+        // band to background and map_draw() fills it, with nothing rendered
+        // between the two.
+        //
+        // The deadline can expire with the grid part-filled, and that path
+        // gets the handover too - twelve seconds is long enough that a device
+        // still showing a world map would look stuck.
+        bootEnd();
         {
             GnssFix f; gnss_get(&f);
             map_draw(f);
             drawStatus(f);
+            drawFooter(f);
         }
-        Serial.printf("boot: first picture after %lu ms%s (uptime %lu ms)\n",
+        Serial.printf("boot: picture after %lu ms, %d of %d slots%s "
+                      "(uptime %lu ms)\n",
                       (unsigned long)(millis() - t0),
-                      map_has_picture() ? "" : " (gave up waiting)",
+                      map_picture_slots(), GRID_N * GRID_N,
+                      map_picture_complete() ? "" : " (gave up waiting)",
                       (unsigned long)millis());
     }
 
@@ -4437,18 +4455,19 @@ void loop() {
         // simpler than clipping around it, and costs nothing: the panel is a
         // deliberate, short-lived interaction, and pinPanelClose() forces the
         // repaint on the way out.
-        // `painted` gates this for the same reason the boot wait does not
-        // call map_draw(): with no tile committed yet, blit_region() has
-        // nothing to blit and fills the whole map band with background,
-        // replacing the boot world with flat colour for as long as that
-        // lasts. Once anything has landed the gate is open for good and this
-        // is the ordinary path again.
+        // The boot screen owns the panel until bootEnd() gives it up, and
+        // loop() can start before that on the paths where setup() is still
+        // working. Drawing here in the meantime would put blit_region()'s
+        // background fill over the boot world - the map band has gaps in
+        // every slot that has not rendered yet, and filling them is what
+        // turned the handover into a flash. map_pump() still advances the
+        // grid, which is what the boot wait is waiting on.
         //
-        // Not an early return, and not folded into the `painted` block above:
-        // drawStatus() and drawFooter() must keep running, since a device
-        // waiting on its first fix still has a bar and buttons to show.
-        if (!g_pinPanel && painted) map_draw(view);
-        else if (!painted)          map_pump();
+        // Not an early return: drawStatus() and drawFooter() must keep
+        // running, since a device waiting on its first fix still has a bar
+        // and buttons to show.
+        if (g_bootActive)       map_pump();
+        else if (!g_pinPanel)   map_draw(view);
         drawStatus(view);
         drawFooter(view);
         drawPinPanel(view);

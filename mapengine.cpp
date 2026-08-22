@@ -1763,6 +1763,27 @@ void map_world_check_free() {
     g_world_px = nullptr;
 }
 
+// How many of the grid's slots have something drawable in them, and whether
+// all of them do.
+//
+// map_has_picture() answers "is anything on screen", which is the right
+// question for "has the renderer come up at all" and the wrong one for
+// "should the boot screen hand over". One slot filled from the z12 overview
+// is a picture by that definition, and what it looks like is a small patch of
+// coarse map on an otherwise empty band - worse than the world it replaced,
+// and it sits there until the real tiles land.
+int map_picture_slots() {
+    if (!g_centred) return 0;
+    int n = 0;
+    xSemaphoreTake(g_glock, portMAX_DELAY);
+    for (int i = 0; i < GRID_COUNT; i++)
+        if (tile_drawable(g_grid.slots[i].state)) n++;
+    xSemaphoreGive(g_glock);
+    return n;
+}
+
+bool map_picture_complete() { return map_picture_slots() >= GRID_COUNT; }
+
 bool map_has_picture() {
     if (!g_centred) return false;
     bool any = false;
