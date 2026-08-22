@@ -123,7 +123,10 @@ static ApRec  *s_tab = nullptr;
 static uint32_t s_count = 0;
 static uint32_t s_dirty = 0;
 static bool     s_available = false;
-static bool     s_enabled = true;
+// Off at boot, for the same reason maglog is: scanning and recording access
+// points is something to opt into per trip, not a default that runs whenever
+// the board is powered. The footer button turns it on.
+static bool     s_enabled = false;
 
 // Estimate state.
 static double   s_est_lat = 0, s_est_lon = 0;

@@ -40,7 +40,10 @@ static const uint32_t MAGLOG_FLUSH_MS = 30000;
 static const uint32_t MAGLOG_MAX_BYTES = 16u * 1024u * 1024u;
 
 static bool     s_available = false;
-static bool     s_enabled   = true;
+// Off at boot. Logging writes to the card continuously and quietly, and a
+// logger that starts itself is one nobody remembers turning on - the footer
+// button turns it on when it is wanted, for the trip it is wanted for.
+static bool     s_enabled   = false;
 static bool     s_full      = false;
 static uint32_t s_rows      = 0;
 static uint32_t s_bytes     = 0;

@@ -549,6 +549,10 @@ static volatile bool g_paused    = false;
 // Rendered into its own buffer rather than the overview's, because the
 // overview is requested moments later for a completely different tile and one
 // would overwrite the other. Freed as soon as the boot screen is done with it.
+//
+// WORLD_PX rather than COARSE_PX: this one is not a placeholder, it is the
+// boot backdrop, and it is on screen at panel resolution for the whole of
+// startup.
 static uint16_t *g_world_px = nullptr;
 static volatile tile_state_t g_world_state = TILE_PENDING;
 
@@ -810,7 +814,7 @@ static void worker_task(void *arg) {
             // the reader, and place names at z0 are a dozen continents.
             w_label_dst = nullptr;
             tile_state_t res = g_world_px
-                ? render_tile(job.id, g_world_px, COARSE_PX, 0)
+                ? render_tile(job.id, g_world_px, WORLD_PX, 0)
                 : TILE_ERROR;
             g_world_state = res;
             Serial.printf("map: world tile z0 %s in %lu ms\n",
@@ -1718,7 +1722,7 @@ bool map_place_text(char *out, size_t cap) {
 // ---- world check, public side ----------------------------------------------
 void map_world_check_start() {
     if (g_world_px) return;                    // already running or done
-    g_world_px = (uint16_t *)ps_malloc((size_t)COARSE_PX * COARSE_PX * 2);
+    g_world_px = (uint16_t *)ps_malloc((size_t)WORLD_PX * WORLD_PX * 2);
     if (!g_world_px) {
         Serial.println("map: no PSRAM for the world check - skipping it");
         g_world_state = TILE_ERROR;
@@ -1740,19 +1744,58 @@ tile_state_t map_world_check_state() { return g_world_state; }
 bool map_world_check_draw(int cx, int cy, int size) {
     if (g_headless || !g_world_px) return false;
     if (g_world_state != TILE_READY) return false;
-    if (size > COARSE_PX) size = COARSE_PX;
+    if (size > WORLD_PX) size = WORLD_PX;
 
     // Nearest-neighbour down to whatever the caller asked for. This is on
     // screen for a couple of seconds during boot; a resampling pass over it
     // would cost more than it could possibly buy.
-    const uint32_t step = ((uint32_t)COARSE_PX << 16) / (uint32_t)size;
-    static uint16_t row[COARSE_PX];
+    const uint32_t step = ((uint32_t)WORLD_PX << 16) / (uint32_t)size;
+    static uint16_t row[WORLD_PX];
     for (int y = 0; y < size; y++) {
         const uint16_t *src = g_world_px
-                            + (size_t)((y * step) >> 16) * COARSE_PX;
+                            + (size_t)((y * step) >> 16) * WORLD_PX;
         uint32_t sx = 0;
         for (int x = 0; x < size; x++, sx += step) row[x] = src[sx >> 16];
         M5.Display.pushImage(cx - size / 2, cy - size / 2 + y, size, 1, row);
+    }
+    return true;
+}
+
+// The same buffer as a full-screen backdrop: scaled to cover (dst_w, dst_h)
+// and centre-cropped, rather than letterboxed. At WORLD_PX 1280 on a 1280x720
+// panel the scale works out to exactly 1:1 and this is a straight copy of the
+// middle 720 rows - the poles, which are stretched to nothing by Mercator and
+// carry no coastline anyone recognises, are what falls off.
+bool map_world_check_draw_fit(int dst_w, int dst_h) {
+    if (g_headless || !g_world_px) return false;
+    if (g_world_state != TILE_READY) return false;
+    if (dst_w <= 0 || dst_h <= 0) return false;
+    if (dst_w > WORLD_PX) dst_w = WORLD_PX;
+
+    // Cover: one source pixel per destination pixel along the longer edge,
+    // which is the axis that has to reach the screen edge.
+    const int longest = dst_w > dst_h ? dst_w : dst_h;
+    const uint32_t step = ((uint32_t)WORLD_PX << 16) / (uint32_t)longest;
+
+    // Centre the crop in source space.
+    const int32_t sx0 = ((int32_t)(WORLD_PX << 16) - (int32_t)(dst_w * step)) / 2;
+    const int32_t sy0 = ((int32_t)(WORLD_PX << 16) - (int32_t)(dst_h * step)) / 2;
+
+    static uint16_t row[WORLD_PX];
+    for (int y = 0; y < dst_h; y++) {
+        int32_t syf = sy0 + (int32_t)(y * step);
+        int sy = syf >> 16;
+        if (sy < 0) sy = 0;
+        if (sy >= WORLD_PX) sy = WORLD_PX - 1;
+        const uint16_t *src = g_world_px + (size_t)sy * WORLD_PX;
+        int32_t sxf = sx0;
+        for (int x = 0; x < dst_w; x++, sxf += (int32_t)step) {
+            int sx = sxf >> 16;
+            if (sx < 0) sx = 0;
+            if (sx >= WORLD_PX) sx = WORLD_PX - 1;
+            row[x] = src[sx];
+        }
+        M5.Display.pushImage(0, y, dst_w, 1, row);
     }
     return true;
 }

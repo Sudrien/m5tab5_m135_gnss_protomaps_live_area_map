@@ -1727,21 +1727,142 @@ static void handlePowerButton() {
 // Startup takes several seconds - SD mount, wifi association, SNTP, archive
 // open - and a blank panel through all of it gives no indication whether the
 // device is working or hung. Each step reports as it happens.
-static int  g_bootLine = 0;
-static bool g_bootActive = true;
+//
+// It reports onto the same furniture the saved-points panel uses: a dark
+// rounded card with a titled header and one row per entry, centred on the
+// screen. Two reasons beyond looks. The first is that the boot screen is the
+// first thing anyone sees, and a panel that matches the one they will meet
+// again the first time they press "pin" makes the two read as one device
+// rather than two programs sharing a board. The second is that a card with a
+// border has an edge, and an edge is what lets the world map sit behind it
+// without the text becoming unreadable.
+//
+// Behind the card is the z0 tile - the whole earth, WORLD_PX square, pushed
+// as a full-screen backdrop. It is not available at bootBegin() time (the
+// card has not been mounted yet, let alone the archive opened), so the screen
+// starts on a flat ocean-blue field and switches to the real thing the moment
+// the archive check answers. That switch is why every line has to be
+// remembered rather than merely drawn: repainting the backdrop wipes the list
+// with it.
+#define BOOT_LINES_MAX 18
 
-static void bootBegin() {
-    if (!g_panelOk) return;   // no display attached
-    M5.Display.fillScreen(TFT_BLACK);
+struct BootLine {
+    char    msg[72];
+    uint8_t state;              // 0 ok, 1 fail, 2 pending
+};
+
+static BootLine g_bootLines[BOOT_LINES_MAX];
+static int      g_bootLine = 0;      // committed lines
+static bool     g_bootActive = true;
+static bool     g_bootPend = false;  // a pending line sits after the committed ones
+static BootLine g_bootPendLine;
+static bool     g_bootWorld = false; // backdrop is the z0 tile rather than the field
+
+// Panel geometry, in the same spirit as PP_* for the saved-points panel: a
+// header deep enough for a title and a subtitle, then fixed-height rows.
+#define BP_MARGIN_X 60
+#define BP_MARGIN_Y 44
+#define BP_HEAD_H   104
+#define BP_ROW_H    32
+
+static void bootPanelRect(int *x, int *y, int *w, int *h) {
+    int W = M5.Display.width(), H = M5.Display.height();
+    *x = BP_MARGIN_X;
+    *y = BP_MARGIN_Y;
+    *w = W - BP_MARGIN_X * 2;
+    *h = H - BP_MARGIN_Y * 2;
+}
+
+// How many rows fit. Anything past this is still logged over serial - the
+// screen is the convenience, the trace is the record.
+static int bootRows() {
+    int x, y, w, h; bootPanelRect(&x, &y, &w, &h);
+    int r = (h - BP_HEAD_H - 12) / BP_ROW_H;
+    if (r < 1) r = 1;
+    if (r > BOOT_LINES_MAX) r = BOOT_LINES_MAX;
+    return r;
+}
+
+// The backdrop, whichever one we have. Deliberately not style_background():
+// the palette is chosen from the remembered position part-way through boot,
+// and a boot screen that changes colour underneath its own message list looks
+// like a fault.
+static void bootBackdrop() {
+    if (g_bootWorld && map_world_check_draw_fit(M5.Display.width(),
+                                                M5.Display.height()))
+        return;
+    // Deep ocean blue - the same thing the world tile is mostly made of, so
+    // the swap when the archive check lands is a change of detail rather than
+    // a change of scene.
+    M5.Display.fillScreen(M5.Display.color565(14, 26, 46));
+}
+
+// One row, drawn in place. The panel body is opaque, so a row can be redrawn
+// on its own without touching the backdrop behind it.
+static void bootDrawRow(int idx, const BootLine &bl) {
+    int x, y, w, h; bootPanelRect(&x, &y, &w, &h);
+    int ry = y + BP_HEAD_H + idx * BP_ROW_H;
+    if (ry + BP_ROW_H > y + h - 8) return;
+
+    // Clear the row to the panel body colour first: a pending line is
+    // overwritten in place by its result, and the result is often shorter
+    // than the message it replaces ("connecting to wifi" -> "wifi
+    // 192.168.5.62"). Without clearing, the tail of the longer text stays
+    // underneath the new one.
+    M5.Display.fillRect(x + 14, ry, w - 28, BP_ROW_H, M5.Display.color565(20, 20, 26));
+
+    M5.Display.setTextDatum(middle_left);
+    M5.Display.setTextSize(2);
+    M5.Display.setTextColor(bl.state == 2 ? TFT_YELLOW
+                          : bl.state == 1 ? TFT_RED : TFT_GREEN);
+    M5.Display.drawString(bl.state == 2 ? "..." : bl.state == 1 ? "fail" : " ok ",
+                          x + 26, ry + BP_ROW_H / 2);
+    M5.Display.setTextColor(TFT_WHITE);
+    M5.Display.drawString(bl.msg, x + 96, ry + BP_ROW_H / 2);
+}
+
+// Everything, from the backdrop up. Called on bootBegin() and again whenever
+// the backdrop changes underneath the list.
+static void bootPaintAll() {
+    if (!g_panelOk) return;
+    int x, y, w, h; bootPanelRect(&x, &y, &w, &h);
+
+    bootBackdrop();
+
+    M5.Display.fillRoundRect(x, y, w, h, 14, M5.Display.color565(20, 20, 26));
+    M5.Display.drawRoundRect(x, y, w, h, 14, TFT_WHITE);
+
     M5.Display.setTextDatum(top_left);
     M5.Display.setTextColor(TFT_WHITE);
     M5.Display.setTextSize(3);
-    M5.Display.drawString("Tab5 Map", 40, 36);
+    M5.Display.drawString("Tab5 Map", x + 22, y + 20);
     M5.Display.setTextSize(2);
     M5.Display.setTextColor(TFT_DARKGREY);
-    M5.Display.drawString("starting up", 40, 76);
+    M5.Display.drawString("starting up", x + 22, y + 60);
+
+    const int rows = bootRows();
+    for (int i = 0; i < g_bootLine && i < rows; i++)
+        bootDrawRow(i, g_bootLines[i]);
+    if (g_bootPend && g_bootLine < rows)
+        bootDrawRow(g_bootLine, g_bootPendLine);
+}
+
+static void bootBegin() {
+    if (!g_panelOk) return;   // no display attached
     g_bootLine = 0;
+    g_bootPend = false;
     g_bootActive = true;
+    bootPaintAll();
+}
+
+// Promote the backdrop to the rendered z0 tile. Called once, from the archive
+// check, and it repaints the whole screen because the list has to come back
+// on top of the new picture.
+static void bootWorldBackdrop() {
+    if (!g_panelOk || !g_bootActive || g_bootWorld) return;
+    if (map_world_check_state() != TILE_READY) return;
+    g_bootWorld = true;
+    bootPaintAll();
 }
 
 static void bootStepEx(const char *msg, bool ok, bool pending) {
@@ -1752,19 +1873,23 @@ static void bootStepEx(const char *msg, bool ok, bool pending) {
     Serial.printf("boot: %-6s %s\n", pending ? "..." : (ok ? "ok" : "FAIL"), msg);
 
     if (!g_bootActive || !g_panelOk) { if (!pending) g_bootLine++; return; }
-    int y = 130 + g_bootLine * 30;
-    if (y > M5.Display.height() - 40) return;
-    // A pending line is overwritten in place by its result, and the result is
-    // often shorter than the message it replaces ("connecting to wifi" ->
-    // "wifi 192.168.5.62"). Without clearing the row first, the tail of the
-    // longer text stays on screen underneath the new one.
-    M5.Display.fillRect(0, y - 2, M5.Display.width(), 28, TFT_BLACK);
-    M5.Display.setTextSize(2);
-    M5.Display.setTextColor(pending ? TFT_YELLOW : (ok ? TFT_GREEN : TFT_RED));
-    M5.Display.drawString(pending ? "..." : (ok ? " ok " : "fail"), 40, y);
-    M5.Display.setTextColor(TFT_WHITE);
-    M5.Display.drawString(msg, 110, y);
-    if (!pending) g_bootLine++;
+
+    BootLine bl;
+    snprintf(bl.msg, sizeof bl.msg, "%s", msg);
+    bl.state = pending ? 2 : (ok ? 0 : 1);
+
+    const int rows = bootRows();
+    if (pending) {
+        g_bootPendLine = bl;
+        g_bootPend = true;
+        if (g_bootLine < rows) bootDrawRow(g_bootLine, bl);
+        return;
+    }
+
+    g_bootPend = false;
+    if (g_bootLine < BOOT_LINES_MAX) g_bootLines[g_bootLine] = bl;
+    if (g_bootLine < rows) bootDrawRow(g_bootLine, bl);
+    g_bootLine++;
 }
 
 // No default arguments: the Arduino preprocessor copies them into the
@@ -1781,9 +1906,10 @@ static void bootEnd() {
     // that far. A second fillScreen would wipe a map that is already up.
     if (!g_bootActive) return;
     g_bootActive = false;
-    // The world check is the last thing on the boot screen and the boot
-    // screen is about to be painted over, so its half-megabyte goes back to
-    // the heap here rather than being held for the run.
+    g_bootWorld = false;
+    // The world tile is the boot backdrop and the boot screen is about to be
+    // painted over, so its megabytes go back to the heap here rather than
+    // being held for the run.
     map_world_check_free();
     M5.Display.fillScreen(style_background());
 }
@@ -3718,13 +3844,10 @@ void setup() {
             snprintf(m, sizeof m, "archive readable (world in %lu ms)",
                      (unsigned long)(millis() - t0));
             bootStep(m);
-            // Centred on the boot screen, above the list, at a size that
-            // reads as a globe rather than a thumbnail.
-            if (g_panelOk) {
-                int side = M5.Display.height() / 3;
-                map_world_check_draw(M5.Display.width() / 2,
-                                     M5.Display.height() / 3, side);
-            }
+            // Behind the boot panel, full screen, rather than as a thumbnail
+            // above the list: the tile is rendered at panel width for exactly
+            // this. Repaints the list on top of it.
+            bootWorldBackdrop();
         } else if (w == TILE_NODATA) {
             bootStepFail("archive has no z0 tile - is it complete?");
         } else if (w == TILE_PENDING) {
