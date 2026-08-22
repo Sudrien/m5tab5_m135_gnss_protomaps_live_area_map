@@ -66,6 +66,7 @@ float compass_field_ut()            { return 0.0f; }
 float compass_roll()                { return 0.0f; }
 float compass_pitch()               { return 0.0f; }
 uint32_t compass_last_motion_ms()   { return 0; }
+uint32_t compass_last_stir_ms()     { return 0; }
 float compass_motion_peak_take()    { return 0.0f; }
 void  compass_set_position(double, double) { }
 void  compass_calibrate_start()        { }
@@ -145,6 +146,19 @@ static uint8_t  s_motion_run  = 0;
 // resting on, and whether an engine is running nearby, none of which is
 // knowable from here.
 static float    s_motion_peak = 0.0f;
+
+// Last time the device was disturbed at all, at a much lower bar than
+// MOTION_COUNTS. Handling is a decision; this is corroboration - the question
+// it answers is not "is someone using this" but "is this device somewhere
+// that things happen", and a vehicle, a bicycle and a pocket all clear it
+// continuously while a desk does not clear it at all.
+static uint32_t s_stir_ms     = 0;
+
+// Measured desk peaks over 30 s windows run 188-255 counts, so this sits just
+// clear of the quietest surface the device is likely to sit on. It is not
+// trying to be sensitive - a mount that vibrates less than a desk does not
+// exist in a moving vehicle.
+static const float STIR_COUNTS = 500.0f;
 
 // About 0.09 g, measured rather than guessed. On a Tab5 on a desk the peak
 // departure over a 30 s window sits at 206-255 counts; a device picked up and
@@ -1107,6 +1121,14 @@ void compass_update() {
         float dev = sqrtf(dx * dx + dy * dy + dz * dz);
         if (dev > s_motion_peak) s_motion_peak = dev;
 
+        if (dev > STIR_COUNTS) {
+            // No run required, unlike handling. A single sample is enough
+            // because this only ever extends the life of a signal that
+            // something else has to raise first.
+            s_stir_ms = millis();
+            if (!s_stir_ms) s_stir_ms = 1;
+        }
+
         if (dev > MOTION_COUNTS) {
             if (s_motion_run < MOTION_RUN_NEEDED) s_motion_run++;
             if (s_motion_run >= MOTION_RUN_NEEDED) {
@@ -1225,6 +1247,7 @@ float compass_roll()     { return s_roll; }
 float compass_pitch()    { return s_pitch; }
 float compass_field_ut() { return s_field; }
 uint32_t compass_last_motion_ms() { return s_motion_ms; }
+uint32_t compass_last_stir_ms()   { return s_stir_ms; }
 
 float compass_motion_peak_take() {
     float v = s_motion_peak;

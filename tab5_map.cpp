@@ -461,6 +461,12 @@ static const uint32_t IDLE_UNDIM_HOLD_MS = 15000;
 // test did. 30 s is long enough that a slow walk clears the distance before
 // the window rolls.
 static const double   IDLE_UNDIM_MOVE_M    = 25.0;
+
+// How stale a stir may be and still corroborate a distance. Generous: the
+// point is to reject a device that has been provably undisturbed for minutes,
+// not to require vibration in the same instant as the fix. A vehicle clears
+// this continuously; a desk never does.
+static const uint32_t IDLE_UNDIM_STIR_MS   = 60000;
 static const uint32_t IDLE_UNDIM_ANCHOR_MS = 30000;
 static const int      IDLE_DIM_PCT   = 40;
 static const uint8_t  IDLE_DIM_FLOOR = 30;
@@ -683,11 +689,27 @@ static bool idleDimmed(const GnssFix &fix) {
         anchorMs = millis(); anchored = true;
     } else if (wp_distance_m(fix.lat, fix.lon, anchorLat, anchorLon)
                >= IDLE_UNDIM_MOVE_M) {
-        // Genuinely somewhere else. Re-anchor here so a continuing journey
-        // keeps clearing the test rather than measuring from the start of it.
+        // Somewhere else, according to the receiver. Re-anchor either way, so
+        // a continuing journey keeps clearing the test rather than measuring
+        // from the start of it - and so a receiver that has wandered does not
+        // stay 25 m from a stale anchor and undim forever.
         anchorLat = fix.lat; anchorLon = fix.lon;
         anchorMs = millis();
-        return false;
+
+        // Corroborate before believing it. Indoors the position itself
+        // wanders tens of metres on a good HDOP - two undims in one logged
+        // session, with the accelerometer reading under 200 counts throughout
+        // - and nothing on the GNSS side tells that apart from slow travel.
+        // A device that has genuinely gone 25 m has been carried, driven or
+        // ridden there, none of which is silent on an accelerometer, so
+        // silence is grounds to disbelieve the distance.
+        //
+        // Only a veto: a stir on its own means nothing, and this cannot
+        // undim anything by itself.
+        uint32_t stir = compass_last_stir_ms();
+        bool corroborated = !compass_ok() ||
+                            (stir && millis() - stir < IDLE_UNDIM_STIR_MS);
+        if (corroborated) return false;
     } else if (millis() - anchorMs >= IDLE_UNDIM_ANCHOR_MS) {
         // Rolling window. Without this the anchor ages indefinitely and slow
         // drift eventually crosses the threshold from standing still.
@@ -4201,13 +4223,22 @@ void loop() {
                 else snprintf(moved, sizeof moved, "%.0fs ago",
                               (millis() - movedMs) / 1000.0);
 
+                // Whether a claimed distance would currently be believed.
+                // Without this the veto is invisible: a rejected undim looks
+                // identical to one that was never proposed.
+                uint32_t stirMs = compass_last_stir_ms();
+                char stir[24];
+                if (!stirMs) snprintf(stir, sizeof stir, "none");
+                else snprintf(stir, sizeof stir, "%.0fs ago",
+                              (millis() - stirMs) / 1000.0);
+
                 Serial.printf("compass: %s, %.0f deg %s  "
-                              "moved %s peak %.0f  "
+                              "moved %s peak %.0f stir %s  "
                               "log %s %lu rows %u KB  gnss %u ms  "
                               "wifi %lu APs\n",
                               compass_status(),
                               h < 0 ? 0.0f : h, compass_label(h),
-                              moved, compass_motion_peak_take(),
+                              moved, compass_motion_peak_take(), stir,
                               !maglog_available() ? "unavailable"
                                                   : maglog_enabled() ? "on" : "off",
                               (unsigned long)maglog_rows(),

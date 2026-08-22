@@ -146,6 +146,17 @@ uint32_t compass_last_motion_ms();
 // 16384 counts per g at the configured 2 g range, if a conversion is wanted.
 float compass_motion_peak_take();
 
+// millis() when the device was last disturbed at all, at a far lower bar than
+// compass_last_motion_ms() uses, or 0 for never. Not a substitute for it: a
+// stir is not enough to conclude anyone is present, only enough to conclude
+// the device is not sitting undisturbed on a hard surface.
+//
+// The use is corroboration. A receiver indoors wanders its *position*, not
+// just its speed, by tens of metres with a perfectly good HDOP, and no
+// threshold on the GNSS side separates that from slow travel. Real travel is
+// never silent here, so silence here is grounds to disbelieve it.
+uint32_t compass_last_stir_ms();
+
 void compass_calibrate_start();
 
 // Restart calibration keeping the accumulated fit, so a second sweep improves
