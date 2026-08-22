@@ -2434,6 +2434,23 @@ static inline uint32_t draw_cpu_us() {
 static inline uint32_t draw_cpu_us() { return 0; }
 #endif
 
+// The state-advancing half of map_draw(), without the drawing.
+//
+// coarse_fill_pending() is what promotes a pending or unavailable slot to
+// TILE_COARSE, which is what makes map_has_picture() true in the first place,
+// so it cannot simply be skipped while waiting for the first picture. But
+// map_draw() itself must be skipped there: blit_region() paints background
+// into every slot with nothing in it, so calling it before anything has
+// landed replaces the boot backdrop with flat colour for the whole wait.
+//
+// Hence the split. Callers with nothing on screen yet pump; everyone else
+// draws, and map_draw() pumps on their behalf exactly as before.
+void map_pump() {
+    if (g_headless) return;
+    if (!g_visible || !g_view_set) return;
+    coarse_fill_pending();
+}
+
 void map_draw(const GnssFix &fix) {
     if (g_headless) return;
     if (!g_visible || !g_view_set) return;

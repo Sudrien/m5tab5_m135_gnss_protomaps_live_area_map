@@ -57,13 +57,31 @@ int row_spans(const uint16_t *xy, const uint16_t *ring, int rings,
 
 }  // namespace
 
+static void worldmap_draw_impl(int x0, int y0, int w, int h,
+                               int ytop, int ybot, bool dark);
+
 uint16_t worldmap_sea(bool dark) {
     const Palette &p = dark ? PAL_NIGHT : PAL_DAY;
     return M5.Display.color565(p.sea[0], p.sea[1], p.sea[2]);
 }
 
 void worldmap_draw(int x0, int y0, int w, int h, bool dark) {
+    worldmap_draw_impl(x0, y0, w, h, 0, h, dark);
+}
+
+void worldmap_draw_clipped(int w, int h, int ytop, int ybot, bool dark) {
+    worldmap_draw_impl(0, 0, w, h, ytop, ybot, dark);
+}
+
+// `ytop`/`ybot` are rows of the rectangle, not of the world: the geometry is
+// computed for the whole of (w, h) and the loop simply skips what is outside
+// them.
+static void worldmap_draw_impl(int x0, int y0, int w, int h,
+                               int ytop, int ybot, bool dark) {
     if (w <= 0 || h <= 0) return;
+    if (ytop < 0) ytop = 0;
+    if (ybot > h) ybot = h;
+    if (ytop >= ybot) return;
 
     const Palette &p = dark ? PAL_NIGHT : PAL_DAY;
     const uint16_t sea  = M5.Display.color565(p.sea[0],  p.sea[1],  p.sea[2]);
@@ -83,7 +101,7 @@ void worldmap_draw(int x0, int y0, int w, int h, bool dark) {
 
     uint16_t xs[MAX_X];
 
-    for (int y = 0; y < h; y++) {
+    for (int y = ytop; y < ybot; y++) {
         for (int i = 0; i < rw; i++) row[i] = sea;
 
         // Screen row -> world row. Rows off the top or bottom of the world

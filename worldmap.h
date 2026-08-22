@@ -35,6 +35,16 @@
 // PSRAM is full.
 void worldmap_draw(int x0, int y0, int w, int h, bool dark);
 
+// The same picture, positioned for a full w x h panel, but with only the rows
+// between `ytop` and `ybot` actually written.
+//
+// This is for drawing around the status bar and the footer. Insetting the
+// rectangle instead would rescale and recentre the world into the gap between
+// them, so the coastlines would move the moment the bars appeared; clipping
+// keeps the geometry fixed to the panel and simply leaves those rows alone for
+// whoever owns them.
+void worldmap_draw_clipped(int w, int h, int ytop, int ybot, bool dark);
+
 // The sea colour of the palette above, for callers that need to match it -
 // clearing a strip, or filling the part of a panel the map has not reached.
 uint16_t worldmap_sea(bool dark);

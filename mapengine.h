@@ -170,6 +170,12 @@ void map_seed_position(double lat, double lon);
 // Whether the grid has an anchor at all, and whether anything drawable has
 // landed in it yet. setup() orders the slow parts of bring-up behind the
 // second of these; see the comments there.
+// Advance the grid without painting: the placeholder fill that turns pending
+// slots into drawable ones, and nothing else. For callers that are showing
+// something other than the map (the boot backdrop) and must not have it
+// painted over before there is a map to replace it with.
+void map_pump();
+
 bool map_has_anchor();
 bool map_has_picture();
 

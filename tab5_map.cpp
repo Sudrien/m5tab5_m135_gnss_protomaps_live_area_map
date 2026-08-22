@@ -809,6 +809,7 @@ static bool g_panelOk = false;
 static bool g_setupOk = false;
 
 static const int UI_STATUS_H = 52;          // must match STATUS_H in mapengine
+static const int UI_FOOTER_H = 82;          // must match FOOTER_H in mapengine
 
 static M5Canvas g_statusCv(&M5.Display);
 static M5Canvas g_btnCv(&M5.Display);
@@ -1748,6 +1749,17 @@ static void handlePowerButton() {
 //
 // Lines are still remembered rather than merely drawn, because bootEnd() and
 // the storage wait both repaint the whole screen underneath the list.
+//
+// Two bands are left out of the backdrop and filled flat: the top UI_STATUS_H
+// rows and the bottom UI_FOOTER_H, which is exactly where the status bar and
+// the button row land once the map takes over. They are drawn from the first
+// paint, in the colours those two will use, so their arrival is a band gaining
+// text rather than a black strip being stamped over a picture - and the
+// footer's gaps between buttons show background rather than the coastline the
+// buttons happen to be sitting on.
+//
+// The world is clipped to the gap between them rather than squeezed into it,
+// so nothing moves when they fill in.
 #define BOOT_LINES_MAX 18
 
 struct BootLine {
@@ -1764,16 +1776,19 @@ static BootLine g_bootPendLine;
 // Panel geometry, in the same spirit as PP_* for the saved-points panel: a
 // header deep enough for a title and a subtitle, then fixed-height rows.
 #define BP_MARGIN_X 60
-#define BP_MARGIN_Y 44
+#define BP_MARGIN_Y 26
 #define BP_HEAD_H   104
 #define BP_ROW_H    32
 
+// Inset into the map band, not the panel: the card must not overlap the two
+// reserved strips, or the status bar would clip its top edge the moment it
+// appeared.
 static void bootPanelRect(int *x, int *y, int *w, int *h) {
     int W = M5.Display.width(), H = M5.Display.height();
     *x = BP_MARGIN_X;
-    *y = BP_MARGIN_Y;
+    *y = UI_STATUS_H + BP_MARGIN_Y;
     *w = W - BP_MARGIN_X * 2;
-    *h = H - BP_MARGIN_Y * 2;
+    *h = H - UI_STATUS_H - UI_FOOTER_H - BP_MARGIN_Y * 2;
 }
 
 // How many rows fit. Anything past this is still logged over serial - the
@@ -1786,13 +1801,34 @@ static int bootRows() {
     return r;
 }
 
-// The backdrop. map_is_dark() rather than a fixed palette so a night boot
-// does not throw a bright screen at a dark room; it is set by themeBoot()
-// from the remembered position, which happens late, so most of boot draws in
-// day colours and the last repaint may switch. That is a change of shade on a
-// picture that stays put, not a change of scene.
+// The palette the boot screen was first painted in, and it does not change
+// afterwards.
+//
+// It used to ask map_is_dark() on every repaint, which meant themeBoot() -
+// which runs late, because it needs a position off the card - flipped the
+// backdrop underneath a screen that was already up. Land and sea swapping
+// shade in one frame reads as the display inverting, not as a theme setting,
+// and it was on screen for a second before the map took over anyway.
+//
+// So the boot screen keeps whatever it started with and the theme applies to
+// the map. themeBoot() still drops the backlight for a night start, which is
+// the part that actually matters in a dark car.
+static bool g_bootDark = false;
+
+// The two reserved bands, in the colours their real occupants use, so nothing
+// has to be blacked out later. The status bar's own no-fix background and the
+// map background respectively - which is what the footer paints in the gaps
+// between its buttons.
+static void bootBands() {
+    const int W = M5.Display.width(), H = M5.Display.height();
+    M5.Display.fillRect(0, 0, W, UI_STATUS_H, 0x6000);
+    M5.Display.fillRect(0, H - UI_FOOTER_H, W, UI_FOOTER_H, style_background());
+}
+
 static void bootBackdrop() {
-    worldmap_draw(0, 0, M5.Display.width(), M5.Display.height(), map_is_dark());
+    const int W = M5.Display.width(), H = M5.Display.height();
+    worldmap_draw_clipped(W, H, UI_STATUS_H, H - UI_FOOTER_H, g_bootDark);
+    bootBands();
 }
 
 // One row, drawn in place. The panel body is opaque, so a row can be redrawn
@@ -1906,8 +1942,15 @@ static void bootEnd() {
     //
     // Leaving the world up instead costs one repaint and gives the wait
     // something to be. The map paints over it tile by tile as they arrive.
-    if (map_has_picture()) M5.Display.fillScreen(style_background());
-    else                   bootBackdrop();
+    // Only the map band is handed over. The two bands are already the right
+    // colour and drawStatus()/drawFooter() are about to draw into them, so
+    // repainting them here would be the black stamp this is avoiding.
+    if (map_has_picture())
+        M5.Display.fillRect(0, UI_STATUS_H, M5.Display.width(),
+                            M5.Display.height() - UI_STATUS_H - UI_FOOTER_H,
+                            style_background());
+    else
+        bootBackdrop();
 }
 
 // Mount the card, trying the fast bus first and falling back.
@@ -3660,7 +3703,15 @@ void setup() {
         // probing and serial chatter between here and bootBegin(), and a black
         // panel for any part of boot is exactly what this change is about.
         // Costs one pass of the scanline fill, which needs nothing but flash.
-        worldmap_draw(0, 0, M5.Display.width(), M5.Display.height(), false);
+        //
+        // Banded like every later repaint, so this first paint is already in
+        // the layout the map will hand back to.
+        worldmap_draw_clipped(M5.Display.width(), M5.Display.height(),
+                              UI_STATUS_H, M5.Display.height() - UI_FOOTER_H,
+                              false);
+        M5.Display.fillRect(0, 0, M5.Display.width(), UI_STATUS_H, 0x6000);
+        M5.Display.fillRect(0, M5.Display.height() - UI_FOOTER_H,
+                            M5.Display.width(), UI_FOOTER_H, style_background());
     }
 
     M5.Power.setExtOutput(true);               // powers the M135
@@ -3913,7 +3964,14 @@ void setup() {
         while (!map_has_picture() && millis() - t0 < 12000) {
             M5.update();
             GnssFix f; gnss_get(&f);
-            map_draw(f);
+            // Deliberately not map_draw() here. blit_region() paints
+            // background into every slot that has nothing in it yet, so
+            // calling it before the first tile lands wipes the map band to
+            // flat colour and holds it there for the whole wait - the second
+            // flash. There is nothing to show until map_has_picture() is
+            // true, so the world stays up until there is. map_pump() still
+            // runs the placeholder fill, which is what makes it true.
+            map_pump();
             drawStatus(f);
             delay(50);
         }
@@ -4379,7 +4437,18 @@ void loop() {
         // simpler than clipping around it, and costs nothing: the panel is a
         // deliberate, short-lived interaction, and pinPanelClose() forces the
         // repaint on the way out.
-        if (!g_pinPanel) map_draw(view);
+        // `painted` gates this for the same reason the boot wait does not
+        // call map_draw(): with no tile committed yet, blit_region() has
+        // nothing to blit and fills the whole map band with background,
+        // replacing the boot world with flat colour for as long as that
+        // lasts. Once anything has landed the gate is open for good and this
+        // is the ordinary path again.
+        //
+        // Not an early return, and not folded into the `painted` block above:
+        // drawStatus() and drawFooter() must keep running, since a device
+        // waiting on its first fix still has a bar and buttons to show.
+        if (!g_pinPanel && painted) map_draw(view);
+        else if (!painted)          map_pump();
         drawStatus(view);
         drawFooter(view);
         drawPinPanel(view);
