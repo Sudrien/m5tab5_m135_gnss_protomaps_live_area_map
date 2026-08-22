@@ -88,15 +88,6 @@
 #define COARSE_PX 512
 #endif
 
-// The boot backdrop: z0/0/0, the whole earth, rendered once into a single
-// square tile of this many pixels. Hard-coded at panel width so the boot
-// screen can push it 1:1 - no resampling, no scaling artefacts on coastlines
-// that are one pixel wide to begin with. 1280x1280x2 = 3.2 MB of PSRAM, held
-// only until bootEnd() frees it.
-#ifndef WORLD_PX
-#define WORLD_PX 1280
-#endif
-
 // ---- working zoom levels ---------------------------------------------------
 // The grid switches between these two by speed. Setting both to the same
 // value pins the map to one level, which is worth doing while judging

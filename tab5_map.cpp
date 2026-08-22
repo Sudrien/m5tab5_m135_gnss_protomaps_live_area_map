@@ -50,6 +50,7 @@
 #include "maglog.h"
 #include "wifiloc.h"
 #include "gpstrust.h"
+#include "worldmap.h"
 
 constexpr int      PIN_GNSS_TX = 7;    // module transmits here -> ESP32 RX
 constexpr int      PIN_GNSS_RX = 6;    // module listens here   -> ESP32 TX
@@ -1737,13 +1738,16 @@ static void handlePowerButton() {
 // border has an edge, and an edge is what lets the world map sit behind it
 // without the text becoming unreadable.
 //
-// Behind the card is the z0 tile - the whole earth, WORLD_PX square, pushed
-// as a full-screen backdrop. It is not available at bootBegin() time (the
-// card has not been mounted yet, let alone the archive opened), so the screen
-// starts on a flat ocean-blue field and switches to the real thing the moment
-// the archive check answers. That switch is why every line has to be
-// remembered rather than merely drawn: repainting the backdrop wipes the list
-// with it.
+// Behind the card is the world at z0, from worldmap.cpp - compiled into the
+// binary rather than rendered out of the archive. That choice is the whole
+// point: the archive backdrop could not appear until the card was mounted and
+// the file opened, which is most of boot and the two steps most likely to be
+// what has failed, so the boot screen had a picture on it only when it was
+// least needed. The compiled outline is there from the first line of setup(),
+// on a device with no card in it at all.
+//
+// Lines are still remembered rather than merely drawn, because bootEnd() and
+// the storage wait both repaint the whole screen underneath the list.
 #define BOOT_LINES_MAX 18
 
 struct BootLine {
@@ -1756,7 +1760,6 @@ static int      g_bootLine = 0;      // committed lines
 static bool     g_bootActive = true;
 static bool     g_bootPend = false;  // a pending line sits after the committed ones
 static BootLine g_bootPendLine;
-static bool     g_bootWorld = false; // backdrop is the z0 tile rather than the field
 
 // Panel geometry, in the same spirit as PP_* for the saved-points panel: a
 // header deep enough for a title and a subtitle, then fixed-height rows.
@@ -1783,18 +1786,13 @@ static int bootRows() {
     return r;
 }
 
-// The backdrop, whichever one we have. Deliberately not style_background():
-// the palette is chosen from the remembered position part-way through boot,
-// and a boot screen that changes colour underneath its own message list looks
-// like a fault.
+// The backdrop. map_is_dark() rather than a fixed palette so a night boot
+// does not throw a bright screen at a dark room; it is set by themeBoot()
+// from the remembered position, which happens late, so most of boot draws in
+// day colours and the last repaint may switch. That is a change of shade on a
+// picture that stays put, not a change of scene.
 static void bootBackdrop() {
-    if (g_bootWorld && map_world_check_draw_fit(M5.Display.width(),
-                                                M5.Display.height()))
-        return;
-    // Deep ocean blue - the same thing the world tile is mostly made of, so
-    // the swap when the archive check lands is a change of detail rather than
-    // a change of scene.
-    M5.Display.fillScreen(M5.Display.color565(14, 26, 46));
+    worldmap_draw(0, 0, M5.Display.width(), M5.Display.height(), map_is_dark());
 }
 
 // One row, drawn in place. The panel body is opaque, so a row can be redrawn
@@ -1855,16 +1853,6 @@ static void bootBegin() {
     bootPaintAll();
 }
 
-// Promote the backdrop to the rendered z0 tile. Called once, from the archive
-// check, and it repaints the whole screen because the list has to come back
-// on top of the new picture.
-static void bootWorldBackdrop() {
-    if (!g_panelOk || !g_bootActive || g_bootWorld) return;
-    if (map_world_check_state() != TILE_READY) return;
-    g_bootWorld = true;
-    bootPaintAll();
-}
-
 static void bootStepEx(const char *msg, bool ok, bool pending) {
     // Logged first, unconditionally. Everything below depends on the panel
     // being up, and when it is not, height() is 0, the geometry check below
@@ -1906,12 +1894,20 @@ static void bootEnd() {
     // that far. A second fillScreen would wipe a map that is already up.
     if (!g_bootActive) return;
     g_bootActive = false;
-    g_bootWorld = false;
-    // The world tile is the boot backdrop and the boot screen is about to be
-    // painted over, so its megabytes go back to the heap here rather than
-    // being held for the run.
+    // The archive check's z0 buffer is a diagnostic, not the backdrop any
+    // more, but it is still half a megabyte of PSRAM with nothing left to do.
     map_world_check_free();
-    M5.Display.fillScreen(style_background());
+
+    // What used to be here was fillScreen(style_background()), and it is what
+    // turned the world into a flash: the panel handed over to a map that had
+    // no tiles yet - no fix, nothing rendered - and the "handover" was a
+    // screenful of flat background colour that stayed until the first tile
+    // landed. Which, on a cold start with no fix, is minutes.
+    //
+    // Leaving the world up instead costs one repaint and gives the wait
+    // something to be. The map paints over it tile by tile as they arrive.
+    if (map_has_picture()) M5.Display.fillScreen(style_background());
+    else                   bootBackdrop();
 }
 
 // Mount the card, trying the fast bus first and falling back.
@@ -3660,7 +3656,11 @@ void setup() {
     if (panel) {
         M5.Display.setRotation(3);             // landscape, as in the GNSS sketch
         M5.Display.setBrightness(BRIGHT_DAY);
-        M5.Display.fillScreen(TFT_BLACK);
+        // The world, not black. There are a few hundred milliseconds of board
+        // probing and serial chatter between here and bootBegin(), and a black
+        // panel for any part of boot is exactly what this change is about.
+        // Costs one pass of the scanline fill, which needs nothing but flash.
+        worldmap_draw(0, 0, M5.Display.width(), M5.Display.height(), false);
     }
 
     M5.Power.setExtOutput(true);               // powers the M135
@@ -3844,10 +3844,6 @@ void setup() {
             snprintf(m, sizeof m, "archive readable (world in %lu ms)",
                      (unsigned long)(millis() - t0));
             bootStep(m);
-            // Behind the boot panel, full screen, rather than as a thumbnail
-            // above the list: the tile is rendered at panel width for exactly
-            // this. Repaints the list on top of it.
-            bootWorldBackdrop();
         } else if (w == TILE_NODATA) {
             bootStepFail("archive has no z0 tile - is it complete?");
         } else if (w == TILE_PENDING) {

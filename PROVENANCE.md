@@ -190,3 +190,22 @@ settled.
 `SUBTILE_PX 1280` and `Z_FLOOR 14` are probably the two most load-bearing
 numbers in the project. They decide the whole tiling scheme and appear in the
 boot log every run.
+
+## worldmap_data.h - the compiled-in boot backdrop
+
+Natural Earth 1:110m `land` and `lakes`, from
+`nvkelso/natural-earth-vector`, projected to Web Mercator and quantised by
+`tools/gen_worldmap.py`. Natural Earth is public domain, which is why it is
+this and not one of the alternatives: GSHHG is LGPL, and a z0 tile lifted out
+of the pmtiles archive would carry whatever that archive's basemap carries -
+ODbL, for anything OpenStreetMap-derived, which is a licence worth thinking
+about before baking the geometry into a firmware image rather than reading it
+off a card at runtime.
+
+The three constants in the generator are chosen against the panel rather than
+against the data. `SIMPLIFY_PX 0.7` and `MIN_AREA_PX 2.0` are both expressed
+in pixels at `TARGET_PX 1280`, so the simplification cannot move a coastline
+anywhere the display could resolve, and the dropped rings are the ones that
+would have been a speck. They have not been tuned: the first values tried
+produced 139 rings and about 15 KB, which was small enough that there was
+nothing to trade against.

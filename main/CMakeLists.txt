@@ -22,6 +22,7 @@ idf_component_register(
     SRCS
         "../tab5_map.cpp"
         "../mapengine.cpp"
+        "../worldmap.cpp"
         "../netsource.cpp"
         "../tilecache.cpp"
         "../wifistore.cpp"

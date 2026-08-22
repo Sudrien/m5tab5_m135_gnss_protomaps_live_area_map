@@ -187,9 +187,6 @@ bool map_has_picture();
 void         map_world_check_start();
 tile_state_t map_world_check_state();
 bool         map_world_check_draw(int cx, int cy, int size);
-// The same tile as a full-screen backdrop: scaled to cover the given size and
-// centre-cropped. Used by the boot screen, which draws its message list on top.
-bool         map_world_check_draw_fit(int dst_w, int dst_h);
 void         map_world_check_free();
 
 // Hold the render worker off the SD and PSRAM buses, and let it go again.
