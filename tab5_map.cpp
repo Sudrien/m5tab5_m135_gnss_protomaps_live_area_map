@@ -559,10 +559,38 @@ static double minutesToTwilight() {
     return dr < ds ? dr : ds;
 }
 
+// Where the sun question was last answered from. A fix that has just gone
+// invalid does not move the device, and this is what lets an unusable one be
+// ignored rather than answered wrongly.
+static double g_sunLat = 0, g_sunLon = 0;
+static bool   g_sunHavePos = false;
+
 static bool sunIsUp(const GnssFix &fix) {
-    if (fix.status != 'A' || !fix.utc[0]) return true;   // assume day if unsure
-    if (g_sunFromStored) { g_sunDay = -1; g_sunFromStored = false; }
-    return sunIsUpAt(fix.lat, fix.lon);
+    if (fix.status == 'A' && fix.utc[0]) {
+        if (g_sunFromStored) { g_sunDay = -1; g_sunFromStored = false; }
+        g_sunLat = fix.lat; g_sunLon = fix.lon; g_sunHavePos = true;
+        return sunIsUpAt(fix.lat, fix.lon);
+    }
+
+    // No usable fix this pass. This used to return true - assume day - and
+    // that assumption is what made the palette oscillate.
+    //
+    // RMC carries a validity flag and it drops to 'V' routinely: between
+    // solutions once the rate drops to 5 s, under a bridge, for a second after
+    // a constellation change. gnss_get() publishes whatever the last sentence
+    // said, so applyTheme() saw valid/invalid/valid at walking pace and read
+    // it as night/day/night - and each flip is map_set_dark(), which
+    // invalidates every tile and re-renders the grid and the overview. That is
+    // the flashing, and it was worst when standing still at night, which is
+    // the case it is least excusable in.
+    //
+    // Losing the fix is not evidence about the sun. A remembered position
+    // answers the question perfectly well - the device has not moved far
+    // enough between two frames to change the answer - and where there is no
+    // position at all, keeping the palette we already have beats flipping to
+    // a guess.
+    if (g_sunHavePos) return sunIsUpAt(g_sunLat, g_sunLon);
+    return !map_is_dark();
 }
 
 // What automatic would choose right now.
@@ -750,7 +778,28 @@ static void applyTheme(const GnssFix &fix) {
         case THEME_NIGHT: wantDark = true;  break;
         default:          wantDark = !sunIsUp(fix); break;
     }
-    if (wantDark != map_is_dark()) map_set_dark(wantDark);
+
+    // A dwell, on top of the fix above being made stable. Belt and braces, and
+    // cheap: a palette change costs a full re-render of the grid and the
+    // overview - about a second of the SD bus and the rasteriser - so an
+    // automatic one is worth spending only when the sun has genuinely
+    // crossed, which happens twice a day and never twice in a minute.
+    //
+    // Manual changes are exempt. Pressing the palette row in settings and
+    // waiting thirty seconds for anything to happen would read as a broken
+    // button, and a press is unambiguous evidence about what is wanted in a
+    // way that a dropped fix is not.
+    static uint32_t lastFlip = 0;
+    static ThemeMode lastMode = THEME_AUTO;
+    bool manual = (g_themeMode != lastMode);
+    lastMode = g_themeMode;
+
+    if (wantDark != map_is_dark()) {
+        if (manual || lastFlip == 0 || millis() - lastFlip > 30000) {
+            lastFlip = millis();
+            map_set_dark(wantDark);
+        }
+    }
 
     // The idle dim wraps the chosen level rather than replacing it, so a
     // manual override still decides what "full" means and this only decides
@@ -2746,6 +2795,10 @@ static void themeBoot() {
     }
 
     bool dark = !sunIsUpAt(lat, lon);
+    // Also the position sunIsUp() falls back on until a fix supersedes it, so
+    // the palette has a real answer to give from the first pass rather than
+    // holding whatever it happens to have started in.
+    g_sunLat = lat; g_sunLon = lon; g_sunHavePos = true;
     g_sunFromStored = true;      // recompute on the first real fix
     Serial.printf("theme: remembered %.3f,%.3f -> %s palette\n",
                   lat, lon, dark ? "night" : "day");
